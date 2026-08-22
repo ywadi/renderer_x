@@ -1,0 +1,2549 @@
+5878c7e feat(rx_scene,rx_material,shaders): physical light units + punctual lights (#49)
+
+ samples/09_scene/main.cpp                          |  69 +-
+ shaders/material/forward_entry.slang               |  11 +
+ shaders/material/material.slang                    |  51 +-
+ shaders/material/standard_pbr.slang                | 102 ++-
+ src/rx_asset/tests/CMakeLists.txt                  |   8 +-
+ src/rx_asset/tests/import_gltf_gpu_test.cpp        |  90 +++
+ src/rx_material/include/rx_material/draw_data.h    |  57 +-
+ src/rx_material/tests/CMakeLists.txt               |   5 +
+ .../tests/test_standard_pbr_punctual_gpu.cpp       | 778 +++++++++++++++++++++
+ src/rx_scene/CMakeLists.txt                        |   3 +
+ src/rx_scene/include/rx_scene/light_math.h         |  95 +++
+ src/rx_scene/include/rx_scene/scene.h              | 200 +++++-
+ src/rx_scene/light_math.cpp                        |  45 ++
+ src/rx_scene/scene.cpp                             | 123 ++++
+ src/rx_scene/tests/CMakeLists.txt                  |   2 +
+ src/rx_scene/tests/light_math_test.cpp             | 128 ++++
+ src/rx_scene/tests/scene_test.cpp                  | 192 +++++
+ 17 files changed, 1921 insertions(+), 38 deletions(-)
+
+diff --git a/samples/09_scene/main.cpp b/samples/09_scene/main.cpp
+index 5308a58..004104f 100644
+--- a/samples/09_scene/main.cpp
++++ b/samples/09_scene/main.cpp
+@@ -1842,22 +1842,59 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
+         totalSubmeshCount += static_cast<uint32_t>(registry.mesh(instance.mesh).submeshes.size());
+         rx::scene::RenderableDesc desc;
+         desc.mesh = instance.mesh;
+         desc.transform = instance.worldTransform;
+         app.renderableHandles.push_back(app.scene->createRenderable(desc));
+     }
+     if (app.renderableHandles.empty()) {
+         RX_LOG_ERROR("sample_09_scene: imported scene produced zero renderables");
+         return false;
+     }
+-    app.lightHandle = app.scene->createDirectionalLight(
+-        rx::scene::DirectionalLightDesc{app.lightDirWorld, glm::vec3(5.0F, 5.0F, 5.0F), true, 0xFFu});
++
++    // [Phase 5 Stage 2 Task 13, #49] Consume any KHR_lights_punctual
++    // lights the imported glTF itself carries -- EVERY light (any type)
++    // is created in the Scene for real (`scene->lightCount()` reflects
++    // them afterward), satisfying "authored glTF punctual lights arrive
++    // in the Scene" concretely, in a real production code path, not just
++    // a test. This sample's own single-light forward/shadow slot
++    // (`app.lightHandle`) still only ever drives from a DIRECTIONAL light
++    // -- Point/Spot production shading is Task 14/15's clustered scope
++    // (per the plan's own "directional stays direct... [Point/Spot]
++    // consumes cluster lists" framing), not wired to pixels through this
++    // sample's single-light path yet; a scene with only Point/Spot lights
++    // (or none at all, e.g. Sponza) falls back to the SAME hardcoded key
++    // light every earlier round already used here, byte-identical.
++    std::vector<rx::scene::LightHandle> importedLights = rx::scene::instantiateImportedLights(*app.scene, scene.lights);
++    std::optional<rx::scene::LightHandle> importedDirectional;
++    for (rx::scene::LightHandle h : importedLights) {
++        if (app.scene->lightType(h) == rx::scene::LightType::Directional) {
++            importedDirectional = h;
++            break;
++        }
++    }
++    if (importedDirectional.has_value()) {
++        app.lightHandle = *importedDirectional;
++        app.lightDirWorld = app.scene->lightDirection(app.lightHandle);
++        RX_LOG_INFO("sample_09_scene: --scene: using the imported scene's own directional light as the main "
++                     "light ({} total imported light(s))",
++                     importedLights.size());
++    } else {
++        app.lightHandle = app.scene->createDirectionalLight(
++            rx::scene::DirectionalLightDesc{app.lightDirWorld, glm::vec3(5.0F, 5.0F, 5.0F), true, 0xFFu});
++        if (!importedLights.empty()) {
++            RX_LOG_INFO("sample_09_scene: --scene: imported scene has {} Point/Spot light(s) (created in the "
++                         "Scene) but no Directional light -- falling back to the default key light for this "
++                         "sample's own single-light forward/shadow slot (Point/Spot production shading is "
++                         "Task 14/15's clustered scope)",
++                         importedLights.size());
++        }
++    }
+ 
+     rx::asset::AABB totalBounds{};
+     for (const rx::asset::AABB& b : app.scene->worldBoundsSpan()) {
+         totalBounds = rx::asset::AABB::unionOf(totalBounds, b);
+     }
+     if (!totalBounds.isValid()) {
+         totalBounds = rx::asset::AABB{glm::vec3(-1.0F), glm::vec3(1.0F)};
+     }
+     const glm::vec3 center = 0.5F * (totalBounds.min + totalBounds.max);
+     const float radius = std::max(0.5F * glm::length(totalBounds.max - totalBounds.min), 0.1F);
+@@ -2261,22 +2298,45 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     // -- this sample's own FlyCamera already owns a real rx::scene::Camera
+     // (fly_camera.h); this sample has no `--exposure` CLI control of its
+     // own (unlike sample 08), so `exposure()` is always the default
+     // neutral 1.0 today -- wired in anyway so this sample stays
+     // coherently migrated with sample 08's own convention (no
+     // half-migrated consumer of RxDrawData's lightColor/ambientColor
+     // fields) and so a future exposure control on THIS sample needs no
+     // further plumbing here.
+     const float preExposure = app.flyCamera.camera.exposure();
+     const uint8_t lightChannels = app.hud.lightChannelHighlightOn ? 0xFFu : static_cast<uint8_t>(0xFFu & ~kHighlightChannelBit);
++    // [Phase 5 Stage 2 Task 13, #49] `mainLightDir`/`mainLightColorLux`
++    // read GENERICALLY from `app.scene`'s own LightRecord for
++    // `app.lightHandle` when it is alive -- the real Scene-API consumption
++    // path this sample's own key light previously bypassed entirely (the
++    // pre-Task-13 code below wrote the literal `(5,5,5)` and the separate
++    // CPU-side `app.lightDirWorld` field directly into every row, never
++    // actually reading `Scene::lightColorLux()`/`lightDirection()`).
++    // BYTE-IDENTICAL for every pre-Task-13 producer of `app.lightHandle`
++    // (`populateHelmetGrid()`/`populateImportedInstances()`'s own
++    // fallback path both still create a directional light with EXACTLY
++    // `colorLux=(5,5,5)`/`dir=app.lightDirWorld`) -- the ONLY path where
++    // this now differs is `populateImportedInstances()`'s NEW "the
++    // imported scene had its own directional light" branch, where
++    // `app.lightHandle` carries that light's own real, imported
++    // intensity/direction. `--stress` mode never creates ANY Scene light
++    // (`app.lightHandle` stays at its own default, dead, handle) --
++    // `isLightAlive()` is false there, so this falls back to the SAME
++    // hardcoded `(5,5,5)`/`app.lightDirWorld` pair the pre-Task-13 code
++    // always used, unconditionally, for that mode -- also byte-identical.
++    glm::vec3 mainLightDir = app.lightDirWorld;
++    glm::vec3 mainLightColorLux(5.0F, 5.0F, 5.0F);
+     if (app.scene->isLightAlive(app.lightHandle)) {
+         app.scene->setLightChannels(app.lightHandle, lightChannels);
++        mainLightDir = app.scene->lightDirection(app.lightHandle);
++        mainLightColorLux = app.scene->lightColorLux(app.lightHandle);
+     }
+ 
+     // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
+     // scene environment's own bindless bundle -- mirrors
+     // samples/08_gltf_viewer's own updateDrawDataPerPassFields()
+     // identically (same EnvironmentDesc-read-once-per-frame-then-broadcast
+     // shape). `hasEnvironment() == false` leaves every row at
+     // DrawDataGpu{}'s own "no environment" sentinel default (set once at
+     // app.drawDataRows.assign(rows, DrawDataGpu{}), never touched again in
+     // that case) -- byte-identical to a pre-T10 producer.
+@@ -2290,22 +2350,23 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
+     const auto transforms = app.scene->transformsSpan();
+     for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
+         const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
+         const glm::mat4& model = transforms[payload.instanceDataIndex];
+         const glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(model)));
+ 
+         rx::material::DrawDataGpu& row = app.drawDataRows[i];
+         row.model = glm::transpose(model);
+         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
+         row.viewProj = viewProjTransposed;
+-        row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
+-        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
++        row.lightDirWorld = glm::vec4(-glm::normalize(mainLightDir), 0.0F);
++        row.lightColor = glm::vec4(mainLightColorLux, 0.0F) * preExposure;
++        row.lightType = 0;  // Directional -- see this function's own comment above (Point/Spot: Task 14/15's scope).
+         row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired field, inert -- see MaterialVertex::ambientColor's own header comment.
+         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
+         row.materialIndex = payload.materialIndex;
+         if (hasEnvironment) {
+             row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
+             row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
+             row.envDfgLutIndex = envDesc.dfgLutIndex;
+             row.envCubeSamplerIndex = envDesc.cubeSamplerIndex;
+             row.envDfgSamplerIndex = envDesc.dfgSamplerIndex;
+             row.envMaxPrefilteredLod = envDesc.maxPrefilteredLod;
+diff --git a/shaders/material/forward_entry.slang b/shaders/material/forward_entry.slang
+index f296995..34060fd 100644
+--- a/shaders/material/forward_entry.slang
++++ b/shaders/material/forward_entry.slang
+@@ -226,20 +226,31 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
+     // sitting in a local, so there is nothing to gain from also widening
+     // the vertex-stage output struct for it).
+     v.envIrradianceCubeIndex = draw.envIrradianceCubeIndex;
+     v.envPrefilteredCubeIndex = draw.envPrefilteredCubeIndex;
+     v.envDfgLutIndex = draw.envDfgLutIndex;
+     v.envCubeSamplerIndex = draw.envCubeSamplerIndex;
+     v.envDfgSamplerIndex = draw.envDfgSamplerIndex;
+     v.envMaxPrefilteredLod = draw.envMaxPrefilteredLod;
+     v.envIntensity = draw.envIntensity;
+ 
++    // [Phase 5 Stage 2 Task 13, #49] The punctual-light bundle -- read
++    // directly off the SAME `draw` row, same "nothing to gain from also
++    // widening VertexStageOutput for a per-pass-constant value" reasoning
++    // as the env* fields immediately above.
++    v.lightType = draw.lightType;
++    v.lightRange = draw.lightRange;
++    v.lightAngleScale = draw.lightAngleScale;
++    v.lightAngleOffset = draw.lightAngleOffset;
++    v.lightPositionWorld = draw.lightPositionWorld.xyz;
++    v.lightSpotDirWorld = draw.lightSpotDirWorld.xyz;
++
+     // Default-constructed: every conforming material struct this engine
+     // links against is data-free by convention (its bound parameters live
+     // in its own module-scope `ParameterBlock<TParams> gParams`, per D8 --
+     // see material.slang's header comment and test_unlit.slang for the
+     // worked example), so there is no instance state to initialize here.
+     MaterialImpl material;
+     float4 color = material.evaluate(v);
+ 
+     // [Phase 5 Task 4/#40, gate ruling rulings-2026-08-20.md T4] The
+     // Phase-4 `--exposure` post-multiply that used to sit here
+diff --git a/shaders/material/material.slang b/shaders/material/material.slang
+index a49b754..a11e163 100644
+--- a/shaders/material/material.slang
++++ b/shaders/material/material.slang
+@@ -64,20 +64,35 @@ public struct MaterialVertex {
+     // rationale and the `envIrradianceCubeIndex == 0xFFFFFFFF` "no
+     // environment" sentinel convention.
+     public uint envIrradianceCubeIndex;
+     public uint envPrefilteredCubeIndex;
+     public uint envDfgLutIndex;
+     public uint envCubeSamplerIndex;
+     public uint envDfgSamplerIndex;
+     public float envMaxPrefilteredLod;
+     public float envIntensity;
+ 
++    // [Phase 5 Stage 2 Task 13, #49] The punctual-light bundle, forwarded
++    // verbatim from the SAME `RxDrawData` row `forward_entry.slang`'s
++    // `fragmentMain` re-reads for its shadow/env fields (NOT carried
++    // through `VertexStageOutput` -- same "per-pass-constant, nothing to
++    // gain from interpolating it" reasoning `envIrradianceCubeIndex` et
++    // al. already establish). See `RxDrawData`'s own header comment
++    // (above, this file) for the full field-by-field unit/semantics
++    // account.
++    public uint lightType;
++    public float lightRange;
++    public float lightAngleScale;
++    public float lightAngleOffset;
++    public float3 lightPositionWorld;
++    public float3 lightSpotDirWorld;
++
+     // [BRDF baseline] World-space camera/eye position -- the one piece of
+     // per-pass (not per-vertex) data StandardPBR's specular term genuinely
+     // needs and neither `worldPos` nor any field above supplies: Schlick
+     // Fresnel/GGX both need a view direction (`normalize(cameraPosWorld -
+     // worldPos)`), which cannot be reconstructed from `normal`/`worldPos`
+     // alone. Resolved once in vertexMain from the SAME RxDrawData row as
+     // lightDirWorld/lightColor/ambientColor above (see that struct's own
+     // `cameraPosWorld` field) and carried through identically.
+     public float3 cameraPosWorld;
+ }
+@@ -365,32 +380,56 @@ public struct RxDrawData {
+     // Task 13 (Stage 2, KHR_lights_punctual) is where this reconciles
+     // against a broader physical-light-unit system; this field's own
+     // "environment radiance/luminance, exposure-premultiplied" unit is
+     // T10's OWN documented convention until then.
+     public float envIntensity;
+     // [MATRIX LAYOUT / std430 ARRAY STRIDE -- LOAD-BEARING] A
+     // `StructuredBuffer<RxDrawData>[]`'s per-element STRIDE is rounded up
+     // to the alignment of its largest member (16 bytes, this struct's own
+     // several `float4x4`/`float4` fields) -- exactly the GLSL/HLSL std430
+     // array-of-struct rule, verified directly against this exact
+-    // mismatch during this task's own development (a struct total NOT a
++    // mismatch during Task 10's own development (a struct total NOT a
+     // multiple of 16 bytes makes the SHADER's own real per-row byte
+     // stride silently round up beyond what a C++ producer's tight
+     // `sizeof(DrawDataGpu) * rowCount` packing assumes -- row 0 still
+     // reads correctly, since it sits at offset 0 either way, but every
+     // row AFTER it reads progressively misaligned/garbage data. This ONE
+-    // padding field is exactly what's needed to bring this struct's own
+-    // total size back to a 16-byte multiple (352 + 7 real env fields' 28
+-    // bytes + this 4 bytes == 384) -- see draw_data.h's own
+-    // `static_assert(sizeof(DrawDataGpu) == 384, ...)` for the other half
+-    // of this invariant.
++    // padding field brought the struct's (AS OF Task 10) total size back
++    // to a 16-byte multiple (352 + 7 real env fields' 28 bytes + this 4
++    // bytes == 384) -- KEPT (not reused) by Task 13's own append below,
++    // which starts fresh at this clean 384-byte boundary; see
++    // draw_data.h's own `static_assert(sizeof(DrawDataGpu) == 432, ...)`
++    // for the other half of this invariant.
+     public float _padEnv0;
++
++    // [Phase 5 Stage 2 Task 13, #49] Generalizes the "one directional
++    // light" term above (`lightDirWorld`/`lightColor`) to Directional/
++    // Point/Spot -- mirrors `rx::material::DrawDataGpu`'s own tail-append
++    // EXACTLY (draw_data.h, same field order/types, same "starts at a
++    // clean 384-byte boundary, no extra padding needed" reasoning: the
++    // four leading scalars below occupy exactly 16 bytes, keeping both
++    // trailing `float4`s naturally aligned). `lightDirWorld`/`lightColor`
++    // above KEEP their existing semantics for Directional (constant
++    // per-pass "toward light" unit vector / lux `color*intensity`,
++    // unattenuated); for Point/Spot, `lightColor` instead holds
++    // `color*intensity` in CANDELA and the true per-fragment "toward
++    // light" vector is derived by `standard_pbr.slang`'s own punctual
++    // term from `lightPositionWorld` and the shaded fragment's own
++    // `worldPos`. `lightType==0`/`lightRange==0` (both fields' own
++    // defaults) reproduces byte-identical Directional-only (pre-Task-13)
++    // behavior for any row that never sets these fields.
++    public uint lightType;         // 0=Directional, 1=Point, 2=Spot [rx::scene::LightType].
++    public float lightRange;       // Point/Spot inverse-square-window radius; 0.0 == infinite range (no windowing).
++    public float lightAngleScale;  // Spot cone precomputed scale [rx::scene::lightmath::spotAngleScaleOffset()]; Directional/Point unused.
++    public float lightAngleOffset; // Spot cone precomputed offset; Directional/Point unused.
++    public float4 lightPositionWorld;  // Point/Spot world position, xyz (w unused). Directional: unused.
++    public float4 lightSpotDirWorld;   // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
+ }
+ 
+ [[vk::binding(2, 0)]]
+ public StructuredBuffer<RxDrawData> gDrawData[];
+ 
+ // [Phase 4 Stage 2 Task 22 fix round, F1, spec D21/gate ruling #23]
+ // Hardware comparison-sampler 3x3 PCF -- 9 real `SampleCmp` taps against a
+ // `compareEnable=VK_TRUE`/`compareOp=VK_COMPARE_OP_LESS` `VkSampler`
+ // (hardware-filtered per-tap, NOT a manual `if (depth > stored)` compare
+ // the way `shaders/multipass/lit.frag.slang` does), matching this
+diff --git a/shaders/material/standard_pbr.slang b/shaders/material/standard_pbr.slang
+index fab6f4a..90f738d 100644
+--- a/shaders/material/standard_pbr.slang
++++ b/shaders/material/standard_pbr.slang
+@@ -370,25 +370,107 @@ struct StandardPbr : IMaterialShader {
+         float2 occUv = v.uv * gParams.occlusionUvOffsetScale.zw + gParams.occlusionUvOffsetScale.xy;
+         float occSample = rx_sampleTexture(gParams.occlusionTexture, gParams.occlusionSampler, occUv).r;
+         float occlusion = 1.0 + gParams.occlusionStrength * (occSample - 1.0);
+ 
+         // --- Emissive -------------------------------------------------
+         float2 emUv = v.uv * gParams.emissiveUvOffsetScale.zw + gParams.emissiveUvOffsetScale.xy;
+         float3 emissive = gParams.emissiveFactorAndPad.xyz *
+                            rx_sampleTexture(gParams.emissiveTexture, gParams.emissiveSampler, emUv).rgb;
+ 
+         // --- Lambertian diffuse + GGX/Smith-correlated/Schlick specular,
+-        // one directional light [BRDF baseline, this file's own header
+-        // comment; math consumed from brdf.slang -- Task 8 rework]
+-        // --------------------------------------------------------------
++        // ONE punctual light -- Directional/Point/Spot [BRDF baseline,
++        // this file's own header comment; math consumed from brdf.slang
++        // -- Task 8 rework; GENERALIZED beyond directional-only by Phase
++        // 5 Stage 2 Task 13, #49] --------------------------------------
++        //
++        // [Task 13] `v.lightType` selects the punctual-light unit/
++        // attenuation model this ONE light-slot term applies -- ported
++        // from `rx::scene::lightmath` (src/rx_scene/light_math.h, the
++        // SAME closed-form functions a device-free C++ unit test asserts
++        // against KHR_lights_punctual's own reference code, README.md,
++        // Khronos glTF commit 2b29723d025a995971726f2989697cdc49b1222a).
++        // Directional stays UNATTENUATED (KHR spec: "Because it is at an
++        // infinite distance, the light is not attenuated") -- `v.
++        // lightDirWorld` is already the constant per-pass "toward light"
++        // unit vector every pre-Task-13 producer populates, so this path
++        // is BYTE-IDENTICAL to the pre-Task-13 code for lightType==0
++        // (every existing DrawDataGpu producer's own default).
++        //
++        // [Task 15's own plan text: "The lit path consumes cluster lists
++        // for point/spot (directional stays direct)"] This single-light
++        // term is a FOUNDATIONAL, forward-compatible mechanism: Task 14/
++        // 15's clustered Forward+ path will later REUSE these exact
++        // attenuation formulas per-light inside a per-pixel froxel light
++        // loop, superseding (for Point/Spot only) the "one light per
++        // draw" data source below with a per-pixel light LIST -- the math
++        // itself does not change, only where the light's own data comes
++        // from.
+         float3 viewDir = normalize(v.cameraPosWorld - v.worldPos);
+-        float3 lightDir = normalize(v.lightDirWorld);
++        float3 lightDir;
++        float lightAttenuation = 1.0;
++        if (v.lightType == 0u) {
++            // Directional -- constant per-pass direction, no attenuation.
++            lightDir = normalize(v.lightDirWorld);
++        } else {
++            // Point/Spot -- `lightDir` (the "toward light" unit vector
++            // NdotL/the half-vector need) varies per-fragment, derived
++            // from the light's own world position and this fragment's
++            // own (already-per-fragment-varying) worldPos.
++            float3 toLight = v.lightPositionWorld - v.worldPos;
++            float distSq = max(dot(toLight, toLight), 1e-8);
++            float dist = sqrt(distSq);
++            lightDir = toLight / dist;
++
++            // KHR_lights_punctual range-property window [README.md#range-
++            // property, quoted verbatim: "attenuation = max(min(1.0-
++            // (current_distance/range)^4,1),0)/current_distance^2"] --
++            // the LITERAL, un-squared form (gate matrix's own Open
++            // Question resolution: this is what the spec text, its own
++            // reference implementation, AND the pinned glTF-Sample-
++            // Renderer conformance target all agree on; Filament's own
++            // shader squares the window term an extra time, a deliberate
++            // "cinematic" softening this project does NOT port). `v.
++            // lightRange <= 0.0` == "no configured range" (this project's
++            // own established sentinel) -- pure inverse-square, no window.
++            float rangeWindow = 1.0;
++            if (v.lightRange > 0.0) {
++                float ratio = dist / v.lightRange;
++                float ratio4 = ratio * ratio;
++                ratio4 = ratio4 * ratio4;
++                rangeWindow = saturate(1.0 - ratio4);
++            }
++            lightAttenuation = rangeWindow / distSq;
++
++            if (v.lightType == 2u) {
++                // Spot -- additional cone attenuation [KHR reference code,
++                // README.md: "float cd = dot(spotlightDir,
++                // normalizedLightVector); float angularAttenuation =
++                // saturate(cd*lightAngleScale+lightAngleOffset);
++                // angularAttenuation *= angularAttenuation;"].
++                // `normalizedLightVector` there is the vector FROM the
++                // light TOWARD the fragment (the light's own travel
++                // direction at this fragment) -- i.e. `-lightDir` here,
++                // NOT `lightDir` itself (which points the OPPOSITE way,
++                // toward the light, matching NdotL's own convention) --
++                // cross-checked directly against the pinned glTF-Sample-
++                // Renderer's own `getSpotAttenuation()` (punctual.glsl:
++                // `actualCos = dot(normalize(spotDirection),
++                // normalize(-pointToLight))` where `pointToLight =
++                // light.position - worldPosition`, i.e. `-pointToLight ==
++                // worldPosition - light.position`, the SAME travel-
++                // direction vector).
++                float cd = dot(normalize(v.lightSpotDirWorld), -lightDir);
++                float angularAttenuation = saturate(cd * v.lightAngleScale + v.lightAngleOffset);
++                angularAttenuation *= angularAttenuation;
++                lightAttenuation *= angularAttenuation;
++            }
++        }
+         float3 halfVec = normalize(viewDir + lightDir);
+         float NdotL = max(dot(N, lightDir), 0.0);
+         float NdotV = max(dot(N, viewDir), 1e-4);  // clamped away from 0, not 0-able geometry (grazing/back-facing).
+         float NdotH = max(dot(N, halfVec), 0.0);
+         float VdotH = max(dot(viewDir, halfVec), 0.0);
+ 
+         // [Task 8] Dielectric F0/F90 via KHR_materials_ior/_specular --
+         // see computeDielectricF0F90()'s own header comment. Metal
+         // exclusion ["the metal BRDF is not affected by the parameter",
+         // both extensions' own spec text]: `lerp` toward baseColor/1.0 at
+@@ -451,21 +533,31 @@ struct StandardPbr : IMaterialShader {
+         // Sample-Renderer/three.js) treat ambient occlusion as an
+         // INDIRECT-only term, and the gate matrix's own occlusion row
+         // scopes the acceptance criterion to exactly the ambient
+         // contribution below ("ambientColor x occlusionValue x
+         // baseColor... the ONLY contribution"). An earlier version of this
+         // file multiplied `directLight` by `occlusion` too -- spec-
+         // incorrect (double-darkens a direct-lit, occluded surface) and,
+         // forward-looking, would have doubled up with Task 22's own future
+         // shadow maps (a REAL direct-light visibility term) once that
+         // lands. Direct light is governed by NdotL/shadowing alone.
+-        float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
++        // [Task 13] `lightAttenuation` is 1.0 for Directional (unattenuated,
++        // by construction above) -- byte-identical to the pre-Task-13
++        // expression for every existing directional-only producer.
++        // `v.lightColor` is candela for Point/Spot (see this file's own
++        // punctual-light comment above) -- multiplying by the inverse-
++        // square/window/cone attenuation term converts it into the SAME
++        // lux-equivalent-irradiance space the diffuse/specular BRDF terms
++        // already assume, matching Filament's own `light.colorIntensity.
++        // rgb * light.attenuation * NoL` composition (shaders/src/
++        // surface_light_punctual.fs, google/filament v1.75.0).
++        float3 directLight = (diffuse + specular) * v.lightColor * lightAttenuation * NdotL;
+ 
+         // [Phase 5 Task 10, #46, FG1 closure] Image-based lighting --
+         // REPLACES the retired FG1 flat ambient/environment term (see
+         // MaterialVertex::ambientColor's own header comment, material.slang)
+         // with real diffuse irradiance + specular prefiltered-cubemap
+         // sampling, per the charter's own "each lobe fed by both direct
+         // lighting and IBL" requirement. Split-sum composition [Karis 2013;
+         // Filament `evaluateIBL()`, shaders/src/surface_light_indirect.fs,
+         // google/filament v1.75.0, :717-758 -- see brdf.slang's own
+         // `iblSpecularReflectance()` header comment for the full citation,
+diff --git a/src/rx_asset/tests/CMakeLists.txt b/src/rx_asset/tests/CMakeLists.txt
+index 1dfef2c..747fef1 100644
+--- a/src/rx_asset/tests/CMakeLists.txt
++++ b/src/rx_asset/tests/CMakeLists.txt
+@@ -109,17 +109,23 @@ add_executable(rx_asset_gltf_gpu_tests
+     async_import_test.cpp
+     # Issue #31 -- KHR_draco_mesh_compression additional acceptance
+     # coverage (render-equivalence/exact-counter gate, decode-failure
+     # gate, real-world BoomBox integration) beyond Task 13's own
+     # import_gltf_gpu_test.cpp decode test. Joins THIS binary for the
+     # identical reason every file above does: the same fastgltf-aware
+     # Registry/GeometryPool/Scheduler fixture shape, no new dependency.
+     draco_compression_test.cpp
+ )
+ target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
+-target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
++# [Phase 5 Stage 2 Task 13, #49] rx_scene: import_gltf_gpu_test.cpp's own
++# import-consumption TEST_CASE calls rx::scene::instantiateImportedLights()
++# against a REAL registry.importGltf() result -- the SAME
++# "one file's own TEST_CASE needs a normally-unrelated library link"
++# precedent test_standard_pbr_unlit.cpp's own pre-exposure TEST_CASE
++# already established for rx_material_gpu_tests' rx_scene link (Task 4).
++target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_scene rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
+ target_compile_definitions(rx_asset_gltf_gpu_tests PRIVATE
+     RX_ASSET_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+     RX_ASSET_ROOT_DIR="${CMAKE_SOURCE_DIR}"
+ )
+ add_test(NAME rx_asset_gltf_gpu_tests COMMAND rx_asset_gltf_gpu_tests --validate)
+ set_tests_properties(rx_asset_gltf_gpu_tests PROPERTIES TIMEOUT 300)
+diff --git a/src/rx_asset/tests/import_gltf_gpu_test.cpp b/src/rx_asset/tests/import_gltf_gpu_test.cpp
+index b4d2ea3..103ab8c 100644
+--- a/src/rx_asset/tests/import_gltf_gpu_test.cpp
++++ b/src/rx_asset/tests/import_gltf_gpu_test.cpp
+@@ -1,17 +1,18 @@
+ #include <doctest/doctest.h>
+ #include <rx_asset/geometry_pool.h>
+ #include <rx_asset/registry.h>
+ #include <rx_rhi_vk/command.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
++#include <rx_scene/scene.h>
+ #include <rx_task/scheduler.h>
+ #include <algorithm>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstring>
+ #include <fstream>
+ #include <optional>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -784,20 +785,109 @@ TEST_CASE("importGltf: cameras (perspective infinite + orthographic) and all 3 l
+             CHECK(*l.innerConeAngle == doctest::Approx(0.2F));
+             CHECK(*l.outerConeAngle == doctest::Approx(0.6F));
+         }
+     }
+     CHECK(sawDirectional);
+     CHECK(sawPoint);
+     CHECK(sawSpot);
+     CHECK_FALSE(fixture->context.hasValidationErrors());
+ }
+ 
++TEST_CASE("importGltf -> rx::scene::instantiateImportedLights(): authored glTF punctual lights arrive in "
++          "the Scene with value-asserted intensities/cones [Phase 5 Stage 2 Task 13, #49; gate matrix "
++          "'Authored glTF punctual lights arrive in the Scene with value-asserted intensities/cones' "
++          "acceptance criterion, decoded-value discipline]. Reuses cube_lights_camera.gltf (the SAME "
++          "fixture the plain-parse TEST_CASE above already round-trips at the LightData layer) but drives "
++          "it through the REAL end-to-end path: a GPU-backed registry.importGltf() followed by "
++          "rx::scene::instantiateImportedLights() against a real rx::scene::Scene -- proving the FULL "
++          "chain (fastgltf parse -> LightData -> Scene light), not just the import layer alone.") {
++    auto fixture = makeFixture("import_lights_consumption");
++    if (!fixture) {
++        return;
++    }
++    attachPoolAndScheduler(*fixture);
++    Registry registry;
++    ImportResult result = registry.importGltf(testAssetDir() + "/cube_lights_camera.gltf", *fixture->pool,
++                                                *fixture->scheduler);
++    REQUIRE(result.ok());
++    REQUIRE(result.scene.lights.size() == 3);
++
++    rx::scene::Scene scene([](rx::asset::MeshHandle) { return rx::asset::AABB{}; });
++    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, result.scene.lights);
++    REQUIRE(handles.size() == 3);
++    CHECK(scene.lightCount() == 3);
++
++    bool sawDirectional = false, sawPoint = false, sawSpot = false;
++    for (rx::scene::LightHandle h : handles) {
++        switch (scene.lightType(h)) {
++            case rx::scene::LightType::Directional: {
++                sawDirectional = true;
++                // color=[1,0.9,0.8] * intensity=3.0 -- EXACT pass-through,
++                // lux, no unit conversion (KHR spec: directional
++                // intensity is ALREADY illuminance in lux).
++                const glm::vec3 c = scene.lightColorLux(h);
++                CHECK(c.x == doctest::Approx(3.0F));
++                CHECK(c.y == doctest::Approx(2.7F));
++                CHECK(c.z == doctest::Approx(2.4F));
++                // sun_node: translation (1,1,1), NO rotation -- direction
++                // is local (0,0,-1) unrotated (translation has zero
++                // effect on direction, per KHR spec).
++                const glm::vec3 dir = scene.lightDirection(h);
++                CHECK(dir.x == doctest::Approx(0.0F).epsilon(0.001));
++                CHECK(dir.y == doctest::Approx(0.0F).epsilon(0.001));
++                CHECK(dir.z == doctest::Approx(-1.0F).epsilon(0.001));
++                break;
++            }
++            case rx::scene::LightType::Point: {
++                sawPoint = true;
++                // color=[1,0,0] * intensity=500.0 -- EXACT pass-through,
++                // candela [gate matrix's own worked acceptance criterion:
++                // "1500 candela imports as EXACTLY 1500.0, not
++                // 1500/(4*pi)" -- this fixture uses 500, same principle].
++                const glm::vec3 c = scene.lightColorLux(h);
++                CHECK(c.x == doctest::Approx(500.0F));
++                CHECK(c.y == doctest::Approx(0.0F));
++                CHECK(c.z == doctest::Approx(0.0F));
++                // point_node: translation (2,2,2).
++                CHECK(scene.lightPosition(h) == glm::vec3(2.0F, 2.0F, 2.0F));
++                // range PRESENT in the fixture (10.0) -- not the "absent"
++                // sentinel.
++                CHECK(scene.lightRange(h) == doctest::Approx(10.0F));
++                break;
++            }
++            case rx::scene::LightType::Spot: {
++                sawSpot = true;
++                // color=[0,1,0] * intensity=200.0 -- EXACT pass-through,
++                // candela.
++                const glm::vec3 c = scene.lightColorLux(h);
++                CHECK(c.x == doctest::Approx(0.0F));
++                CHECK(c.y == doctest::Approx(200.0F));
++                CHECK(c.z == doctest::Approx(0.0F));
++                // spot_node: translation (3,3,3), no rotation.
++                CHECK(scene.lightPosition(h) == glm::vec3(3.0F, 3.0F, 3.0F));
++                const glm::vec3 dir = scene.lightDirection(h);
++                CHECK(dir.x == doctest::Approx(0.0F).epsilon(0.001));
++                CHECK(dir.y == doctest::Approx(0.0F).epsilon(0.001));
++                CHECK(dir.z == doctest::Approx(-1.0F).epsilon(0.001));
++                CHECK(scene.lightRange(h) == doctest::Approx(5.0F));
++                CHECK(scene.lightInnerConeAngle(h) == doctest::Approx(0.2F));
++                CHECK(scene.lightOuterConeAngle(h) == doctest::Approx(0.6F));
++                break;
++            }
++        }
++    }
++    CHECK(sawDirectional);
++    CHECK(sawPoint);
++    CHECK(sawSpot);
++    CHECK_FALSE(fixture->context.hasValidationErrors());
++}
++
+ TEST_CASE("importGltf: EXT_meshopt_compression (real meshoptimizer-encoded fixture) decodes correctly") {
+     auto fixture = makeFixture("import_meshopt_compressed");
+     if (!fixture) {
+         return;
+     }
+     attachPoolAndScheduler(*fixture);
+     Registry registry;
+     ImportResult result =
+         registry.importGltf(testAssetDir() + "/cube_meshopt.gltf", *fixture->pool, *fixture->scheduler);
+     REQUIRE(result.ok());
+diff --git a/src/rx_material/include/rx_material/draw_data.h b/src/rx_material/include/rx_material/draw_data.h
+index eb1f2ab..d2a010d 100644
+--- a/src/rx_material/include/rx_material/draw_data.h
++++ b/src/rx_material/include/rx_material/draw_data.h
+@@ -148,34 +148,67 @@ struct DrawDataGpu {
+     // default.
+     uint32_t envIrradianceCubeIndex = 0xFFFFFFFFu;   // bindless CUBE index (BindlessTable::kCubeSampledImageBinding).
+     uint32_t envPrefilteredCubeIndex = 0xFFFFFFFFu;  // bindless CUBE index.
+     uint32_t envDfgLutIndex = 0xFFFFFFFFu;           // bindless SAMPLED_IMAGE (2D) index.
+     uint32_t envCubeSamplerIndex = 0;                // bindless SAMPLER index, trilinear-across-mips.
+     uint32_t envDfgSamplerIndex = 0;                 // bindless SAMPLER index, bilinear clamp-to-edge.
+     float envMaxPrefilteredLod = 0.0F;               // prefilteredCubemap mip count - 1.
+     float envIntensity = 0.0F;                       // PRE-EXPOSED physical-units scalar (Camera::exposure() already applied).
+     // [MATRIX LAYOUT / std430 ARRAY STRIDE -- LOAD-BEARING, see this
+     // header's own top comment] ONE padding field, not decorative --
+-    // rounds this struct's total size up to a multiple of 16 bytes,
+-    // matching the per-element STRIDE Slang's `StructuredBuffer<RxDrawData>
+-    // []` (material.slang) actually uses on the GPU side (std430's
+-    // array-of-struct stride-rounds-to-largest-member-alignment rule,
+-    // 16 bytes here because of this struct's several float4x4/float4
+-    // fields). Omitting this padding reproduced a REAL bug directly during
+-    // this task's own development: row 0 of a multi-row DrawDataGpu buffer
+-    // still read correctly (offset 0 either way), but every row after it
+-    // read progressively misaligned/garbage data, because a C++ producer's
+-    // tight `sizeof(DrawDataGpu) * rowCount` packing silently disagreed
+-    // with the shader's own (16-byte-rounded) real stride.
++    // rounds the struct's size (AS OF Task 10) up to a multiple of 16
++    // bytes, matching the per-element STRIDE Slang's `StructuredBuffer<
++    // RxDrawData>[]` (material.slang) actually uses on the GPU side
++    // (std430's array-of-struct stride-rounds-to-largest-member-alignment
++    // rule, 16 bytes here because of this struct's several float4x4/
++    // float4 fields). Omitting this padding reproduced a REAL bug directly
++    // during Task 10's own development: row 0 of a multi-row DrawDataGpu
++    // buffer still read correctly (offset 0 either way), but every row
++    // after it read progressively misaligned/garbage data, because a C++
++    // producer's tight `sizeof(DrawDataGpu) * rowCount` packing silently
++    // disagreed with the shader's own (16-byte-rounded) real stride. KEPT
++    // (not removed/reused) even though Task 13 appends more fields after
++    // it below -- every subsequent std430-aligned append must land AFTER
++    // this field, at the 384-byte boundary it establishes, never before
++    // it (an earlier draft of this task's own diff got this backwards --
++    // see this file's own git history / task-13-report.md for the
++    // disclosed self-caught defect).
+     float _padEnv0 = 0.0F;
++
++    // [Phase 5 Stage 2 Task 13, #49] Generalizes the "one directional
++    // light" term above (`lightDirWorld`/`lightColor`) to Directional/
++    // Point/Spot -- see material.slang's own RxDrawData mirror + this
++    // struct's own top comment for the full field-by-field rationale.
++    // `lightDirWorld`/`lightColor` KEEP their existing semantics for
++    // Directional (constant per-pass "toward light" unit vector / lux
++    // color*intensity, unattenuated); for Point/Spot, `lightColor` instead
++    // holds `color*intensity` in CANDELA and the true per-fragment "toward
++    // light" vector is derived in-shader from `lightPositionWorld`. Every
++    // field below defaults to the exact value that reproduces byte-
++    // identical Directional-only (pre-Task-13) behavior for a row that
++    // never sets them (lightType==0==Directional, lightRange==0==no
++    // window -- irrelevant anyway since Directional never attenuates).
++    // Appended starting at byte offset 384 (a clean 16-byte boundary,
++    // thanks to `_padEnv0` immediately above) -- the four leading scalars
++    // (16 bytes) keep the two trailing `vec4`s naturally 16-byte-aligned
++    // with zero implicit compiler padding on EITHER the C++ or the Slang
++    // std430 side, so this append needs no additional manual pad field.
++    uint32_t lightType = 0;        // 0=Directional, 1=Point, 2=Spot [rx::scene::LightType].
++    float lightRange = 0.0F;       // Point/Spot inverse-square-window radius; 0.0 == infinite range (no windowing).
++    float lightAngleScale = 0.0F;  // Spot cone precomputed scale [rx::scene::lightmath::spotAngleScaleOffset()]; Directional/Point unused.
++    float lightAngleOffset = 0.0F; // Spot cone precomputed offset; Directional/Point unused.
++    glm::vec4 lightPositionWorld{0.0F};        // Point/Spot world position, xyz (w unused). Directional: unused.
++    glm::vec4 lightSpotDirWorld{0.0F, 0.0F, -1.0F, 0.0F};  // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
+ };
+-static_assert(sizeof(DrawDataGpu) == 384, "DrawDataGpu must stay exactly 384 bytes -- mirrors material.slang's RxDrawData");
++static_assert(sizeof(DrawDataGpu) == 432, "DrawDataGpu must stay exactly 432 bytes (384 + 48 punctual-light bytes, "
++                                           "already a 16-byte multiple with no additional pad) -- mirrors "
++                                           "material.slang's RxDrawData");
+ 
+ // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
+ // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)
+ // field-for-field. Deliberately ALL-SCALAR (no vec/mat fields) -- see
+ // lit.vert.slang's own header comment for the empirically-verified reason
+ // this project avoids vector/matrix fields inside a push-constant block
+ // (Slang's push-constant packing rules are not the predictable std430 rules
+ // a StructuredBuffer gets); every genuinely vector-shaped per-pass value
+ // (viewProj, light/ambient) lives in DrawDataGpu above instead, reached
+ // indirectly via `drawDataBufferIndex`.
+diff --git a/src/rx_material/tests/CMakeLists.txt b/src/rx_material/tests/CMakeLists.txt
+index 095c7af..040fb6f 100644
+--- a/src/rx_material/tests/CMakeLists.txt
++++ b/src/rx_material/tests/CMakeLists.txt
+@@ -47,20 +47,25 @@ add_executable(rx_material_gpu_tests
+     # ShadowCasterPipeline/fitShadowFrustum (device-free math + the real
+     # shadow-caster pipeline building the shadow map this test's receiver
+     # draws sample).
+     test_standard_pbr_shadow_gpu.cpp
+     # Phase 5 Stage 1 Task 10 [#46, FG1 closure]: standard_pbr.slang's new
+     # IBL diffuse/specular lobes (Lambertian-under-uniform-environment
+     # closed form, mirror-metal matched-pose value probe, rough-metal
+     # furnace sanity) + shaders/ibl/skybox.slang's own background pass
+     # (camera-ray value probe) -- see that file's own header comment.
+     test_standard_pbr_ibl_gpu.cpp
++    # Phase 5 Stage 2 Task 13 [#49]: standard_pbr.slang's generalized
++    # punctual-light term (Directional/Point/Spot) -- falloff/cone-
++    # attenuation value probes, directional regression, pre-exposure
++    # coherence. See that file's own header comment.
++    test_standard_pbr_punctual_gpu.cpp
+ )
+ # [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
+ # pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads
+ # camera.exposure()/rx::scene::exposure::exposure(ev100) to compute the
+ # expected pre-multiplied lightColor it asserts against -- the ONE case in
+ # this binary that needs Camera's exposure math linked in.
+ target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_scene rx_rhi_vk rx_platform doctest::doctest)
+ rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
+ 
+ target_compile_definitions(rx_material_gpu_tests PRIVATE
+diff --git a/src/rx_material/tests/test_standard_pbr_punctual_gpu.cpp b/src/rx_material/tests/test_standard_pbr_punctual_gpu.cpp
+new file mode 100644
+index 0000000..e889a87
+--- /dev/null
++++ b/src/rx_material/tests/test_standard_pbr_punctual_gpu.cpp
+@@ -0,0 +1,778 @@
++// src/rx_material/tests/test_standard_pbr_punctual_gpu.cpp -- Phase 5
++// Stage 2 Task 13 [#49, gate matrix-p5t13-physical-lights.md]: value-
++// asserted GPU tests for standard_pbr.slang's generalized punctual-light
++// term (Directional/Point/Spot, previously directional-only) -- the
++// ticket's own named acceptance criteria: "Single-light analytic falloff
++// probe: rendered intensity at distance d matches inverse-square
++// expectation within tolerance" plus the gate matrix's own per-row
++// discrimination requirements (range-window conditional-on-presence,
++// spot cone squared-saturate curve, directional regression).
++//
++// TEST RIG -- a TRIMMED duplicate of test_standard_pbr_ibl_gpu.cpp's own
++// rig (Fixture/QuadMesh/DrawDataBuffer/renderQuad), scoped to exactly
++// what punctual-light falloff probing needs (one quad, one draw,
++// StandardPBR only, NO environment) -- matching this test suite's own
++// established per-file-duplicated-fixture idiom (see that file's own
++// header comment for why).
++//
++// GEOMETRY: the SAME unit quad every rig in this suite uses (object-space
++// (-0.5,-0.5,0)..(0.5,0.5,0), normal (0,0,1)), camera fixed at (0,0,2)
++// looking straight down -Z. Every Point/Spot TEST_CASE below places its
++// light ALONG THE SAME +Z AXIS the quad's own normal points along
++// (`lightPositionWorld = (0,0,d)`), so `NdotL == 1.0` identically
++// regardless of `d` -- this ISOLATES the pure distance-attenuation term
++// from the angle-dependent BRDF terms, which is what makes a RATIO
++// assertion (`pixel(d1)/pixel(d2) == attenuation(d1)/attenuation(d2)`)
++// exact rather than merely plausible: with `viewDir == lightDir ==
++// halfVec == N == (0,0,1)` for every distance, `(diffuse+specular)` is a
++// FIXED distance-independent constant, so it cancels exactly in the
++// ratio -- the SAME "matched-pose" methodology test_standard_pbr_ibl_gpu.
++// cpp's own mirror-metal TEST_CASE already established for this rig
++// shape, and the SAME ratio-not-absolute-value methodology Task 4's own
++// pre-exposure TEST_CASE (test_standard_pbr_unlit.cpp) established for
++// exposure. The spot cone sweep instead keeps the light's own POSITION
++// fixed (so distance attenuation stays constant) and tilts the light's
++// own FACING direction (`lightSpotDirWorld`) by a known angle `theta`
++// around the X axis -- `dot((0,0,-1), (0,sin(theta),-cos(theta))) ==
++// cos(theta)` exactly, isolating the cone term the identical way.
++#include <doctest/doctest.h>
++#include <rx_material/draw_data.h>
++#include <rx_material/material_system.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_scene/camera.h>
++#include <rx_scene/light_math.h>
++
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_task/scheduler.h>
++
++#define GLM_FORCE_DEPTH_ZERO_TO_ONE
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace {
++
++std::filesystem::path shaderDataPath(const char* filename) {
++    return std::filesystem::path(RX_MATERIAL_SHADER_DIR) / filename;
++}
++
++struct Fixture {
++    rx::platform::Window window;
++    rx::rhi::Context context;
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    rx::rhi::Device device;
++    rx::rhi::BindlessTable bindless;
++    rx::rhi::Allocator allocator;
++};
++
++std::optional<Fixture> makeFixture(const char* title) {
++    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
++    if (!window.has_value()) {
++        MESSAGE("no display backend available, skipping StandardPBR punctual-light test");
++        return std::nullopt;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        MESSAGE("video driver reports no Vulkan surface extensions, skipping StandardPBR punctual-light test");
++        return std::nullopt;
++    }
++    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
++    REQUIRE(context.has_value());
++    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
++    REQUIRE(surface != VK_NULL_HANDLE);
++    auto device = rx::rhi::Device::create(*context, surface);
++    REQUIRE(device.has_value());
++
++    rx::rhi::BindlessTable::Capacities capacities;
++    capacities.sampledImages = 16;
++    capacities.samplers = 8;
++    capacities.storageBuffers = 8;
++    // [Phase 4 Stage 2 Task 22 / Phase 5 Task 10 precedent] material.slang
++    // unconditionally declares `gShadowCompareSamplers`(binding 3)/
++    // `gTexturesCube`(binding 4) now -- EVERY BindlessTable feeding a
++    // MaterialSystem needs these two capacities nonzero or pipeline
++    // creation fails validation (`VUID-VkGraphicsPipelineCreateInfo-
++    // layout-00756`, "Shader uses descriptor slot 0.3/0.4... but not
++    // declared in pipeline layout") -- reproduced directly during this
++    // file's own development (this rig never registers a real shadow map
++    // or cube image; both capacities exist purely so the pipeline LAYOUT
++    // itself is well-formed).
++    capacities.comparisonSamplers = 1;
++    capacities.cubeImages = 1;
++    auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
++    REQUIRE(bindless.has_value());
++
++    auto allocator = rx::rhi::Allocator::create(*context, *device);
++    REQUIRE(allocator.has_value());
++
++    return Fixture{std::move(*window),  std::move(*context),   surface,
++                    std::move(*device), std::move(*bindless), std::move(*allocator)};
++}
++
++std::filesystem::path freshCachePath(const char* name) {
++    std::filesystem::path path =
++        std::filesystem::temp_directory_path() / (std::string("rx_standard_pbr_punctual_test_") + name + ".cache");
++    std::error_code ec;
++    std::filesystem::remove(path, ec);
++    return path;
++}
++
++struct Vertex {
++    float position[3];
++    float normal[3];
++    float tangent[4];
++    float uv[2];
++};
++
++constexpr std::array<Vertex, 4> kQuadVertices{{
++    {{-0.5F, -0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}},
++    {{0.5F, -0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},
++    {{0.5F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}},
++    {{-0.5F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}},
++}};
++constexpr std::array<uint32_t, 6> kQuadIndices{0, 1, 2, 0, 2, 3};
++
++struct QuadMesh {
++    rx::rhi::Buffer vertexBuffer;
++    rx::rhi::Buffer indexBuffer;
++};
++
++std::optional<QuadMesh> createQuadMesh(rx::rhi::Allocator& allocator) {
++    auto vb = allocator.createHostVisibleBuffer(sizeof(kQuadVertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                                                 rx::rhi::MemoryCategory::Internal);
++    auto ib = allocator.createHostVisibleBuffer(sizeof(kQuadIndices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
++                                                 rx::rhi::MemoryCategory::Internal);
++    if (!vb.has_value() || !ib.has_value()) {
++        return std::nullopt;
++    }
++    std::memcpy(vb->mappedData(), kQuadVertices.data(), sizeof(kQuadVertices));
++    vb->flush();
++    std::memcpy(ib->mappedData(), kQuadIndices.data(), sizeof(kQuadIndices));
++    ib->flush();
++    return QuadMesh{std::move(*vb), std::move(*ib)};
++}
++
++// Base row: camera at (0,0,2) looking at the origin, orthographic
++// projection matched to the quad's own extent, EVERY light field zeroed
++// (a TEST_CASE populates exactly the punctual fields it probes).
++// `modelTranslation` optionally moves the QUAD (not the camera/light) --
++// used by the directional regression TEST_CASE only.
++rx::material::DrawDataGpu makeBaseRow(glm::vec3 modelTranslation = glm::vec3(0.0F)) {
++    rx::material::DrawDataGpu row;
++    glm::mat4 model = glm::translate(glm::mat4(1.0F), modelTranslation);
++    glm::mat4 view = glm::lookAt(glm::vec3(0.0F, 0.0F, 2.0F), glm::vec3(0.0F, 0.0F, 0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
++    glm::mat4 proj = glm::orthoZO(-0.5F, 0.5F, -0.5F, 0.5F, 0.1F, 10.0F);
++    proj[1][1] *= -1.0F;  // Vulkan Y-flip -- see test_standard_pbr_unlit.cpp's own makeHeadOnRow() for the full account.
++    for (int col = 0; col < 4; ++col) {  // reversed-Z affine remap z' = 1-z.
++        const float row3 = (col == 3) ? 1.0F : 0.0F;
++        proj[col][2] = row3 - proj[col][2];
++    }
++    glm::mat4 viewProj = proj * view;
++    glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(model)));
++
++    row.model = glm::transpose(model);
++    row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
++    row.viewProj = glm::transpose(viewProj);
++    row.lightColor = glm::vec4(0.0F);  // OFF by default -- each TEST_CASE turns on exactly what it probes.
++    row.ambientColor = glm::vec4(0.0F);
++    row.cameraPosWorld = glm::vec4(0.0F, 0.0F, 2.0F, 0.0F);
++    row.materialIndex = 0;
++    return row;
++}
++
++struct DrawDataBuffer {
++    rx::rhi::Buffer buffer;
++    rx::rhi::BindlessHandle handle;
++};
++
++std::optional<DrawDataBuffer> createDrawDataBuffer(rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
++                                                     const rx::material::DrawDataGpu& row) {
++    auto buf = allocator.createHostVisibleBuffer(sizeof(row), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                                  rx::rhi::MemoryCategory::Internal);
++    if (!buf.has_value()) {
++        return std::nullopt;
++    }
++    std::memcpy(buf->mappedData(), &row, sizeof(row));
++    buf->flush();
++    rx::rhi::BindlessHandle handle = bindless.registerStorageBuffer(buf->handle(), sizeof(row));
++    if (!handle.isValid()) {
++        return std::nullopt;
++    }
++    return DrawDataBuffer{std::move(*buf), handle};
++}
++
++template <typename T>
++void setParam(std::vector<uint8_t>& blob, const std::vector<rx::material::MaterialParamInfo>& params, const char* name,
++              const T& value) {
++    for (const auto& p : params) {
++        if (p.name == name) {
++            REQUIRE(p.size == sizeof(T));
++            std::memcpy(blob.data() + p.offset, &value, sizeof(T));
++            return;
++        }
++    }
++    FAIL("param not found: ", name);
++}
++
++struct Rgba8 {
++    uint8_t r = 0, g = 0, b = 0, a = 0;
++};
++
++uint32_t makeWhiteTexture(rx::material::MaterialSystem& system) {
++    rx::material::TextureCreateInfo texInfo;
++    texInfo.width = 1;
++    texInfo.height = 1;
++    texInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
++    std::array<uint8_t, 4> whitePixel{255, 255, 255, 255};
++    texInfo.pixels = whitePixel.data();
++    texInfo.pixelBytes = whitePixel.size();
++    rx::material::TextureHandle tex = system.createTexture2D(texInfo);
++    REQUIRE(tex.isValid());
++    return system.textureBindlessIndex(tex);
++}
++
++uint32_t makeFlatNormalTexture(rx::material::MaterialSystem& system) {
++    rx::material::TextureCreateInfo texInfo;
++    texInfo.width = 1;
++    texInfo.height = 1;
++    texInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
++    std::array<uint8_t, 4> flatPixel{128, 128, 255, 255};
++    texInfo.pixels = flatPixel.data();
++    texInfo.pixelBytes = flatPixel.size();
++    rx::material::TextureHandle tex = system.createTexture2D(texInfo);
++    REQUIRE(tex.isValid());
++    return system.textureBindlessIndex(tex);
++}
++
++// Neutral StandardPbrParams blob -- white diffuse, non-metal, fully
++// rough (isolates a clean, distance/angle-independent-once-normalized
++// BRDF constant -- see this file's own header comment).
++std::vector<uint8_t> makePunctualBlob(rx::material::MaterialSystem& system, rx::material::MaterialHandle handle,
++                                       uint32_t whiteTex, uint32_t flatNormalTex, uint32_t samplerIndex) {
++    uint32_t blockSize = system.paramBlockSize(handle);
++    const auto params = system.materialParams(handle);
++    std::vector<uint8_t> blob(blockSize, 0);
++    setParam(blob, params, "baseColorFactor", std::array<float, 4>{1.0F, 1.0F, 1.0F, 1.0F});
++    setParam(blob, params, "metallicFactor", 0.0F);
++    setParam(blob, params, "roughnessFactor", 1.0F);
++    setParam(blob, params, "normalScale", 1.0F);
++    setParam(blob, params, "occlusionStrength", 1.0F);
++    setParam(blob, params, "alphaCutoff", 0.0F);
++    setParam(blob, params, "ior", 1.5F);
++    setParam(blob, params, "specularFactor", 1.0F);
++    setParam(blob, params, "specularColorFactorAndPad", std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++    setParam(blob, params, "dfgY", 1.0F);
++    setParam(blob, params, "emissiveFactorAndPad", std::array<float, 4>{0.0F, 0.0F, 0.0F, 0.0F});
++    setParam(blob, params, "baseColorTexture", whiteTex);
++    setParam(blob, params, "metallicRoughnessTexture", whiteTex);
++    setParam(blob, params, "normalTexture", flatNormalTex);
++    setParam(blob, params, "occlusionTexture", whiteTex);
++    setParam(blob, params, "emissiveTexture", whiteTex);
++    setParam(blob, params, "baseColorSampler", samplerIndex);
++    setParam(blob, params, "metallicRoughnessSampler", samplerIndex);
++    setParam(blob, params, "normalSampler", samplerIndex);
++    setParam(blob, params, "occlusionSampler", samplerIndex);
++    setParam(blob, params, "emissiveSampler", samplerIndex);
++    setParam(blob, params, "baseColorUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
++    setParam(blob, params, "metallicRoughnessUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
++    setParam(blob, params, "normalUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
++    setParam(blob, params, "occlusionUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
++    setParam(blob, params, "emissiveUvOffsetScale", std::array<float, 4>{0.0F, 0.0F, 1.0F, 1.0F});
++    return blob;
++}
++
++// One tiny 8x8 offscreen render -- ONE quad draw against a real
++// StandardPBR pipeline, reversed-Z depth. Returns the CENTER texel.
++// Mirrors test_standard_pbr_ibl_gpu.cpp's own renderQuad() shape verbatim
++// (this file's own established per-file rig-duplication convention).
++Rgba8 renderQuad(rx::rhi::Device& device, rx::rhi::Allocator& allocator, rx::rhi::BindlessTable& bindless,
++                  rx::rhi::BindlessHandle drawDataBufferHandle, uint32_t defaultSamplerIndex, const QuadMesh& mesh,
++                  rx::material::MaterialSystem& system, rx::material::MaterialHandle handle,
++                  const std::vector<uint8_t>& paramBlob) {
++    constexpr VkExtent2D kExtent{8, 8};
++    constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
++    constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++
++    auto scheduler = rx::task::Scheduler::create();
++    REQUIRE(scheduler != nullptr);
++    auto executor = rx::graph::Executor::create(device, *scheduler);
++    REQUIRE(executor != nullptr);
++
++    rx::graph::RenderGraph graph;
++    rx::graph::Pass& pass = graph.addPass("standard_pbr_punctual_test");
++    rx::graph::AttachmentDesc colorDesc;
++    colorDesc.format = kColorFormat;
++    pass.addColorOutput("color", colorDesc);
++    rx::graph::AttachmentDesc depthDesc;
++    depthDesc.format = kDepthFormat;
++    depthDesc.depthConvention = rx::graph::DepthConvention::Reversed;
++    pass.setDepthStencilOutput("depth", depthDesc);
++    graph.setBackbufferSource("color");
++
++    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
++    VkDescriptorPoolCreateInfo poolInfo{};
++    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.maxSets = 1;
++    poolInfo.poolSizeCount = 1;
++    poolInfo.pPoolSizes = &poolSize;
++    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorPool(device.device(), &poolInfo, nullptr, &descriptorPool) == VK_SUCCESS);
++
++    VkDescriptorSetLayoutBinding uboBinding{};
++    uboBinding.binding = 0;
++    uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    uboBinding.descriptorCount = 1;
++    uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    VkDescriptorSetLayoutCreateInfo setLayoutInfo{};
++    setLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    setLayoutInfo.bindingCount = 1;
++    setLayoutInfo.pBindings = &uboBinding;
++    VkDescriptorSetLayout paramSetLayout = VK_NULL_HANDLE;
++    REQUIRE(vkCreateDescriptorSetLayout(device.device(), &setLayoutInfo, nullptr, &paramSetLayout) == VK_SUCCESS);
++
++    rx::graph::PassSignature sig;
++    sig.colorCount = 1;
++    sig.colorFormats[0] = kColorFormat;
++    sig.depthFormat = kDepthFormat;
++    sig.samples = VK_SAMPLE_COUNT_1_BIT;
++    VkPipeline pipeline = system.getPipeline({handle, sig, 0});
++    REQUIRE(pipeline != VK_NULL_HANDLE);
++    VkPipelineLayout layout = system.pipelineLayout(handle);
++    uint32_t pushSize = system.layoutInfo(handle).pushRanges[0].size;
++
++    std::optional<rx::rhi::Buffer> paramBuffer;
++    VkDescriptorSet paramSet = VK_NULL_HANDLE;
++
++    pass.setExecute([&](rx::graph::PassContext& ctx) {
++        VkCommandBuffer cmd = ctx.cmd;
++        VkViewport viewport{0.0F, 0.0F, static_cast<float>(kExtent.width), static_cast<float>(kExtent.height), 0.0F, 1.0F};
++        VkRect2D scissor{{0, 0}, kExtent};
++        vkCmdSetViewport(cmd, 0, 1, &viewport);
++        vkCmdSetScissor(cmd, 0, 1, &scissor);
++
++        VkDescriptorSet bindlessSet = bindless.descriptorSet();
++        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &bindlessSet, 0, nullptr);
++        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++
++        rx::material::MaterialGlobalsPush push;
++        push.defaultSamplerIndex = defaultSamplerIndex;
++        push.drawDataBufferIndex = drawDataBufferHandle.index();
++        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushSize, &push);
++
++        auto buf = allocator.createHostVisibleBuffer(paramBlob.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
++                                                       rx::rhi::MemoryCategory::Internal);
++        REQUIRE(buf.has_value());
++        std::memcpy(buf->mappedData(), paramBlob.data(), paramBlob.size());
++        buf->flush();
++
++        VkDescriptorSetAllocateInfo allocInfo{};
++        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++        allocInfo.descriptorPool = descriptorPool;
++        allocInfo.descriptorSetCount = 1;
++        allocInfo.pSetLayouts = &paramSetLayout;
++        REQUIRE(vkAllocateDescriptorSets(device.device(), &allocInfo, &paramSet) == VK_SUCCESS);
++
++        VkDescriptorBufferInfo bufferInfo{buf->handle(), 0, paramBlob.size()};
++        VkWriteDescriptorSet write{};
++        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        write.dstSet = paramSet;
++        write.dstBinding = 0;
++        write.descriptorCount = 1;
++        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++        write.pBufferInfo = &bufferInfo;
++        vkUpdateDescriptorSets(device.device(), 1, &write, 0, nullptr);
++        paramBuffer = std::move(buf);
++
++        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &paramSet, 0, nullptr);
++
++        VkDeviceSize zeroOffset = 0;
++        VkBuffer vbHandle = mesh.vertexBuffer.handle();
++        vkCmdBindVertexBuffers(cmd, 0, 1, &vbHandle, &zeroOffset);
++        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
++        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kQuadIndices.size()), 1, 0, 0, /*firstInstance=*/0);
++    });
++
++    rx::graph::CompileInfo compileInfo;
++    compileInfo.swapchainWidth = kExtent.width;
++    compileInfo.swapchainHeight = kExtent.height;
++    compileInfo.swapchainFormat = kColorFormat;
++    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(compileInfo);
++    executor->realize(graph);
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kColorFormat;
++    imageInfo.extent = {kExtent.width, kExtent.height, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    VkImage image = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImage(device.device(), &imageInfo, nullptr, &image) == VK_SUCCESS);
++
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(device.device(), image, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(device.physicalDevice(), &memProps);
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    REQUIRE(memoryTypeIndex != UINT32_MAX);
++    VkMemoryAllocateInfo allocInfo{};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memoryTypeIndex;
++    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
++    REQUIRE(vkAllocateMemory(device.device(), &allocInfo, nullptr, &imageMemory) == VK_SUCCESS);
++    REQUIRE(vkBindImageMemory(device.device(), image, imageMemory, 0) == VK_SUCCESS);
++
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = image;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kColorFormat;
++    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    VkImageView view = VK_NULL_HANDLE;
++    REQUIRE(vkCreateImageView(device.device(), &viewInfo, nullptr, &view) == VK_SUCCESS);
++
++    VkDeviceSize pixelBytes = static_cast<VkDeviceSize>(kExtent.width) * kExtent.height * 4;
++    auto readback =
++        allocator.createHostVisibleBuffer(pixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, rx::rhi::MemoryCategory::Internal);
++    REQUIRE(readback.has_value());
++
++    {
++        auto cmdCtx = rx::rhi::CommandContext::create(device.device(), device.graphicsQueue(), device.graphicsQueueFamily());
++        REQUIRE(cmdCtx.has_value());
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) { executor->execute(graph, cmd, image, view, kExtent); });
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            region.imageExtent = {kExtent.width, kExtent.height, 1};
++            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1, &region);
++        });
++    }
++    readback->invalidate();
++    const auto* rawPixels = static_cast<const uint8_t*>(readback->mappedData());
++    const size_t centerIndex = (static_cast<size_t>(kExtent.height / 2) * kExtent.width + kExtent.width / 2) * 4;
++    Rgba8 result{rawPixels[centerIndex], rawPixels[centerIndex + 1], rawPixels[centerIndex + 2], rawPixels[centerIndex + 3]};
++
++    vkDestroyImageView(device.device(), view, nullptr);
++    vkDestroyImage(device.device(), image, nullptr);
++    vkFreeMemory(device.device(), imageMemory, nullptr);
++    vkDestroyDescriptorSetLayout(device.device(), paramSetLayout, nullptr);
++    vkDestroyDescriptorPool(device.device(), descriptorPool, nullptr);
++    return result;
++}
++
++// End-to-end rig bundle -- built once per TEST_CASE, reused across every
++// render() call inside it (multiple distances/angles per probe).
++struct Rig {
++    std::unique_ptr<Fixture> fixture;
++    std::optional<QuadMesh> mesh;
++    std::unique_ptr<rx::material::MaterialSystem> system;
++    rx::material::MaterialHandle material;
++    uint32_t whiteTex = 0;
++    uint32_t flatNormalTex = 0;
++    uint32_t samplerIndex = 0;
++    VkSampler rawSampler = VK_NULL_HANDLE;
++    std::vector<uint8_t> blob;
++
++    Rgba8 render(const rx::material::DrawDataGpu& row) {
++        auto drawDataBuffer = createDrawDataBuffer(fixture->allocator, fixture->bindless, row);
++        REQUIRE(drawDataBuffer.has_value());
++        return renderQuad(fixture->device, fixture->allocator, fixture->bindless, drawDataBuffer->handle,
++                           samplerIndex, *mesh, *system, material, blob);
++    }
++};
++
++// Explicit teardown for the ONE raw Vulkan object this rig creates
++// outside any RAII wrapper (the sampler) -- called at the END of every
++// TEST_CASE using a rig, before its own device/fixture teardown, exactly
++// matching test_standard_pbr_unlit.cpp's own `destroyRig()` precedent (a
++// leaked sampler otherwise fires `VUID-vkDestroyDevice-device-00378` at
++// implicit `Fixture` teardown -- reproduced directly during this file's
++// own development before this function existed).
++void destroyRig(Rig& rig) { vkDestroySampler(rig.fixture->device.device(), rig.rawSampler, nullptr); }
++
++std::unique_ptr<Rig> makeRig(const char* name) {
++    auto fixtureOpt = makeFixture(name);
++    if (!fixtureOpt.has_value()) {
++        return nullptr;
++    }
++    auto fixture = std::make_unique<Fixture>(std::move(*fixtureOpt));
++    auto mesh = createQuadMesh(fixture->allocator);
++    REQUIRE(mesh.has_value());
++    auto system = rx::material::MaterialSystem::create(fixture->device, fixture->bindless, freshCachePath(name));
++    REQUIRE(system != nullptr);
++    rx::material::MaterialHandle material =
++        system->loadMaterial(shaderDataPath("standard_pbr.slang"), rx::material::MaterialFixedFunctionState{});
++
++    auto rig = std::make_unique<Rig>();
++    rig->whiteTex = makeWhiteTexture(*system);
++    rig->flatNormalTex = makeFlatNormalTexture(*system);
++    rig->samplerIndex = 0;
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_LINEAR;
++    samplerInfo.minFilter = VK_FILTER_LINEAR;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
++    VkSampler sampler = VK_NULL_HANDLE;
++    REQUIRE(vkCreateSampler(fixture->device.device(), &samplerInfo, nullptr, &sampler) == VK_SUCCESS);
++    rx::rhi::BindlessHandle samplerHandle = fixture->bindless.registerSampler(sampler);
++    REQUIRE(samplerHandle.isValid());
++    rig->samplerIndex = samplerHandle.index();
++    rig->rawSampler = sampler;
++    rig->blob = makePunctualBlob(*system, material, rig->whiteTex, rig->flatNormalTex, rig->samplerIndex);
++    rig->material = material;
++    rig->system = std::move(system);
++    rig->mesh.emplace(std::move(*mesh));
++    rig->fixture = std::move(fixture);
++    return rig;
++}
++
++// Builds a Point-light row -- light on the +Z axis at world distance `d`
++// from the origin (SAME axis as the quad's own normal -- see this file's
++// own header comment for why this isolates the attenuation term). `range
++// <= 0` == infinite range (no windowing).
++rx::material::DrawDataGpu makePointRow(float d, float range, glm::vec3 colorCandela) {
++    rx::material::DrawDataGpu row = makeBaseRow();
++    row.lightType = 1;  // rx::scene::LightType::Point
++    row.lightColor = glm::vec4(colorCandela, 0.0F);
++    row.lightPositionWorld = glm::vec4(0.0F, 0.0F, d, 0.0F);
++    row.lightRange = range;
++    return row;
++}
++
++bool near(float actual, float expected, float relTolerance) {
++    return std::abs(actual - expected) <= relTolerance * std::max(std::abs(expected), 1.0F);
++}
++
++}  // namespace
++
++TEST_CASE("StandardPBR punctual: Directional-light regression -- measured intensity is IDENTICAL at two "
++          "world positions at different distances from the scene origin [gate matrix 'Directional light: "
++          "literally unattenuated' row: 'a directional light's measured intensity is IDENTICAL at two "
++          "probe points at different distances'] -- proves the generalized punctual-light term did NOT "
++          "accidentally introduce a distance term into the Directional (lightType==0) path.") {
++    auto rig = makeRig("directional_regression");
++    if (!rig) {
++        return;
++    }
++
++    rx::material::DrawDataGpu nearRow = makeBaseRow(glm::vec3(0.0F, 0.0F, 0.0F));
++    nearRow.lightType = 0;  // Directional (also the default).
++    nearRow.lightDirWorld = glm::vec4(0.0F, 0.0F, 1.0F, 0.0F);
++    nearRow.lightColor = glm::vec4(2.0F, 2.0F, 2.0F, 0.0F);
++
++    rx::material::DrawDataGpu farRow = nearRow;
++    // Move the QUAD (model translation) to a different world position --
++    // the light stays a constant per-pass direction/color either way
++    // (that IS the "not attenuated" claim under test); only the SHADED
++    // WORLD POSITION changes. Translated along the camera's own view
++    // axis (-Z, staying within the rig's [0.1,10] near/far range and its
++    // [-0.5,0.5] ortho X/Y extent so the quad remains visible/centered --
++    // an EARLIER version of this TEST_CASE translated the quad far enough
++    // to fall outside the view frustum entirely, which silently read back
++    // the graph's own black clear color instead of a real shaded pixel;
++    // caught empirically by this TEST_CASE's own `nearPixel.r > 0`
++    // non-degenerate assertion below failing against a black `farPixel`).
++    farRow.model = glm::transpose(glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -3.0F)));
++
++    Rgba8 nearPixel = rig->render(nearRow);
++    Rgba8 farPixel = rig->render(farRow);
++    CHECK(nearPixel.r == farPixel.r);
++    CHECK(nearPixel.g == farPixel.g);
++    CHECK(nearPixel.b == farPixel.b);
++    // Non-degenerate: both pixels are actually lit (not both coincidentally black).
++    CHECK(nearPixel.r > 0);
++    destroyRig(*rig);
++}
++
++TEST_CASE("StandardPBR punctual: Point light near-field inverse-square falloff -- rendered intensity at "
++          "distance d matches the inverse-square expectation within tolerance [ticket #49's own named "
++          "acceptance criterion: 'Single-light analytic falloff probe']. d1=1, d2=2, infinite range (both "
++          "well within the near-field where the range-window term is moot) -- expected ratio "
++          "pixel(d1)/pixel(d2) == (d2/d1)^2 == 4.0 exactly (the fixed BRDF constant this rig's own "
++          "matched-pose geometry produces cancels in the ratio -- see this file's own header comment).") {
++    auto rig = makeRig("point_inverse_square");
++    if (!rig) {
++        return;
++    }
++    Rgba8 near1 = rig->render(makePointRow(1.0F, 0.0F, glm::vec3(2.0F)));
++    Rgba8 near2 = rig->render(makePointRow(2.0F, 0.0F, glm::vec3(2.0F)));
++    REQUIRE(near2.r > 0);  // non-degenerate (would silently pass a 0/0 ratio check otherwise).
++    float measuredRatio = static_cast<float>(near1.r) / static_cast<float>(near2.r);
++    MESSAGE("point inverse-square: pixel(d=1)=", static_cast<int>(near1.r), " pixel(d=2)=", static_cast<int>(near2.r),
++            " measured ratio=", measuredRatio, " expected=4.0");
++    CHECK(near(measuredRatio, 4.0F, 0.15F));  // 8-bit quantization tolerance, matching this suite's own ratio-test idiom.
++    destroyRig(*rig);
++}
++
++TEST_CASE("StandardPBR punctual: Point light range-window DISCRIMINATION -- a ranged light's falloff near "
++          "its own cutoff diverges sharply from a pure inverse-square (unranged) light at the SAME two "
++          "distances, proving range-windowing is actually CONDITIONAL on range's presence, not always-on "
++          "or always-off [gate matrix 'Range absent = infinite range, pure inverse-square law' row's own "
++          "named acceptance criterion]. range=10, d1=5 (window still close to 1.0), d2=9 (close to the "
++          "cutoff, window~0.34 for the RANGED light, still 1.0 for the UNRANGED light at the same "
++          "distance) -- hand-computed (python3, double precision): rangeAttenuation(5,10)=0.0375, "
++          "rangeAttenuation(9,10)=0.0042457, ratio=8.8325; the UNRANGED equivalent ratio at the same two "
++          "distances is exactly (9/5)^2=3.24 -- a ~2.7x difference. (d1/d2 deliberately NOT 1 and 9: an "
++          "earlier version of this TEST_CASE used d1=1, whose near-field attenuation is close enough to "
++          "1.0 that the resulting >80x dynamic range clipped the near pixel to 255 at any color intensity "
++          "large enough to keep the far/windowed pixel above 8-bit noise -- caught empirically via this "
++          "TEST_CASE's own logged raw pixel values, not asserted; d1=5 keeps both endpoints in a clean, "
++          "non-clipping, non-zero 8-bit range.)") {
++    auto rig = makeRig("point_range_window");
++    if (!rig) {
++        return;
++    }
++    const glm::vec3 color(20.0F);
++    Rgba8 rangedNear = rig->render(makePointRow(5.0F, 10.0F, color));
++    Rgba8 rangedFar = rig->render(makePointRow(9.0F, 10.0F, color));
++    Rgba8 unrangedNear = rig->render(makePointRow(5.0F, 0.0F, color));
++    Rgba8 unrangedFar = rig->render(makePointRow(9.0F, 0.0F, color));
++
++    MESSAGE("range-window discrimination raw pixels: rangedNear=", static_cast<int>(rangedNear.r), " rangedFar=",
++            static_cast<int>(rangedFar.r), " unrangedNear=", static_cast<int>(unrangedNear.r), " unrangedFar=",
++            static_cast<int>(unrangedFar.r));
++    REQUIRE(rangedFar.r > 0);
++    REQUIRE(unrangedFar.r > 0);
++    REQUIRE(rangedNear.r < 250);   // headroom check -- not saturated against the 8-bit ceiling.
++    REQUIRE(unrangedNear.r < 250);
++    float rangedRatio = static_cast<float>(rangedNear.r) / static_cast<float>(rangedFar.r);
++    float unrangedRatio = static_cast<float>(unrangedNear.r) / static_cast<float>(unrangedFar.r);
++    MESSAGE("range-window discrimination: ranged ratio=", rangedRatio, " (expect ~8.83), unranged ratio=",
++            unrangedRatio, " (expect ~3.24)");
++
++    CHECK(near(unrangedRatio, 3.24F, 0.15F));
++    CHECK(near(rangedRatio, 8.8325F, 0.15F));
++    // The RANGED ratio must be markedly larger than the unranged one --
++    // the windowing term's own extra darkening near the cutoff. This is
++    // the actual discrimination: a shader that silently ignored
++    // `lightRange` entirely would produce rangedRatio == unrangedRatio.
++    CHECK(rangedRatio > unrangedRatio * 2.0F);
++    destroyRig(*rig);
++}
++
++TEST_CASE("StandardPBR punctual: Spot cone angular attenuation -- dead-center (full brightness), inside "
++          "the inner/outer window (partial, matching the squared-saturate closed form), and outside the "
++          "outer cone (fully dark) [gate matrix 'Spot cone attenuation (inner/outer angle)' row: 'GPU "
++          "falloff probe asserts a spot light's measured intensity at a sampled point inside/at/outside "
++          "the outer cone matches the saturate(...)^2 curve's predicted value']. Light POSITION is fixed "
++          "at (0,0,4) (constant distance attenuation across all three renders); only the light's own "
++          "FACING direction (`lightSpotDirWorld`) is tilted by `theta` around the X axis -- see this "
++          "file's own header comment for the `dot((0,0,-1),(0,sin(theta),-cos(theta)))==cos(theta)` "
++          "derivation.") {
++    auto rig = makeRig("spot_cone");
++    if (!rig) {
++        return;
++    }
++    const float innerConeAngle = 0.2F;
++    const float outerConeAngle = 0.6F;
++    const rx::scene::lightmath::SpotAngleScaleOffset scaleOffset =
++        rx::scene::lightmath::spotAngleScaleOffset(innerConeAngle, outerConeAngle);
++
++    auto makeSpotRow = [&](float theta) {
++        rx::material::DrawDataGpu row = makePointRow(4.0F, 0.0F, glm::vec3(4.0F));
++        row.lightType = 2;  // rx::scene::LightType::Spot
++        row.lightAngleScale = scaleOffset.scale;
++        row.lightAngleOffset = scaleOffset.offset;
++        row.lightSpotDirWorld = glm::vec4(0.0F, std::sin(theta), -std::cos(theta), 0.0F);
++        return row;
++    };
++
++    Rgba8 center = rig->render(makeSpotRow(0.0F));    // dead center: cd=1, full brightness.
++    Rgba8 partial = rig->render(makeSpotRow(0.4F));   // strictly inside (inner=0.2, outer=0.6): partial.
++    Rgba8 outside = rig->render(makeSpotRow(0.8F));   // beyond outerConeAngle: fully dark.
++
++    MESSAGE("spot cone: center=", static_cast<int>(center.r), " partial=", static_cast<int>(partial.r),
++            " outside=", static_cast<int>(outside.r));
++
++    REQUIRE(center.r > 0);
++    // DISCRIMINATION: fully outside the cone must read EXACT black, not
++    // merely dim -- a broken/missing cone term would still light this
++    // pixel (same brightness as `center`, since distance/NdotL are held
++    // constant across all three renders).
++    CHECK(outside.r == 0);
++    CHECK(outside.g == 0);
++    CHECK(outside.b == 0);
++    // Partial must sit STRICTLY between outside (0) and center (full) --
++    // proving the squared-saturate curve is a real, continuous falloff,
++    // not a binary in/out step function.
++    CHECK(partial.r > 0);
++    CHECK(partial.r < center.r);
++    // Matches the closed-form squared-saturate curve's own predicted
++    // ratio (angleAttenuation(theta=0.4) == 0.38274, hand-computed
++    // independently, python3): partial/center should track that ratio
++    // (both share the identical distance/NdotL/BRDF-constant factors,
++    // which cancel exactly, same methodology as the point-light ratio
++    // tests above).
++    float measuredRatio = static_cast<float>(partial.r) / static_cast<float>(center.r);
++    CHECK(near(measuredRatio, 0.38274F, 0.2F));
++    destroyRig(*rig);
++}
++
++TEST_CASE("StandardPBR punctual: pre-exposure coherence -- a Point light's rendered intensity scales by "
++          "EXACTLY rx::scene::Camera::exposure()'s own ratio when the camera's exposure setting changes "
++          "[Task 13's own 'reconciliation' requirement: punctual lights, the environment (already proven "
++          "by Task 4/Task 10's own tests), and directional lights all go through the SAME single "
++          "pre-exposure multiplication point -- this TEST_CASE is the Point-light half of that proof, "
++          "mirroring test_standard_pbr_unlit.cpp's own directional-light pre-exposure TEST_CASE exactly]. "
++          "The RATIO assertion (not an absolute value) is the same double-application-revert "
++          "discriminator Task 4's own report names: a stray leftover second exposure multiply would "
++          "measure the SQUARE of the expected ratio, not the ratio itself.") {
++    auto rig = makeRig("point_pre_exposure");
++    if (!rig) {
++        return;
++    }
++    rx::scene::Camera neutralCamera;  // exposure() == 1.0 exactly (Task 4's own engaged-neutral default).
++    rx::scene::Camera brighterCamera;
++    brighterCamera.setExposure(-1.0F);  // exposure() == 5/3 exactly [task-4-report.md's own cited value].
++
++    const glm::vec3 baseColorCandela(3.0F);
++    auto makeExposedRow = [&](float exposure) {
++        return makePointRow(2.0F, 0.0F, baseColorCandela * exposure);
++    };
++
++    Rgba8 neutralPixel = rig->render(makeExposedRow(neutralCamera.exposure()));
++    Rgba8 brighterPixel = rig->render(makeExposedRow(brighterCamera.exposure()));
++    REQUIRE(neutralPixel.r > 0);
++    float measuredRatio = static_cast<float>(brighterPixel.r) / static_cast<float>(neutralPixel.r);
++    float expectedRatio = brighterCamera.exposure() / neutralCamera.exposure();
++    MESSAGE("point pre-exposure: neutral=", static_cast<int>(neutralPixel.r), " brighter=",
++            static_cast<int>(brighterPixel.r), " measured ratio=", measuredRatio, " expected=", expectedRatio);
++    CHECK(near(measuredRatio, expectedRatio, 0.1F));
++    // Explicit double-application discriminator: the SQUARE of the
++    // expected ratio would be a materially different (larger) number --
++    // if this failed here (measured close to expectedRatio^2 instead),
++    // that would mean exposure is being applied twice somewhere.
++    CHECK_FALSE(near(measuredRatio, expectedRatio * expectedRatio, 0.1F));
++    destroyRig(*rig);
++}
+diff --git a/src/rx_scene/CMakeLists.txt b/src/rx_scene/CMakeLists.txt
+index 846b2ee..87d2988 100644
+--- a/src/rx_scene/CMakeLists.txt
++++ b/src/rx_scene/CMakeLists.txt
+@@ -19,15 +19,18 @@
+ # [Phase 4 Stage 2 Task 19] rx_task PUBLIC: DrawListBuilder::build()/
+ # buildShadow()/recordDrawList() all take `rx::task::Scheduler&` directly
+ # in their own public signatures (draw_list.h) -- the parallel AABB-cull
+ # fan-out D15 requires. Still device-free (rx_task itself has no VkDevice
+ # dependency -- it is a thin enkiTS wrapper, matching this library's own
+ # "no VkDevice, no rx_rhi_vk" posture verbatim).
+ add_library(rx_scene STATIC
+     camera.cpp
+     scene.cpp
+     draw_list.cpp
++    # Phase 5 Stage 2 Task 13 [#49] -- device-free KHR_lights_punctual
++    # attenuation math (see light_math.h's own header comment).
++    light_math.cpp
+ )
+ target_include_directories(rx_scene PUBLIC include)
+ target_link_libraries(rx_scene PUBLIC rx_core rx_asset rx_task)
+ 
+ add_subdirectory(tests)
+diff --git a/src/rx_scene/include/rx_scene/light_math.h b/src/rx_scene/include/rx_scene/light_math.h
+new file mode 100644
+index 0000000..c7d8f07
+--- /dev/null
++++ b/src/rx_scene/include/rx_scene/light_math.h
+@@ -0,0 +1,95 @@
++#pragma once
++
++#include <glm/glm.hpp>
++
++// rx_scene/light_math.h -- device-free KHR_lights_punctual attenuation math
++// [Phase 5 Stage 2 Task 13, #49; gate matrix-p5t13-physical-lights.md;
++// gate ruling rulings-2026-08-20.md, "T13 (#49): KHR_lights_punctual unit
++// mapping is spec-exact and value-asserted"]. Pure functions, no VkDevice,
++// no Scene dependency -- the SAME formulas `shaders/material/standard_pbr.
++// slang`'s punctual-light term ports into Slang, kept here ONCE so a C++
++// unit test can assert the closed form directly (light_math_test.cpp)
++// independently of any GPU render, and so the GPU falloff probes
++// (test_standard_pbr_punctual_gpu.cpp) can compute their own expected
++// values by calling these SAME functions rather than re-deriving the
++// arithmetic inline at every call site.
++//
++// UNIT CONVENTION [KHR_lights_punctual README.md, Khronos glTF commit
++// 2b29723d025a995971726f2989697cdc49b1222a, fetched verbatim this task]:
++// "point and spot lights use luminous intensity in candela (lm/sr) while
++// directional lights use illuminance in lux (lm/m^2)... range... Within
++// the range of the light, attenuation should follow the inverse square
++// law as closely as possible... A recommended implementation... attenuation
++// = max(min(1.0-(current_distance/range)^4,1),0)/current_distance^2".
++// `rangeAttenuation()` below is that formula, LITERALLY (the un-squared
++// form) -- gate matrix's own Open Question resolution: Filament's shipped
++// shader (`getSquareFalloffAttenuation()`, shaders/src/
++// surface_light_punctual.fs:93-99, google/filament v1.75.0 pinned commit
++// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80) SQUARES the smooth-window term
++// an extra time (`smoothFactor*smoothFactor`), which is NOT numerically
++// identical to the KHR spec's own literal formula near `range` (both agree
++// only in the near-field, d<<range) -- the matrix recommends the spec's
++// own literal form as this project's conformance-path default, since a
++// Khronos-Sample-Renderer-class reference (this project's own Task 11
++// conformance harness target) is what any future light-bearing conformance
++// case would be compared against. INDEPENDENTLY CONFIRMED this task: the
++// pinned glTF-Sample-Renderer commit 863b981fb755359063e370ff7b6e956bda0716e2
++// (source/Renderer/shaders/punctual.glsl, `getRangeAttenuation()`) uses the
++// IDENTICAL un-squared formula -- so the spec text, its own reference code,
++// AND the actual Khronos conformance renderer all agree; Filament's shader
++// is the outlier here (a deliberate "cinematic" softening, not a spec
++// reading difference).
++namespace rx::scene::lightmath {
++
++// KHR_lights_punctual range-property attenuation (README.md#range-property,
++// quoted above). `range <= 0.0` means "no configured range" -- this
++// project's own established sentinel (`LightRecord::range`'s "0.0 = inert"
++// convention, scene.h) doubling as glTF-Sample-Renderer's own "negative
++// range means unlimited" case (punctual.glsl's `getRangeAttenuation()`) --
++// returns the un-windowed `1/distance^2` term in that case. `distance` is
++// clamped away from 0 (a coincident light/shading-point is physically
++// degenerate, not a real scene state) to avoid a division producing +inf.
++[[nodiscard]] float rangeAttenuation(float distance, float range);
++
++// KHR_lights_punctual spot-cone precomputation -- README.md's own "Inner
++// and Outer Cone Angles" reference code, quoted verbatim: "float
++// lightAngleScale = 1.0f / max(0.001f, cos(innerConeAngle) -
++// cos(outerConeAngle)); float lightAngleOffset = -cos(outerConeAngle) *
++// lightAngleScale;". Computed ONCE per light (CPU-side, like the spec's
++// own comment says: "These two values can be calculated on the CPU and
++// passed into the shader") -- `standard_pbr.slang`'s punctual term reads
++// the two scalars directly rather than re-deriving them from the raw cone
++// angles per-fragment.
++struct SpotAngleScaleOffset {
++    float scale = 0.0F;
++    float offset = 0.0F;
++
++    bool operator==(const SpotAngleScaleOffset&) const = default;
++};
++[[nodiscard]] SpotAngleScaleOffset spotAngleScaleOffset(float innerConeAngle, float outerConeAngle);
++
++// The shader-side squared-saturate cone term (SAME reference code,
++// continued): "float cd = dot(spotlightDir, normalizedLightVector); float
++// angularAttenuation = saturate(cd * lightAngleScale + lightAngleOffset);
++// angularAttenuation *= angularAttenuation;". `spotDirWorld` is the spot
++// light's own FACING/travel direction (glTF's local -Z axis rotated by the
++// node's world transform -- `LightRecord::direction`'s own existing
++// convention, matching `DirectionalLightDesc::dir`'s "light travel
++// direction" semantic). `travelToFragmentWorld` is the unit vector FROM
++// the light's position TOWARD the shaded point (i.e. `normalize(worldPos -
++// lightPositionWorld)`) -- NOT the "toward light" `L` vector NdotL uses;
++// see this header's own top comment / the task report for the sign-
++// convention derivation, cross-checked directly against the pinned
++// glTF-Sample-Renderer's own `getSpotAttenuation()` (punctual.glsl:
++// `actualCos = dot(normalize(spotDirection), normalize(-pointToLight))`
++// where `pointToLight = light.position - worldPosition`, i.e. `-pointToLight
++// == worldPosition - light.position` -- the SAME travel-direction vector
++// this function takes). Both inputs are assumed pre-normalized by the
++// caller (the GPU port normalizes once per fragment; this device-free
++// twin trusts its own unit-test callers to pass unit vectors, matching
++// this project's other device-free math helpers' own convention of not
++// re-normalizing an already-unit input defensively).
++[[nodiscard]] float spotAngleAttenuation(glm::vec3 spotDirWorld, glm::vec3 travelToFragmentWorld,
++                                          SpotAngleScaleOffset scaleOffset);
++
++}  // namespace rx::scene::lightmath
+diff --git a/src/rx_scene/include/rx_scene/scene.h b/src/rx_scene/include/rx_scene/scene.h
+index 3d85128..55617c9 100644
+--- a/src/rx_scene/include/rx_scene/scene.h
++++ b/src/rx_scene/include/rx_scene/scene.h
+@@ -211,30 +211,94 @@ struct LightRecord {
+     glm::vec3 colorLux{1.0F, 1.0F, 1.0F};
+     float range = 0.0F;             // Point, Spot falloff radius [reserved, Phase 4 inert]
+     float innerConeAngle = 0.0F;    // Spot [reserved, Phase 4 inert]
+     float outerConeAngle = 0.0F;    // Spot [reserved, Phase 4 inert]
+     bool castsShadows = true;
+     uint8_t channels = 0xFF;
+ 
+     bool operator==(const LightRecord&) const = default;
+ };
+ 
+-// The only light creation surface Phase 4 exposes publicly [D19; brief:
++// The only light creation surface Phase 4 exposed publicly [D19; brief:
+ // "struct DirectionalLightDesc { glm::vec3 dir; glm::vec3 colorLux; bool
+-// castsShadows; uint8_t channels = 0xFF; }"].
++// castsShadows; uint8_t channels = 0xFF; }"]. `colorLux` is illuminance
++// [KHR_lights_punctual README.md, Khronos glTF commit
++// 2b29723d025a995971726f2989697cdc49b1222a: "directional lights use
++// illuminance in lux (lm/m^2)... Because it is at an infinite distance,
++// the light is not attenuated"] -- `color * intensity`, never scaled by
++// distance anywhere downstream (standard_pbr.slang's own punctual term).
+ struct DirectionalLightDesc {
+     glm::vec3 dir{0.0F, -1.0F, 0.0F};
+     glm::vec3 colorLux{1.0F, 1.0F, 1.0F};
+     bool castsShadows = true;
+     uint8_t channels = 0xFF;
+ };
+ 
++// [Phase 5 Stage 2 Task 13, #49] Mirrors `DirectionalLightDesc`'s own
++// shape/conventions exactly (gate matrix's own recommendation -- "no new
++// pattern needed, the precedent is already in this same file"). `position`
++// is world-space [KHR spec: "the light's position is defined as the
++// node's world location"]. `colorCandela` is LUMINOUS INTENSITY [KHR spec:
++// "point... lights use luminous intensity in candela (lm/sr)"] --
++// `color * intensity`, in candela, NOT lux -- `Scene`'s own downstream
++// consumer (the shading equation, via `rx::scene::lightmath::
++// rangeAttenuation()`/standard_pbr.slang's ported twin) converts a
++// punctual light's candela intensity into a lux-equivalent irradiance
++// contribution at the shaded point via the inverse-square-law attenuation
++// term, exactly Filament's own `light.colorIntensity.rgb * light.
++// attenuation * NoL` composition (shaders/src/surface_light_punctual.fs,
++// google/filament v1.75.0 pinned commit
++// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80) -- `colorCandela` itself is
++// NEVER unit-converted at creation time (no lumen->candela rescale: a
++// glTF `point`/`spot` light's own `intensity` number is ALREADY candela
++// by spec, see `instantiateImportedLights()`'s own header comment for the
++// "no conversion at import" acceptance criterion this satisfies).
++// `range <= 0.0` means "no configured range" -- pure inverse-square, no
++// windowing (`LightRecord::range`'s own pre-existing "0.0 = inert"
++// sentinel, scene.h's own LightRecord comment -- matches glTF's own
++// "range... undefined... assumed infinite" default exactly, and glTF-
++// Sample-Renderer's identical "negative range means unlimited" reading).
++struct PointLightDesc {
++    glm::vec3 position{0.0F, 0.0F, 0.0F};
++    glm::vec3 colorCandela{1.0F, 1.0F, 1.0F};
++    float range = 0.0F;
++    bool castsShadows = true;
++    uint8_t channels = 0xFF;
++};
++
++// [Phase 5 Stage 2 Task 13, #49] Mirrors `PointLightDesc`'s own shape,
++// adding `dir` (the spot's own FACING/travel direction -- glTF's local
++// -Z axis rotated by the node's world transform, SAME "light travel
++// direction" convention `DirectionalLightDesc::dir` already establishes)
++// and the KHR cone-angle pair. `colorCandela` -- KHR spec, quoted:
++// "Spot light intensity refers to the brightness inside the
++// innerConeAngle (and at the location of the light) and is defined in
++// candela" -- same unit/no-conversion convention as `PointLightDesc::
++// colorCandela` above; the CONE shapes the attenuation multiplicatively,
++// it does not rescale the base candela value.  `innerConeAngle`/
++// `outerConeAngle` default to the KHR spec's own documented defaults
++// (`0`/`PI/4` respectively, README.md's own light-shared-properties
++// table) so a caller that only cares about `outerConeAngle` (the spec's
++// own "engines that don't support two angles... use outerConeAngle...
++// leaving innerConeAngle to implicitly be 0" fallback) gets spec-correct
++// behavior without setting `innerConeAngle` explicitly.
++struct SpotLightDesc {
++    glm::vec3 position{0.0F, 0.0F, 0.0F};
++    glm::vec3 dir{0.0F, 0.0F, -1.0F};
++    glm::vec3 colorCandela{1.0F, 1.0F, 1.0F};
++    float range = 0.0F;
++    float innerConeAngle = 0.0F;
++    float outerConeAngle = 0.7853981633974483F;  // PI/4 [KHR spec default].
++    bool castsShadows = true;
++    uint8_t channels = 0xFF;
++};
++
+ // [Phase 5 Task 10, #46, FG1 closure] The scene-level environment binding
+ // -- skybox pass sampling the base cubemap + IBL diffuse/specular feeding
+ // every lit-path lobe (the ticket's own text). rx::scene stays DEVICE-FREE
+ // (no VkDevice/rx_rhi_vk dependency anywhere in this library -- see this
+ // header's own top comment), so `EnvironmentDesc` carries plain D11-style
+ // BINDLESS INDICES (uint32_t), never a `rx::rhi::Texture2D`/`BindlessHandle`
+ // -- the SAME "engine-defined interface consumed by index, never by
+ // concrete GPU type" convention `asset::TextureRef`/`RenderableDesc`'s own
+ // texture-index fields already establish. A production caller (samples/
+ // 08_gltf_viewer) registers `rx::ibl::bakeEnvironment()`'s own BakeResult
+@@ -271,28 +335,60 @@ struct EnvironmentDesc {
+     // sampler for the three cube reads above, a bilinear CLAMP_TO_EDGE
+     // sampler for the 2D DFG LUT (see material.slang's own RxDrawData
+     // header comment for why these are two DISTINCT samplers, not one
+     // shared index).
+     uint32_t cubeSamplerIndex = 0;
+     uint32_t dfgSamplerIndex = 0;
+     // rx::ibl::BakeResult::prefilteredMipCount - 1 -- the roughness-to-LOD
+     // remap's own natural unit (standard_pbr.slang's own `roughness *
+     // maxPrefilteredLod`).
+     float maxPrefilteredLod = 0.0F;
+-    // [T10's own "physical units" ruling -- see material.slang's own
+-    // RxDrawData::envIntensity header comment for the full unit-convention
+-    // rationale] Environment radiance/luminance in this scene's own
+-    // documented physical-ish unit, PRE-EXPOSURE (i.e. NOT yet multiplied
+-    // by `rx::scene::Camera::exposure()` -- a DrawDataGpu/RxSkyboxData
+-    // PRODUCER applies that multiply once, per Task 4's own pre-exposure
+-    // convention, the same point `lightColor`/`ambientColor` already
+-    // apply it at). Default 1.0 -- a neutral, unscaled environment.
++    // [T10's own "physical units" ruling, RECONCILED by Phase 5 Stage 2
++    // Task 13, #49 -- the carried item T10's own gate matrix Open Question
++    // deferred here explicitly ("Task 13... is the documented
++    // reconciliation point")] A LUX-denominated scale factor applied to
++    // the baked environment's own (source-HDR-relative-scale) radiance --
++    // EXACTLY Filament's own `IndirectLight::Builder::intensity(float
++    // envIntensity)` contract, quoted verbatim: "Scale factor applied to
++    // the environment and irradiance such that the result is in lux, or
++    // lumen/m^2 (default = 30000)" (filament/include/filament/
++    // IndirectLight.h:227, google/filament v1.75.0 pinned commit
++    // 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, fetched/quoted this task).
++    // This is the SAME lux unit `DirectionalLightDesc::colorLux` already
++    // claims and a punctual light's post-attenuation contribution resolves
++    // to (`PointLightDesc`/`SpotLightDesc`'s own candela, divided by
++    // distance^2 via `rx::scene::lightmath::rangeAttenuation()`) -- every
++    // one of these three producers feeds the IDENTICAL NdotL/IBL-weighted
++    // shading equation and is pre-exposed by the SAME single
++    // `rx::scene::Camera::exposure()` multiplier (Task 4's convention,
++    // applied once per producer, CPU-side, before upload) -- this is the
++    // "one coherent photometric story" the carried item required.
++    //
++    // DEFAULT (1.0) is DELIBERATELY NOT Filament's own real-world default
++    // (30000 lux, calibrated for an assumed-unscaled outdoor HDR capture
++    // under Filament's OWN artist workflow) -- RendererX's neutral-1.0
++    // default instead follows this codebase's own established regression-
++    // preserving convention (`Camera::exposureOverride`'s identical
++    // engaged-neutral-by-default resolution, Task 4/#40): "no additional
++    // scaling beyond whatever scale the source HDR/procedural fixture's
++    // own texels already encode". A caller that wants Filament's real
++    // photometric default passes `intensity = 30000.0F` explicitly
++    // (cited above) ALONGSIDE a properly configured `Camera` (real
++    // aperture/shutter/ISO or an EV100 override) -- the SAME pre-exposure
++    // pipeline already brings a real-lux-scale environment into a
++    // displayable range, exactly mirroring `exposureOverride`'s own
++    // documented "opt-in real photometric path" resolution. Every current
++    // producer (samples 08/09) keeps its own already-tuned, non-physical
++    // intensity value (1.0/0.4 respectively) UNCHANGED by this
++    // reconciliation -- it is a unit/documentation clarification, not a
++    // value change (see task-13-report.md's own "reconciliation" section
++    // for the full derivation and the empirical exposure-coherence proof).
+     float intensity = 1.0F;
+ };
+ 
+ class Scene;
+ 
+ namespace detail {
+ 
+ // Test-only seam -- see LightRecord's own comment above for why this
+ // exists. NOT part of the stable public contract.
+ [[nodiscard]] LightHandle createLightRecordForTesting(Scene& scene, const LightRecord& record);
+@@ -421,26 +517,56 @@ public:
+     // additive, and follow the exact same "index i addresses the same
+     // underlying slot across every span" contract documented on this
+     // class's own SoA span-accessor block above.
+     [[nodiscard]] std::span<const uint8_t> aliveSpan() const;
+     [[nodiscard]] std::span<const uint32_t> generationsSpan() const;
+ 
+     // --- Lights ----------------------------------------------------------
+ 
+     // Main-thread-only (D5).
+     [[nodiscard]] LightHandle createDirectionalLight(const DirectionalLightDesc& desc);
++    // [Phase 5 Stage 2 Task 13, #49] See `PointLightDesc`/`SpotLightDesc`'s
++    // own header comments for the unit convention (candela, KHR-spec-exact,
++    // no conversion applied here). Main-thread-only (D5).
++    [[nodiscard]] LightHandle createPointLight(const PointLightDesc& desc);
++    [[nodiscard]] LightHandle createSpotLight(const SpotLightDesc& desc);
+     void destroyLight(LightHandle handle);
+     void setLightChannels(LightHandle handle, uint8_t channels);
+ 
+     [[nodiscard]] bool isLightAlive(LightHandle handle) const;
++    [[nodiscard]] LightType lightType(LightHandle handle) const;
++    // Directional/Spot: the light's own facing/travel direction. Point:
++    // `LightRecord`'s own inert default (unused -- a point light emits
++    // uniformly in every direction).
+     [[nodiscard]] glm::vec3 lightDirection(LightHandle handle) const;
++    // Point/Spot only: world-space position [KHR spec]. Directional:
++    // `LightRecord`'s own inert default (unused -- a directional light has
++    // no position, only a direction).
++    [[nodiscard]] glm::vec3 lightPosition(LightHandle handle) const;
++    // Directional: illuminance, lux (`color*intensity`). Point/Spot:
++    // luminous intensity, candela (`color*intensity`) -- see
++    // `DirectionalLightDesc`/`PointLightDesc`/`SpotLightDesc`'s own header
++    // comments for the full unit citation. The FIELD NAME stays
++    // `colorLux` for the underlying `LightRecord` storage (pre-existing,
++    // load-bearing since Phase 4) -- this accessor's own name/doc comment
++    // is what actually documents the per-type unit; callers that need the
++    // unit-neutral phrase use `lightColorLux()` unchanged.
+     [[nodiscard]] glm::vec3 lightColorLux(LightHandle handle) const;
++    // Point/Spot only: KHR-spec range-property radius. `0.0` == "no
++    // configured range" (pure inverse-square, unwindowed) -- see
++    // `PointLightDesc::range`'s own header comment. Directional: always 0
++    // (unused; a directional light is never attenuated by distance).
++    [[nodiscard]] float lightRange(LightHandle handle) const;
++    // Spot only: KHR cone angles, radians. Directional/Point: `LightRecord`'s
++    // own inert defaults (unused).
++    [[nodiscard]] float lightInnerConeAngle(LightHandle handle) const;
++    [[nodiscard]] float lightOuterConeAngle(LightHandle handle) const;
+     [[nodiscard]] bool lightCastsShadows(LightHandle handle) const;
+     [[nodiscard]] uint8_t lightChannels(LightHandle handle) const;
+     [[nodiscard]] size_t lightCount() const;
+ 
+     // --- Environment [Phase 5 Task 10, #46] -------------------------------
+ 
+     // Sets/replaces this Scene's own single active environment -- see
+     // `EnvironmentDesc`'s own header comment for the singleton rationale.
+     // Main-thread-only (D5), matching every other Scene mutator.
+     void setEnvironment(const EnvironmentDesc& desc);
+@@ -508,11 +634,65 @@ private:
+     std::vector<uint32_t> lightGeneration_;
+     std::vector<bool> lightAlive_;
+     std::vector<uint32_t> lightFreeList_;
+     std::vector<LightRecord> lightRecords_;
+ 
+     // --- Environment [Phase 5 Task 10, #46] -- a plain optional value, not
+     // a handle-pool column (see EnvironmentDesc's own singleton rationale).
+     std::optional<EnvironmentDesc> environment_;
+ };
+ 
++// [Phase 5 Stage 2 Task 13, #49] Converts every `asset::LightData` an
++// import produced (`ImportedScene::lights` -- parsed and preserved since
++// Phase 4, per `import_gltf.cpp`'s own KHR_lights_punctual extension
++// parse, but never before consumed anywhere in this engine -- the gate
++// matrix's own grep-verified finding) into a real `Scene` light via the
++// matching `create{Directional,Point,Spot}Light()` call.
++//
++// UNIT CONVERSION: NONE. A glTF `LightData::intensity` value is ALREADY in
++// its type's own KHR-spec-correct target unit (lux for directional,
++// candela for point/spot -- README.md: "The intensity represents the
++// luminous intensity that the light would emit if it were colored pure
++// white") -- this is a straight `color * intensity` pass-through per
++// light, never a lumen->candela rescale (that conversion, Filament's own
++// `LightManager::setIntensity(intensity, IntensityUnit::LUMEN_LUX)`
++// formula, exists for a DIFFERENT, lumens-denominated AUTHORING surface
++// Filament itself exposes -- not glTF import, where the file's own number
++// is already the correct unit; see the gate matrix's own "no lumen->
++// candela conversion at import" row for the full citation).
++//
++// POSITION/DIRECTION derivation from `LightData::worldTransform` [KHR
++// spec: "For light types that have a position (point and spot lights),
++// the light's position is defined as the node's world location. For light
++// types that have a direction (directional and spot lights), the light's
++// direction is defined as the 3-vector (0.0, 0.0, -1.0) and the rotation
++// of the node orients the light accordingly"]: `position` is the
++// transform's own translation column; `direction` is the transform's own
++// upper-left 3x3 (rotation, ignoring translation/scale per the spec's own
++// "an untransformed light points down the -Z axis" text) applied to
++// local (0,0,-1), normalized.
++//
++// CONE ANGLES: `LightData::innerConeAngle`/`outerConeAngle` are
++// `std::optional<float>` (import_gltf.cpp only sets them `if
++// (light.innerConeAngle)`/`if (light.outerConeAngle)`, i.e. absent when
++// the source glTF omits them) -- `std::nullopt` maps to the KHR spec's
++// own documented defaults (`0`/`PI/4` respectively), matching
++// `SpotLightDesc`'s own default-member-initializer values exactly (a
++// caller that never touches this function's own optional-unwrapping gets
++// the SAME defaults either way).
++//
++// RANGE: `LightData::range`'s `std::nullopt` (absent in the source glTF)
++// maps to `PointLightDesc::range`/`SpotLightDesc::range`'s own `0.0F`
++// "no configured range" sentinel -- see either struct's own header
++// comment.
++//
++// Returns one `LightHandle` per input light, in the SAME order as
++// `lights` (index-parallel) -- a caller that needs to correlate a created
++// light back to its source `LightData` (e.g. to pick "the first imported
++// directional light" as a production main-light slot) can zip the two
++// spans directly.
++//
++// Main-thread-only (D5) -- forwards to `scene`'s own main-thread-only
++// create*Light() methods, no additional state of its own.
++[[nodiscard]] std::vector<LightHandle> instantiateImportedLights(Scene& scene, std::span<const asset::LightData> lights);
++
+ }  // namespace rx::scene
+diff --git a/src/rx_scene/light_math.cpp b/src/rx_scene/light_math.cpp
+new file mode 100644
+index 0000000..f8a9361
+--- /dev/null
++++ b/src/rx_scene/light_math.cpp
+@@ -0,0 +1,45 @@
++#include <rx_scene/light_math.h>
++
++#include <algorithm>
++#include <cmath>
++
++namespace rx::scene::lightmath {
++
++float rangeAttenuation(float distance, float range) {
++    // Clamp away from an exact-zero distance -- see this function's own
++    // header comment. Mirrors glTF-Sample-Renderer's own
++    // `pow(distance, 2.0)` denominator (no epsilon there since its own
++    // test content never places a light exactly at a shaded point), but a
++    // GPU falloff probe that sweeps distance toward 0 would otherwise
++    // divide by zero here; 1e-4 matches this codebase's own established
++    // NdotV/NdotL-style grazing-angle epsilon (standard_pbr.slang).
++    const float d = std::max(distance, 1e-4F);
++    if (range <= 0.0F) {
++        // "negative range means unlimited" (glTF-Sample-Renderer,
++        // punctual.glsl) == KHR's own "range... undefined... assumed
++        // infinite" (README.md#range-property) -- pure inverse-square,
++        // no window term.
++        return 1.0F / (d * d);
++    }
++    const float ratio = d / range;
++    const float ratio4 = ratio * ratio * ratio * ratio;
++    const float window = std::clamp(1.0F - ratio4, 0.0F, 1.0F);
++    return window / (d * d);
++}
++
++SpotAngleScaleOffset spotAngleScaleOffset(float innerConeAngle, float outerConeAngle) {
++    const float cosInner = std::cos(innerConeAngle);
++    const float cosOuter = std::cos(outerConeAngle);
++    SpotAngleScaleOffset result;
++    result.scale = 1.0F / std::max(0.001F, cosInner - cosOuter);
++    result.offset = -cosOuter * result.scale;
++    return result;
++}
++
++float spotAngleAttenuation(glm::vec3 spotDirWorld, glm::vec3 travelToFragmentWorld, SpotAngleScaleOffset scaleOffset) {
++    const float cd = glm::dot(spotDirWorld, travelToFragmentWorld);
++    const float attenuation = std::clamp(cd * scaleOffset.scale + scaleOffset.offset, 0.0F, 1.0F);
++    return attenuation * attenuation;
++}
++
++}  // namespace rx::scene::lightmath
+diff --git a/src/rx_scene/scene.cpp b/src/rx_scene/scene.cpp
+index 7026799..b3e1538 100644
+--- a/src/rx_scene/scene.cpp
++++ b/src/rx_scene/scene.cpp
+@@ -287,20 +287,49 @@ LightHandle Scene::createDirectionalLight(const DirectionalLightDesc& desc) {
+     record.direction = desc.dir;
+     record.colorLux = desc.colorLux;
+     record.castsShadows = desc.castsShadows;
+     record.channels = desc.channels;
+     // position/range/innerConeAngle/outerConeAngle stay at LightRecord's
+     // own inert defaults [FG2] -- this is the only public light-creation
+     // path in Phase 4, and it never populates the punctual-only fields.
+     return insertLightRecord(record);
+ }
+ 
++LightHandle Scene::createPointLight(const PointLightDesc& desc) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createPointLight");
++    LightRecord record;
++    record.type = LightType::Point;
++    record.position = desc.position;
++    record.colorLux = desc.colorCandela;  // candela -- see PointLightDesc's own header comment.
++    record.range = desc.range;
++    record.castsShadows = desc.castsShadows;
++    record.channels = desc.channels;
++    // direction/innerConeAngle/outerConeAngle stay at LightRecord's own
++    // inert defaults -- a point light emits uniformly in every direction.
++    return insertLightRecord(record);
++}
++
++LightHandle Scene::createSpotLight(const SpotLightDesc& desc) {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createSpotLight");
++    LightRecord record;
++    record.type = LightType::Spot;
++    record.direction = desc.dir;
++    record.position = desc.position;
++    record.colorLux = desc.colorCandela;  // candela -- see SpotLightDesc's own header comment.
++    record.range = desc.range;
++    record.innerConeAngle = desc.innerConeAngle;
++    record.outerConeAngle = desc.outerConeAngle;
++    record.castsShadows = desc.castsShadows;
++    record.channels = desc.channels;
++    return insertLightRecord(record);
++}
++
+ void Scene::destroyLight(LightHandle handle) {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::destroyLight");
+     if (!isLiveLightIndex(handle)) {
+         RX_LOG_WARN("rx::scene::Scene::destroyLight: handle (index={}, generation={}) already dead or unknown, ignored",
+                      handle.index(), handle.generation());
+         return;
+     }
+     const uint32_t idx = handle.index();
+     lightAlive_[idx] = false;
+     lightFreeList_.push_back(idx);
+@@ -309,30 +338,55 @@ void Scene::destroyLight(LightHandle handle) {
+ void Scene::setLightChannels(LightHandle handle, uint8_t channels) {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::setLightChannels");
+     lightRecords_[requireLiveLight(handle, "rx::scene::Scene::setLightChannels")].channels = channels;
+ }
+ 
+ bool Scene::isLightAlive(LightHandle handle) const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::isLightAlive");
+     return isLiveLightIndex(handle);
+ }
+ 
++LightType Scene::lightType(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightType");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightType")].type;
++}
++
+ glm::vec3 Scene::lightDirection(LightHandle handle) const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightDirection");
+     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightDirection")].direction;
+ }
+ 
++glm::vec3 Scene::lightPosition(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightPosition");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightPosition")].position;
++}
++
+ glm::vec3 Scene::lightColorLux(LightHandle handle) const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightColorLux");
+     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightColorLux")].colorLux;
+ }
+ 
++float Scene::lightRange(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightRange");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightRange")].range;
++}
++
++float Scene::lightInnerConeAngle(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightInnerConeAngle");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightInnerConeAngle")].innerConeAngle;
++}
++
++float Scene::lightOuterConeAngle(LightHandle handle) const {
++    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightOuterConeAngle");
++    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightOuterConeAngle")].outerConeAngle;
++}
++
+ bool Scene::lightCastsShadows(LightHandle handle) const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightCastsShadows");
+     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightCastsShadows")].castsShadows;
+ }
+ 
+ uint8_t Scene::lightChannels(LightHandle handle) const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightChannels");
+     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightChannels")].channels;
+ }
+ 
+@@ -362,20 +416,89 @@ bool Scene::hasEnvironment() const {
+ 
+ const EnvironmentDesc& Scene::environment() const {
+     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::environment");
+     if (!environment_.has_value()) {
+         RX_LOG_ERROR("rx::scene::Scene::environment: no environment configured -- call hasEnvironment() first");
+         throw std::out_of_range("rx::scene::Scene::environment");
+     }
+     return *environment_;
+ }
+ 
++// ---------------------------------------------------------------------
++// Imported-light consumption [Phase 5 Stage 2 Task 13, #49]
++// ---------------------------------------------------------------------
++
++std::vector<LightHandle> instantiateImportedLights(Scene& scene, std::span<const asset::LightData> lights) {
++    RX_ZONE;
++    std::vector<LightHandle> handles;
++    handles.reserve(lights.size());
++    for (const asset::LightData& light : lights) {
++        // Translation column [KHR spec: "the light's position is defined
++        // as the node's world location"].
++        const glm::vec3 position(light.worldTransform[3]);
++        // Local (0,0,-1) rotated by the node's world transform [KHR spec:
++        // "an untransformed light points down the -Z axis"] -- `mat4 *
++        // vec4(0,0,-1,0)` (a DIRECTION, w=0, so translation drops out)
++        // picks out exactly `-worldTransform`'s own third column, which is
++        // correct under non-uniform scale on the OTHER two axes too (the
++        // matrix-vector product never touches column 0/1 at all) --
++        // normalizing removes whatever scale factor local Z itself
++        // carries, matching the spec's own "light properties are
++        // unaffected by node transforms" / "inherited scale does not
++        // affect cone shape" text (scale affects neither the resulting
++        // unit direction nor anything else this function reads).
++        const glm::vec3 direction = glm::normalize(glm::vec3(light.worldTransform * glm::vec4(0.0F, 0.0F, -1.0F, 0.0F)));
++        // Straight pass-through, no unit conversion [KHR spec: "The
++        // intensity represents the luminous intensity... if it were
++        // colored pure white"; "color" is "a wavelength-specific
++        // multiplier"] -- see this function's own header comment (scene.h)
++        // for the full "no lumen->candela rescale" acceptance criterion.
++        const glm::vec3 colorIntensity = light.color * light.intensity;
++
++        switch (light.type) {
++            case asset::LightData::Type::Directional: {
++                DirectionalLightDesc desc;
++                desc.dir = direction;
++                desc.colorLux = colorIntensity;
++                handles.push_back(scene.createDirectionalLight(desc));
++                break;
++            }
++            case asset::LightData::Type::Point: {
++                PointLightDesc desc;
++                desc.position = position;
++                desc.colorCandela = colorIntensity;
++                desc.range = light.range.value_or(0.0F);  // absent -> "no configured range" sentinel.
++                handles.push_back(scene.createPointLight(desc));
++                break;
++            }
++            case asset::LightData::Type::Spot: {
++                SpotLightDesc desc;
++                desc.position = position;
++                desc.dir = direction;
++                desc.colorCandela = colorIntensity;
++                desc.range = light.range.value_or(0.0F);
++                // KHR spec defaults (README.md): innerConeAngle=0,
++                // outerConeAngle=PI/4 -- SAME literals as SpotLightDesc's
++                // own default-member-initializers, restated explicitly
++                // here since `light.innerConeAngle`/`outerConeAngle` are
++                // `std::optional<float>` and this is the exact point that
++                // resolves "absent" to the spec's own documented value.
++                desc.innerConeAngle = light.innerConeAngle.value_or(0.0F);
++                desc.outerConeAngle = light.outerConeAngle.value_or(0.7853981633974483F);
++                handles.push_back(scene.createSpotLight(desc));
++                break;
++            }
++        }
++    }
++    return handles;
++}
++
+ namespace detail {
+ 
+ LightHandle createLightRecordForTesting(Scene& scene, const LightRecord& record) { return scene.insertLightRecord(record); }
+ 
+ const LightRecord& lightRecordForTesting(const Scene& scene, LightHandle handle) {
+     return scene.lightRecords_[scene.requireLiveLight(handle, "rx::scene::detail::lightRecordForTesting")];
+ }
+ 
+ }  // namespace detail
+ 
+diff --git a/src/rx_scene/tests/CMakeLists.txt b/src/rx_scene/tests/CMakeLists.txt
+index 9be1afe..6923e1e 100644
+--- a/src/rx_scene/tests/CMakeLists.txt
++++ b/src/rx_scene/tests/CMakeLists.txt
+@@ -7,16 +7,18 @@
+ # Vulkan object at all.
+ add_executable(rx_scene_tests
+     doctest_main.cpp
+     camera_test.cpp
+     scene_test.cpp
+     thread_guard_test.cpp
+     draw_list_test.cpp
+     # [Phase 5 Task 5, ticket #41 row 4] FlyCamera -- promoted from
+     # samples/09_scene/fly_camera.h.
+     fly_camera_test.cpp
++    # [Phase 5 Stage 2 Task 13, #49] KHR_lights_punctual attenuation math.
++    light_math_test.cpp
+ )
+ target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
+ add_test(NAME rx_scene_tests COMMAND rx_scene_tests)
+ # Hang guard: a wedged test fails in minutes with output, instead of stalling CI for hours
+ # (windows-cross Wine hang, run 31512073559).
+ set_tests_properties(rx_scene_tests PROPERTIES TIMEOUT 120)
+diff --git a/src/rx_scene/tests/light_math_test.cpp b/src/rx_scene/tests/light_math_test.cpp
+new file mode 100644
+index 0000000..3c8bf20
+--- /dev/null
++++ b/src/rx_scene/tests/light_math_test.cpp
+@@ -0,0 +1,128 @@
++// src/rx_scene/tests/light_math_test.cpp -- Phase 5 Stage 2 Task 13 [#49]:
++// device-free unit tests for rx_scene/light_math.h's KHR_lights_punctual
++// attenuation formulas. Every expected value below was computed
++// independently (python3, double precision, see task-13-report.md for the
++// exact script) directly from the KHR spec's own quoted formulas -- NOT
++// reverse-derived from this function's own output -- matching this
++// codebase's own established TDD discipline (camera_test.cpp's ev100
++// table, task-4-report.md's own "expected values computed independently"
++// precedent).
++#include <doctest/doctest.h>
++#include <rx_scene/light_math.h>
++
++#include <glm/glm.hpp>
++
++#include <cmath>
++
++using rx::scene::lightmath::rangeAttenuation;
++using rx::scene::lightmath::spotAngleAttenuation;
++using rx::scene::lightmath::spotAngleScaleOffset;
++using rx::scene::lightmath::SpotAngleScaleOffset;
++
++TEST_CASE("lightmath::rangeAttenuation matches the KHR_lights_punctual spec's own literal formula "
++          "[README.md#range-property: \"attenuation = max(min(1.0-(d/range)^4,1),0)/d^2\"] -- NOT "
++          "Filament's own extra-squared shader variant (gate matrix Open Question, resolved: the spec "
++          "text, its own reference implementation, AND the pinned glTF-Sample-Renderer conformance "
++          "target all agree on the un-squared form; only Filament's shipped shader squares it again)") {
++    // Near-field (d << range): both candidate formulas (literal vs.
++    // Filament's squared variant) agree closely here -- this case alone
++    // does NOT discriminate between them, by design (see the
++    // near-`range` case below for the actual discriminator).
++    CHECK(rangeAttenuation(2.0F, 10.0F) == doctest::Approx(0.2496F).epsilon(0.0001));
++
++    // Close to `range` (d/range == 0.9): the literal KHR window term
++    // (1-(d/range)^4) and Filament's squared (1-(d/range)^4)^2 DIVERGE
++    // measurably here -- the discriminating case. Literal: window =
++    // 1-0.9^4 = 0.3439, atten = 0.3439/81 = 0.0042456790...  Filament's
++    // own squared alternative would instead give window' = 0.3439^2 =
++    // 0.11826..., atten' = 0.11826/81 = 0.0014601... -- roughly 2.9x
++    // smaller. This TEST_CASE certifies the LITERAL (un-squared) formula.
++    const float measured = rangeAttenuation(9.0F, 10.0F);
++    CHECK(measured == doctest::Approx(0.004245679F).epsilon(0.0001));
++    const float filamentSquaredAlternative = (0.3439F * 0.3439F) / 81.0F;
++    CHECK(measured > filamentSquaredAlternative * 2.0F);  // explicit discrimination, not just a close-enough check.
++
++    // range <= 0.0 -- "no configured range" sentinel (LightRecord's own
++    // 0.0-inert convention, doubling as glTF-Sample-Renderer's "negative
++    // range means unlimited" reading) -- pure inverse-square, no window.
++    CHECK(rangeAttenuation(5.0F, 0.0F) == doctest::Approx(0.04F).epsilon(0.0001));
++    CHECK(rangeAttenuation(5.0F, -1.0F) == doctest::Approx(0.04F).epsilon(0.0001));
++
++    // Beyond range: the spec's own "max(min(...,1),0)" clamp floors the
++    // window term at exactly 0.0 -- fully dark, not negative/NaN.
++    CHECK(rangeAttenuation(15.0F, 10.0F) == doctest::Approx(0.0F).epsilon(0.0001));
++}
++
++TEST_CASE("lightmath::rangeAttenuation: a directional-light regression invariant -- see "
++          "standard_pbr.slang's own punctual term for where this matters: a light with lightType==0 "
++          "(Directional) must NEVER go through this function at all (KHR spec: \"Because it is at an "
++          "infinite distance, the light is not attenuated\") -- this device-free test only exercises "
++          "the function's own math in isolation; the GPU-side regression proof (identical measured "
++          "intensity at two different distances for a Directional light) lives in "
++          "test_standard_pbr_punctual_gpu.cpp, since it requires a real render.") {
++    // A trivial invariant check on the function itself: attenuation is a
++    // strictly decreasing function of distance within [0, range) -- if a
++    // future edit accidentally inverted the ratio (e.g. range/d instead
++    // of d/range), this would catch it immediately.
++    CHECK(rangeAttenuation(1.0F, 10.0F) > rangeAttenuation(5.0F, 10.0F));
++    CHECK(rangeAttenuation(5.0F, 10.0F) > rangeAttenuation(9.0F, 10.0F));
++}
++
++TEST_CASE("lightmath::spotAngleScaleOffset matches the KHR_lights_punctual reference code's closed form "
++          "[README.md's own \"Inner and Outer Cone Angles\" section, quoted verbatim: \"float "
++          "lightAngleScale = 1.0f / max(0.001f, cos(innerConeAngle) - cos(outerConeAngle)); float "
++          "lightAngleOffset = -cos(outerConeAngle) * lightAngleScale;\"] -- using the SAME "
++          "(innerConeAngle=0.2, outerConeAngle=0.6) pair assets/test/cube_lights_camera.gltf's own "
++          "spot light fixture carries (see the import-consumption GPU test, import_gltf_gpu_test.cpp), "
++          "so this device-free proof and that fixture-driven proof share one set of numbers.") {
++    const SpotAngleScaleOffset result = spotAngleScaleOffset(0.2F, 0.6F);
++    CHECK(result.scale == doctest::Approx(6.462830587F).epsilon(0.0001));
++    CHECK(result.offset == doctest::Approx(-5.334004257F).epsilon(0.0001));
++}
++
++TEST_CASE("lightmath::spotAngleAttenuation matches the KHR reference code's own squared-saturate curve "
++          "at four hand-computed angles -- dead-center (full), inside the window (partial), exactly at "
++          "the inner/outer boundaries, and outside the outer cone (fully dark). `spotDirWorld` is fixed "
++          "at (0,0,-1) (the spot's own facing direction); `travelToFragmentWorld` is rotated around the "
++          "X axis by `theta` so `dot(spotDirWorld, travelToFragmentWorld) == cos(theta)` exactly -- "
++          "verify: dot((0,0,-1),(0,sin(theta),-cos(theta))) == cos(theta).") {
++    const glm::vec3 spotDir(0.0F, 0.0F, -1.0F);
++    const SpotAngleScaleOffset scaleOffset = spotAngleScaleOffset(0.2F, 0.6F);
++
++    auto travelAt = [](float theta) {
++        return glm::vec3(0.0F, std::sin(theta), -std::cos(theta));
++    };
++
++    // Dead center (theta=0, cd=1) -- inside the inner cone: full brightness.
++    CHECK(spotAngleAttenuation(spotDir, travelAt(0.0F), scaleOffset) == doctest::Approx(1.0F).epsilon(0.0001));
++
++    // theta=0.4 (strictly between inner=0.2 and outer=0.6): partial,
++    // matching the closed-form squared-saturate curve exactly.
++    CHECK(spotAngleAttenuation(spotDir, travelAt(0.4F), scaleOffset) == doctest::Approx(0.3827363698F).epsilon(0.0005));
++
++    // Exactly at innerConeAngle (theta=0.2): the window's own upper
++    // boundary -- attenuation == 1.0 (saturate(scale*cos(inner)+offset) ==
++    // saturate(1.0) == 1.0 by the scale/offset pair's own construction).
++    CHECK(spotAngleAttenuation(spotDir, travelAt(0.2F), scaleOffset) == doctest::Approx(1.0F).epsilon(0.0005));
++
++    // Exactly at outerConeAngle (theta=0.6): the window's own lower
++    // boundary -- attenuation == 0.0 by construction (offset == -cos(outer)*scale).
++    CHECK(spotAngleAttenuation(spotDir, travelAt(0.6F), scaleOffset) == doctest::Approx(0.0F).epsilon(0.0005));
++
++    // theta=0.8 (beyond outerConeAngle): fully outside the cone -- the
++    // saturate() clamp floors this at exactly 0.0, not a negative value.
++    CHECK(spotAngleAttenuation(spotDir, travelAt(0.8F), scaleOffset) == doctest::Approx(0.0F).epsilon(0.0001));
++}
++
++TEST_CASE("lightmath::spotAngleAttenuation: DISCRIMINATION proof -- a light OUTSIDE the outer cone must "
++          "read fully dark (0.0), not merely dim, distinguishing this from a naive linear/unclamped "
++          "falloff that would still leak a small positive value there.") {
++    const glm::vec3 spotDir(0.0F, 0.0F, -1.0F);
++    const SpotAngleScaleOffset scaleOffset = spotAngleScaleOffset(0.1F, 0.3F);  // a narrow cone.
++    // theta = PI/2 (light arriving from directly the side -- as far
++    // outside the cone as this geometry can express): cd == 0, well
++    // outside [cos(outer), cos(inner)].
++    const glm::vec3 travelFromSide(0.0F, 1.0F, 0.0F);
++    const float attenuation = spotAngleAttenuation(spotDir, travelFromSide, scaleOffset);
++    CHECK(attenuation == 0.0F);  // EXACT zero, not approximate -- the saturate() clamp is exact arithmetic here.
++}
+diff --git a/src/rx_scene/tests/scene_test.cpp b/src/rx_scene/tests/scene_test.cpp
+index 37aff44..a7d8a87 100644
+--- a/src/rx_scene/tests/scene_test.cpp
++++ b/src/rx_scene/tests/scene_test.cpp
+@@ -453,20 +453,212 @@ TEST_CASE(
+     CHECK(stored.innerConeAngle == doctest::Approx(0.1F));
+     CHECK(stored.outerConeAngle == doctest::Approx(0.7F));
+ 
+     // Coexists cleanly, in the SAME storage, alongside a real, publicly
+     // created Directional light.
+     rx::scene::LightHandle dirHandle = scene.createDirectionalLight(rx::scene::DirectionalLightDesc{});
+     CHECK(scene.lightCount() == 2);
+     CHECK(rx::scene::detail::lightRecordForTesting(scene, dirHandle).type == rx::scene::LightType::Directional);
+ }
+ 
++// ---------------------------------------------------------------------
++// Punctual lights [Phase 5 Stage 2 Task 13, #49] -- the gate matrix's own
++// "Point/spot lights have NO public Scene creation API" row, closed:
++// createPointLight()/createSpotLight() mirror createDirectionalLight()'s
++// own shape+conventions exactly (matrix's own recommendation).
++// ---------------------------------------------------------------------
++
++TEST_CASE("PointLightDesc defaults and field round-trip through createPointLight() [gate matrix 'Point/spot "
++          "lights have NO public Scene creation API' row]") {
++    rx::scene::PointLightDesc desc;
++    CHECK(desc.position == glm::vec3(0.0F, 0.0F, 0.0F));
++    CHECK(desc.colorCandela == glm::vec3(1.0F, 1.0F, 1.0F));
++    CHECK(desc.range == doctest::Approx(0.0F));
++    CHECK(desc.castsShadows);
++    CHECK(desc.channels == 0xFFU);
++
++    desc.position = glm::vec3(2.0F, 4.0F, 6.0F);
++    desc.colorCandela = glm::vec3(1500.0F, 100.0F, 50.0F);  // deliberately unequal per-channel, non-neutral.
++    desc.range = 25.0F;
++    desc.castsShadows = false;
++    desc.channels = 0x2U;
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::LightHandle h = scene.createPointLight(desc);
++    CHECK(scene.lightType(h) == rx::scene::LightType::Point);
++    CHECK(scene.lightPosition(h) == glm::vec3(2.0F, 4.0F, 6.0F));
++    // EXACT pass-through -- candela, no conversion (matches the gate
++    // matrix's own "no lumen->candela conversion at import" acceptance
++    // criterion, exercised here at the Scene-API level directly).
++    CHECK(scene.lightColorLux(h) == glm::vec3(1500.0F, 100.0F, 50.0F));
++    CHECK(scene.lightRange(h) == doctest::Approx(25.0F));
++    CHECK_FALSE(scene.lightCastsShadows(h));
++    CHECK(scene.lightChannels(h) == 0x2U);
++}
++
++TEST_CASE("SpotLightDesc defaults (KHR-spec cone-angle defaults 0/PI-over-4) and field round-trip through "
++          "createSpotLight()") {
++    rx::scene::SpotLightDesc desc;
++    CHECK(desc.position == glm::vec3(0.0F, 0.0F, 0.0F));
++    CHECK(desc.dir == glm::vec3(0.0F, 0.0F, -1.0F));
++    CHECK(desc.colorCandela == glm::vec3(1.0F, 1.0F, 1.0F));
++    CHECK(desc.range == doctest::Approx(0.0F));
++    CHECK(desc.innerConeAngle == doctest::Approx(0.0F));
++    CHECK(desc.outerConeAngle == doctest::Approx(0.7853981634F).epsilon(0.0001));  // PI/4 [KHR spec default].
++
++    desc.position = glm::vec3(1.0F, 2.0F, 3.0F);
++    desc.dir = glm::normalize(glm::vec3(1.0F, -1.0F, 0.0F));
++    desc.colorCandela = glm::vec3(200.0F, 200.0F, 200.0F);
++    desc.range = 5.0F;
++    desc.innerConeAngle = 0.2F;
++    desc.outerConeAngle = 0.6F;
++    desc.channels = 0x9U;
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::LightHandle h = scene.createSpotLight(desc);
++    CHECK(scene.lightType(h) == rx::scene::LightType::Spot);
++    CHECK(scene.lightPosition(h) == glm::vec3(1.0F, 2.0F, 3.0F));
++    CHECK(scene.lightDirection(h).x == doctest::Approx(desc.dir.x));
++    CHECK(scene.lightDirection(h).y == doctest::Approx(desc.dir.y));
++    CHECK(scene.lightColorLux(h) == glm::vec3(200.0F, 200.0F, 200.0F));
++    CHECK(scene.lightRange(h) == doctest::Approx(5.0F));
++    CHECK(scene.lightInnerConeAngle(h) == doctest::Approx(0.2F));
++    CHECK(scene.lightOuterConeAngle(h) == doctest::Approx(0.6F));
++    CHECK(scene.lightChannels(h) == 0x9U);
++}
++
++TEST_CASE("Directional/Point/Spot lights coexist in Scene's own light storage, independently destroyable, "
++          "lightCount() exact [growing rx_scene lights to the charter's full punctual set, ticket #49's "
++          "own scope line]") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    rx::scene::LightHandle dir = scene.createDirectionalLight(rx::scene::DirectionalLightDesc{});
++    rx::scene::LightHandle point = scene.createPointLight(rx::scene::PointLightDesc{});
++    rx::scene::LightHandle spot = scene.createSpotLight(rx::scene::SpotLightDesc{});
++    CHECK(scene.lightCount() == 3);
++    CHECK(scene.lightType(dir) == rx::scene::LightType::Directional);
++    CHECK(scene.lightType(point) == rx::scene::LightType::Point);
++    CHECK(scene.lightType(spot) == rx::scene::LightType::Spot);
++
++    scene.destroyLight(point);
++    CHECK(scene.lightCount() == 2);
++    CHECK_FALSE(scene.isLightAlive(point));
++    CHECK(scene.isLightAlive(dir));
++    CHECK(scene.isLightAlive(spot));
++}
++
++// ---------------------------------------------------------------------
++// instantiateImportedLights() [Phase 5 Stage 2 Task 13, #49] -- converts
++// asset::LightData (already parsed+preserved since Phase 4, per
++// import_gltf.cpp's own KHR_lights_punctual extension parse) into real
++// Scene lights. This device-free TEST_CASE hand-builds LightData directly
++// (no GPU-backed importGltf() needed to exercise the CONVERSION logic
++// itself -- the real end-to-end fastgltf-parse-through-Scene path is
++// covered separately, GPU-backed, in
++// src/rx_asset/tests/import_gltf_gpu_test.cpp, reusing this exact
++// fixture's own committed asset -- assets/test/cube_lights_camera.gltf).
++// ---------------------------------------------------------------------
++
++TEST_CASE("instantiateImportedLights(): value-asserted decoded-value discipline -- EXACT candela/lux "
++          "pass-through (no unit conversion), position/direction derived from the node's own world "
++          "transform, KHR cone-angle defaults applied when absent [gate matrix 'Authored glTF punctual "
++          "lights arrive in the Scene with value-asserted intensities/cones' acceptance criterion]") {
++    std::vector<rx::asset::LightData> lights;
++
++    // Directional -- translated+rotated node (translation must NOT affect
++    // direction; only rotation does, per KHR spec). 90-degree rotation
++    // about +Y maps local (0,0,-1) to world (-1,0,0).
++    {
++        rx::asset::LightData ld;
++        ld.type = rx::asset::LightData::Type::Directional;
++        ld.color = glm::vec3(1.0F, 0.9F, 0.8F);
++        ld.intensity = 3.0F;
++        ld.worldTransform =
++            glm::translate(glm::mat4(1.0F), glm::vec3(100.0F, 200.0F, 300.0F)) *
++            glm::rotate(glm::mat4(1.0F), glm::radians(90.0F), glm::vec3(0.0F, 1.0F, 0.0F));
++        lights.push_back(ld);
++    }
++    // Point -- translation only, no rotation; range PRESENT.
++    {
++        rx::asset::LightData ld;
++        ld.type = rx::asset::LightData::Type::Point;
++        ld.color = glm::vec3(1.0F, 0.0F, 0.0F);
++        ld.intensity = 1500.0F;  // candela [gate matrix's own worked example value].
++        ld.range = 10.0F;
++        ld.worldTransform = glm::translate(glm::mat4(1.0F), glm::vec3(2.0F, 3.0F, 4.0F));
++        lights.push_back(ld);
++    }
++    // Spot -- range/cone angles ABSENT (nullopt) -- must resolve to the
++    // KHR spec's own documented defaults, not zero/garbage.
++    {
++        rx::asset::LightData ld;
++        ld.type = rx::asset::LightData::Type::Spot;
++        ld.color = glm::vec3(0.0F, 1.0F, 0.0F);
++        ld.intensity = 200.0F;
++        ld.worldTransform = glm::translate(glm::mat4(1.0F), glm::vec3(5.0F, 6.0F, 7.0F));
++        // ld.range / innerConeAngle / outerConeAngle left std::nullopt.
++        lights.push_back(ld);
++    }
++
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, lights);
++    REQUIRE(handles.size() == 3);
++    CHECK(scene.lightCount() == 3);
++
++    // Directional: colorLux == color*intensity EXACTLY (lux, no
++    // conversion); direction reflects the 90-degree-about-Y rotation
++    // (translation has zero effect on direction).
++    CHECK(scene.lightType(handles[0]) == rx::scene::LightType::Directional);
++    const glm::vec3 dirColor = scene.lightColorLux(handles[0]);
++    CHECK(dirColor.x == doctest::Approx(3.0F));
++    CHECK(dirColor.y == doctest::Approx(2.7F));
++    CHECK(dirColor.z == doctest::Approx(2.4F));
++    const glm::vec3 dirDirection = scene.lightDirection(handles[0]);
++    CHECK(dirDirection.x == doctest::Approx(-1.0F).epsilon(0.001));
++    CHECK(dirDirection.y == doctest::Approx(0.0F).epsilon(0.001));
++    CHECK(dirDirection.z == doctest::Approx(0.0F).epsilon(0.001));
++
++    // Point: colorCandela == color*intensity EXACTLY (candela, no
++    // conversion -- the gate matrix's own "1500 candela imports as
++    // EXACTLY 1500.0, not 1500/(4*pi)" acceptance criterion); position ==
++    // translation; range == the PRESENT value (not the "absent" sentinel).
++    CHECK(scene.lightType(handles[1]) == rx::scene::LightType::Point);
++    const glm::vec3 pointColor = scene.lightColorLux(handles[1]);
++    CHECK(pointColor.x == doctest::Approx(1500.0F));
++    CHECK(pointColor.y == doctest::Approx(0.0F));
++    CHECK(pointColor.z == doctest::Approx(0.0F));
++    CHECK(scene.lightPosition(handles[1]) == glm::vec3(2.0F, 3.0F, 4.0F));
++    CHECK(scene.lightRange(handles[1]) == doctest::Approx(10.0F));
++
++    // Spot: range/cone-angle absence resolves to the KHR spec's own
++    // documented defaults (0 / PI/4), matching SpotLightDesc's own
++    // default-member-initializer values exactly -- NOT left at 0/0 (which
++    // would be a degenerate, always-fully-attenuated cone).
++    CHECK(scene.lightType(handles[2]) == rx::scene::LightType::Spot);
++    const glm::vec3 spotColor = scene.lightColorLux(handles[2]);
++    CHECK(spotColor.x == doctest::Approx(0.0F));
++    CHECK(spotColor.y == doctest::Approx(200.0F));
++    CHECK(spotColor.z == doctest::Approx(0.0F));
++    CHECK(scene.lightPosition(handles[2]) == glm::vec3(5.0F, 6.0F, 7.0F));
++    CHECK(scene.lightRange(handles[2]) == doctest::Approx(0.0F));  // absent -> "no configured range" sentinel.
++    CHECK(scene.lightInnerConeAngle(handles[2]) == doctest::Approx(0.0F));
++    CHECK(scene.lightOuterConeAngle(handles[2]) == doctest::Approx(0.7853981634F).epsilon(0.0001));
++}
++
++TEST_CASE("instantiateImportedLights(): empty input produces zero lights (no accidental default light "
++          "injected) -- discriminates against a scene with no embedded KHR_lights_punctual data (e.g. "
++          "Sponza) silently gaining a phantom light.") {
++    rx::scene::Scene scene(&fallbackShapedBounds);
++    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, {});
++    CHECK(handles.empty());
++    CHECK(scene.lightCount() == 0);
++}
++
+ // ---------------------------------------------------------------------
+ // Environment [Phase 5 Task 10, #46, FG1 closure]
+ // ---------------------------------------------------------------------
+ 
+ TEST_CASE("Scene environment: absent by default, hasEnvironment()/environment() round-trip a set value, "
+           "environment() throws for an unconfigured Scene [gate matrix 'Scene-level environment API' row]") {
+     rx::scene::Scene scene(&fallbackShapedBounds);
+ 
+     // Absent by default -- a freshly-constructed Scene has no environment
+     // (the "existing 08/09 gates regenerate with new, provably-more-
