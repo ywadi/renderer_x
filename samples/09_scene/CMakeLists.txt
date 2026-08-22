@@ -12,7 +12,7 @@ add_executable(sample_09_scene main.cpp)
 # rx::ibl::bakeEnvironment(), consumed by this sample's own default-
 # environment bind (setupEnvironment() in main.cpp).
 target_link_libraries(sample_09_scene PRIVATE
-    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop rx_ibl sample_common
+    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_shadow rx_debug_ui rx_task rx_shader rx_frame_loop rx_ibl rx_cluster sample_common
 )
 
 # RX_REPO_ROOT_DIR: same "bake an absolute CMAKE_SOURCE_DIR-relative path at
@@ -91,6 +91,54 @@ add_custom_command(
 add_custom_target(sample_09_scene_shadow_shaders
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/shadow_shaders_deploy.stamp")
 add_dependencies(sample_09_scene sample_09_scene_shadow_shaders)
+
+# [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] The scene-path main-
+# camera depth prepass's own vertex shader -- deployed into a
+# depth_shaders/ directory next to the binary, same "compiled directly out
+# of the source tree via a runtime-resolved shaderDir, not RX_*_SHADER_DIR"
+# posture as shadow_shaders/ immediately above (this sample builds its own
+# depth-prepass pipeline directly, not through a dedicated rx_* library --
+# see main.cpp's own buildDepthPrepassPipeline() header comment).
+set(RX_SCENE_DEPTH_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/depth/depth_prepass.vert.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/depth_shaders_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/depth_shaders"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_DEPTH_SHADERS}
+          "$<TARGET_FILE_DIR:sample_09_scene>/depth_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/depth_shaders_deploy.stamp"
+  DEPENDS ${RX_SCENE_DEPTH_SHADERS}
+  COMMENT "sample_09_scene: deploying the depth prepass vertex shader next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_09_scene_depth_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/depth_shaders_deploy.stamp")
+add_dependencies(sample_09_scene sample_09_scene_depth_shaders)
+
+# [Phase 5 Stage 2 Task 15, #51] T14's own froxel/cluster compute kernels
+# (rx::cluster::ClusterPipelines::create()'s own runtime-compiled shaderDir)
+# -- deployed into a cluster_shaders/ directory next to the binary, same
+# posture as shadow_shaders/depth_shaders above.
+set(RX_SCENE_CLUSTER_SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/cluster/froxel_common.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/cluster/froxel_light_count.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/cluster/froxel_prefix_sum.slang"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../shaders/cluster/froxel_light_scatter.slang"
+)
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cluster_shaders_deploy.stamp"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:sample_09_scene>/cluster_shaders"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${RX_SCENE_CLUSTER_SHADERS}
+          "$<TARGET_FILE_DIR:sample_09_scene>/cluster_shaders/"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/cluster_shaders_deploy.stamp"
+  DEPENDS ${RX_SCENE_CLUSTER_SHADERS}
+  COMMENT "sample_09_scene: deploying T14's froxel/cluster compute shaders next to the binary"
+  VERBATIM
+)
+add_custom_target(sample_09_scene_cluster_shaders
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cluster_shaders_deploy.stamp")
+add_dependencies(sample_09_scene sample_09_scene_cluster_shaders)
 
 # The forward pass's own tonemap half reuses shaders/multipass/tonemap.{vert,
 # frag}.slang VERBATIM, deployed flat next to the binary -- same convention

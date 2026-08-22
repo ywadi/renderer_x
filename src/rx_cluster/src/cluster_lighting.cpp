@@ -239,9 +239,19 @@ std::optional<ClusterPipelines> ClusterPipelines::create(VkDevice device, rx::rh
         slot.countSet0 = allocateSet1(device, pool, result.countKernel_->pso.setLayouts[0]);
         slot.prefixSumSet0 = allocateSet1(device, pool, result.prefixSumKernel_->pso.setLayouts[0]);
         slot.scatterSet0 = allocateSet1(device, pool, result.scatterKernel_->pso.setLayouts[0]);
+        // [Phase 5 Task 15, #51] Each kernel's own REAL set-1, ALSO
+        // allocated here (once, per slot) -- addClusterPasses() below only
+        // ever REWRITES these via vkUpdateDescriptorSets, never reallocates
+        // them, which is exactly what makes this slot reusable across every
+        // future frame that selects it without a reset (see this class's
+        // own FRAMES-IN-FLIGHT DESIGN comment, header).
+        slot.countSet1 = allocateSet1(device, pool, result.countKernel_->pso.setLayouts[1]);
+        slot.prefixSumSet1 = allocateSet1(device, pool, result.prefixSumKernel_->pso.setLayouts[1]);
+        slot.scatterSet1 = allocateSet1(device, pool, result.scatterKernel_->pso.setLayouts[1]);
         if (slot.countSet0 == VK_NULL_HANDLE || slot.prefixSumSet0 == VK_NULL_HANDLE ||
-            slot.scatterSet0 == VK_NULL_HANDLE) {
-            RX_LOG_ERROR("rx_cluster: failed to allocate an empty set-0 for frame slot {}", slotIndex);
+            slot.scatterSet0 == VK_NULL_HANDLE || slot.countSet1 == VK_NULL_HANDLE ||
+            slot.prefixSumSet1 == VK_NULL_HANDLE || slot.scatterSet1 == VK_NULL_HANDLE) {
+            RX_LOG_ERROR("rx_cluster: failed to allocate a descriptor set for frame slot {}", slotIndex);
             return std::nullopt;
         }
     }
@@ -249,41 +259,32 @@ std::optional<ClusterPipelines> ClusterPipelines::create(VkDevice device, rx::rh
     return result;
 }
 
+namespace {
+// [Phase 5 Task 15, #51] Resolves `frameInputs.frameSlot` against
+// `slotCount`, clamping (modulo) an out-of-range value with a loud log --
+// called FRESH inside every recorded pass lambda below (never once at
+// declare time), matching ClusterFrameInputs::frameSlot's own header
+// comment ("read FRESH... clamped, logged, at execute time").
+uint32_t resolveFrameSlot(const ClusterFrameInputs& frameInputs, size_t slotCount) {
+    uint32_t slot = frameInputs.frameSlot;
+    if (slot >= slotCount) {
+        RX_LOG_ERROR("rx_cluster: ClusterFrameInputs::frameSlot {} out of range (framesInFlight={}); clamping", slot,
+                     slotCount);
+        slot = slot % static_cast<uint32_t>(slotCount);
+    }
+    return slot;
+}
+}  // namespace
+
 rx::scene::froxel::FroxelGridParams ClusterPipelines::addClusterPasses(RenderGraph& graph,
                                                                         const ClusterFrameInputs& frameInputs,
                                                                         const rx::scene::Camera& camera,
                                                                         uint32_t viewportWidth, uint32_t viewportHeight,
-                                                                        const ClusterParams& params,
-                                                                        uint32_t frameSlot) {
+                                                                        const ClusterParams& params) {
     const rx::scene::froxel::FroxelGridParams grid = rx::scene::froxel::buildFroxelGrid(
         viewportWidth, viewportHeight, camera.verticalFovRadians, camera.aspectRatio, params.zLightNear,
         params.zLightFar, params.targetFroxelBudget, params.sliceCountZ);
     const uint32_t froxelCount = grid.froxelCount();
-
-    // [Phase 5 Task 15, #51] Clamp (not assert) an out-of-range frameSlot --
-    // this is a per-frame-called path (unlike create()'s own one-time
-    // validation), so a defensively-recoverable clamp (with a loud log)
-    // beats a crash on a caller's off-by-one; see this class's own
-    // FRAMES-IN-FLIGHT DESIGN comment (header) for why ONLY the SELECTED
-    // slot's pool is touched below.
-    if (frameSlot >= frameSlots_.size()) {
-        RX_LOG_ERROR("rx_cluster: addClusterPasses: frameSlot {} out of range (framesInFlight={}); clamping",
-                     frameSlot, frameSlots_.size());
-        frameSlot = frameSlot % static_cast<uint32_t>(frameSlots_.size());
-    }
-    FrameSlot& slot = frameSlots_[frameSlot];
-
-    // Every set-1 (and set-0, re-warmed identically) allocated by THIS call
-    // is freed here -- a DIFFERENT frame slot's own pool/sets, potentially
-    // still referenced by a still-in-flight GPU submission from an earlier
-    // call against THAT slot, is never touched.
-    vkResetDescriptorPool(device_, slot.pool, 0);
-    slot.countSet0 = allocateSet1(device_, slot.pool, countKernel_->pso.setLayouts[0]);
-    slot.prefixSumSet0 = allocateSet1(device_, slot.pool, prefixSumKernel_->pso.setLayouts[0]);
-    slot.scatterSet0 = allocateSet1(device_, slot.pool, scatterKernel_->pso.setLayouts[0]);
-    slot.countSet1 = allocateSet1(device_, slot.pool, countKernel_->pso.setLayouts[1]);
-    slot.prefixSumSet1 = allocateSet1(device_, slot.pool, prefixSumKernel_->pso.setLayouts[1]);
-    slot.scatterSet1 = allocateSet1(device_, slot.pool, scatterKernel_->pso.setLayouts[1]);
 
     // [Phase 5 Task 15, #51] `totalLightCount` is 0 here -- the grid's own
     // SHAPE (every other field) is frozen at this declare-time call, but
@@ -311,11 +312,11 @@ rx::scene::froxel::FroxelGridParams ClusterPipelines::addClusterPasses(RenderGra
     graph.addPass("cluster_count", QueueClass::AsyncCompute)
         .addStorageBufferOutput("clusterTrueCounts", perFroxelDesc)
         .setSideEffect()
-        .setExecute([this, gpuGridShape, &frameInputs, froxelCount, frameSlot](PassContext& ctx) {
+        .setExecute([this, gpuGridShape, &frameInputs, froxelCount](PassContext& ctx) {
             FroxelGridParamsGpu gpuGrid = gpuGridShape;
             gpuGrid.totalLightCount = frameInputs.lightCount;
             const VkDeviceSize lightsBytes = static_cast<VkDeviceSize>(frameInputs.lightCount) * sizeof(ClusterLightGpu);
-            FrameSlot& s = frameSlots_[frameSlot];
+            FrameSlot& s = frameSlots_[resolveFrameSlot(frameInputs, frameSlots_.size())];
             const VkDescriptorBufferInfo lightsInfo{frameInputs.lightsBuffer, 0,
                                                        lightsBytes > 0 ? lightsBytes : VK_WHOLE_SIZE};
             const VkDescriptorBufferInfo countsInfo{ctx.buffer("clusterTrueCounts"), 0, VK_WHOLE_SIZE};
@@ -340,10 +341,10 @@ rx::scene::froxel::FroxelGridParams ClusterPipelines::addClusterPasses(RenderGra
         .addStorageBufferOutput("clusterGlobalOverflow", perFroxelDesc)
         .addStorageBufferOutput("clusterTotalUsed", scalarDesc)
         .setSideEffect()
-        .setExecute([this, gpuGridShape, &frameInputs, frameSlot](PassContext& ctx) {
+        .setExecute([this, gpuGridShape, &frameInputs](PassContext& ctx) {
             FroxelGridParamsGpu gpuGrid = gpuGridShape;
             gpuGrid.totalLightCount = frameInputs.lightCount;
-            FrameSlot& s = frameSlots_[frameSlot];
+            FrameSlot& s = frameSlots_[resolveFrameSlot(frameInputs, frameSlots_.size())];
             const VkDescriptorBufferInfo trueCountsInfo{ctx.buffer("clusterTrueCounts"), 0, VK_WHOLE_SIZE};
             const VkDescriptorBufferInfo offsetsInfo{ctx.buffer("clusterOffsets"), 0, VK_WHOLE_SIZE};
             const VkDescriptorBufferInfo writeCountsInfo{ctx.buffer("clusterWriteCounts"), 0, VK_WHOLE_SIZE};
@@ -370,11 +371,11 @@ rx::scene::froxel::FroxelGridParams ClusterPipelines::addClusterPasses(RenderGra
         .addStorageBufferInput("clusterWriteCounts")
         .addStorageBufferOutput("clusterLightIndices", indicesDesc)
         .setSideEffect()
-        .setExecute([this, gpuGridShape, &frameInputs, froxelCount, frameSlot](PassContext& ctx) {
+        .setExecute([this, gpuGridShape, &frameInputs, froxelCount](PassContext& ctx) {
             FroxelGridParamsGpu gpuGrid = gpuGridShape;
             gpuGrid.totalLightCount = frameInputs.lightCount;
             const VkDeviceSize lightsBytes = static_cast<VkDeviceSize>(frameInputs.lightCount) * sizeof(ClusterLightGpu);
-            FrameSlot& s = frameSlots_[frameSlot];
+            FrameSlot& s = frameSlots_[resolveFrameSlot(frameInputs, frameSlots_.size())];
             const VkDescriptorBufferInfo lightsInfo{frameInputs.lightsBuffer, 0,
                                                        lightsBytes > 0 ? lightsBytes : VK_WHOLE_SIZE};
             const VkDescriptorBufferInfo offsetsInfo{ctx.buffer("clusterOffsets"), 0, VK_WHOLE_SIZE};

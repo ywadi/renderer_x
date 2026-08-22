@@ -81,6 +81,7 @@
 // sample's own default environment bind -- rx::ibl::bakeEnvironment(),
 // consumed by setupEnvironment() below, mirroring samples/08_gltf_viewer's
 // own identical consumption.
+#include <rx_cluster/cluster_lighting.h>
 #include <rx_ibl/bake.h>
 #include <rx_material/draw_data.h>
 #include <rx_material/material_system.h>
@@ -90,6 +91,7 @@
 #include <rx_rhi_vk/bindless.h>
 #include <rx_rhi_vk/buffer.h>
 #include <rx_rhi_vk/command.h>
+#include <rx_rhi_vk/compute_pipeline.h>
 #include <rx_rhi_vk/context.h>
 #include <rx_rhi_vk/deletion_queue.h>
 #include <rx_rhi_vk/descriptor_arena.h>
@@ -168,6 +170,16 @@ constexpr uint32_t kShadowMapResolution = 1024;
 // light + shadow this scene already exercises. See setupEnvironment()'s
 // own header comment for the full rationale.
 constexpr float kDefaultEnvironmentIntensity = 0.4F;
+
+// [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ sizing -- generous
+// headroom past this task's own named content-scale target (plan:523,
+// "100/1k/5k lights"; matrix-p5t15's own scaling-numbers row) so the SAME
+// buffers serve both this sample's default (small) scene AND its own
+// `--stress-lights N` benchmark mode (see runHeadless()'s own comment) up
+// to and including the 5000-light tier.
+constexpr uint32_t kMaxClusterLights = 5500;
+constexpr uint32_t kMaxLightsPerFroxel = 256;
+constexpr uint32_t kMaxTotalLightIndices = 1U << 20;  // 1,048,576 -- matches tools/rx_cluster_bench's own sizing.
 
 // Helmet-grid composition -- see this file's own header comment ("layer
 // mask, not frustum geometry") for the full deterministic-culling
@@ -475,6 +487,30 @@ bool assignShaderModules(VkDevice device, const rx::shader::CompileResult& compi
     return true;
 }
 
+// [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] One row of the depth
+// prepass's own minimal bindless per-draw StructuredBuffer -- mirrors
+// shaders/depth/depth_prepass.vert.slang's `RxDepthPrepassDrawData`
+// EXACTLY (the SAME D26.1-style cross-file-drift-risk pattern
+// rx::material::DrawDataGpu/rx::shadow::ShadowDrawData both already
+// establish for their own GPU-side counterparts). Both fields are
+// transposed (GLM column-major -> this project's Slang sessions' own
+// ROW-major default) before being written into a real row -- see
+// draw_data.h's own MATRIX LAYOUT paragraph for the full convention this
+// follows.
+struct DepthPrepassDrawData {
+    glm::mat4 model{1.0F};     // object -> world. Transposed before upload.
+    glm::mat4 viewProj{1.0F};  // world -> clip, REVERSED-Z [D13, main camera]. Transposed before upload; per-pass, repeated per row (same "simpler than a second buffer" precedent ShadowDrawData's own header comment establishes).
+};
+static_assert(sizeof(DepthPrepassDrawData) == 128,
+              "DepthPrepassDrawData must stay exactly 128 bytes -- mirrors depth_prepass.vert.slang's "
+              "RxDepthPrepassDrawData");
+
+// Mirrors depth_prepass.vert.slang's `PushConstants` field-for-field.
+struct DepthPrepassPushConstants {
+    uint32_t drawDataBufferIndex = 0;
+};
+static_assert(sizeof(DepthPrepassPushConstants) == 4, "DepthPrepassPushConstants must stay exactly 4 bytes");
+
 bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
                           VkFormat backbufferFormat, const std::filesystem::path& tonemapVertPath,
                           const std::filesystem::path& tonemapFragPath, CompiledPass& tonemapPass) {
@@ -566,6 +602,159 @@ bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDes
         VK_SUCCESS) {
         RX_LOG_ERROR("sample_09_scene: vkCreateGraphicsPipelines failed for the tonemap pass");
         destroyCompiledPass(device, tonemapPass);
+        return false;
+    }
+    return true;
+}
+
+// [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] The scene-path MAIN-
+// CAMERA depth prepass pipeline -- built OUTSIDE MaterialSystem [RC3
+// precedent applied to the main camera; see App::depthPrepassPass's own
+// header comment], vertex-only (no fragment stage -- see
+// shaders/depth/depth_prepass.vert.slang's own header comment), following
+// this file's own buildTonemapPipeline()/rx_shadow::ShadowCasterPipeline::
+// create() precedent for hand-rolled fixed-function state.
+//
+// REVERSED-Z [D13's MAIN-camera convention]: depthCompareOp =
+// VK_COMPARE_OP_GREATER_OR_EQUAL, matching MaterialSystem's own forward-
+// pipeline convention exactly (material_system.cpp's own "GREATER_OR_
+// EQUAL, not LESS. From Phase 4 Stage 2 on..." comment) -- the clear VALUE
+// (0.0) is a graph/AttachmentDesc-side choice (declareGraph()'s own
+// swapchainRelativeReversedDepthDesc()), not this pipeline's concern.
+//
+// CULL MODE -- single-sided (VK_CULL_MODE_BACK_BIT) UNCONDITIONALLY, no
+// per-material doubleSided axis (this pass is material-agnostic by
+// design -- it never binds a MaterialSystem pipeline/params at all).
+// Documented, honest limitation: a doubleSided mesh whose ONLY visible
+// surface at a given pixel is a backface gets no early-Z benefit from
+// this prepass for that pixel -- never WRONG occlusion (the pass simply
+// fails to write depth there; forward's own doubleSided draw, which does
+// not cull, still tests/writes correctly against whatever this prepass
+// left in place, per D13's own GREATER_OR_EQUAL "closer-or-equal passes"
+// semantics).
+//
+// OPAQUE-ONLY, MASK EXCLUDED [distinct from RC3's shadow-caster
+// precedent, and deliberately so]: unlike shadow maps (where treating a
+// MASK caster as a full opaque silhouette is an accepted, low-visual-
+// impact Phase 4 limitation), this pass feeds the MAIN camera directly --
+// writing a wrong (too-near) depth at a MASK cutout pixel would WRONGLY
+// occlude whatever geometry sits behind that cutout in forward's own
+// later pass (a real, visible black-hole regression, not a cosmetic
+// shadow softening). recordDepthPrepassPass() below therefore renders
+// ONLY commands whose resolved MaterialFixedFunctionState::alphaMode is
+// Opaque -- MASK commands are skipped entirely (contributing zero
+// prepass depth, exactly like a BLEND command already does), at the cost
+// of losing early-Z benefit for MASK draws specifically (a performance,
+// never a correctness, tradeoff).
+bool buildDepthPrepassPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
+                                VkFormat depthFormat, const std::filesystem::path& depthPrepassVertPath,
+                                CompiledPass& depthPrepassPass) {
+    destroyCompiledPass(device, depthPrepassPass);
+    auto reflected =
+        compileAndReflect(compiler, "SceneDepthPrepassModule", {depthPrepassVertPath.string()}, {"vsMain"});
+    if (!reflected.has_value()) {
+        return false;
+    }
+    if (reflected->layoutInfo.pushRanges.size() != 1 ||
+        reflected->layoutInfo.pushRanges[0].size != sizeof(DepthPrepassPushConstants)) {
+        RX_LOG_ERROR("sample_09_scene: depth prepass shader reflects an unexpected push-constant shape");
+        return false;
+    }
+    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
+    if (!layoutBundle.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: PipelineLayoutBuilder::build failed for the depth prepass");
+        return false;
+    }
+    depthPrepassPass.layoutBundle = std::move(*layoutBundle);
+    depthPrepassPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
+    depthPrepassPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
+    depthPrepassPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
+    if (!assignShaderModules(device, reflected->compileResult, "vsMain", nullptr, depthPrepassPass)) {
+        destroyCompiledPass(device, depthPrepassPass);
+        return false;
+    }
+
+    // Vertex input: the SAME 48-byte D8 pooled-vertex stride
+    // (rx::asset::PoolVertex) the main forward pass binds -- only location
+    // 0 (position) is a real attribute; the binding's own stride still
+    // must match the real buffer layout. Mirrors rx_shadow::
+    // ShadowCasterPipeline::create()'s own identical vertex-input state.
+    struct MaterialVertexLayoutStride {
+        float position[3];
+        float normal[3];
+        float tangent[4];
+        float uv[2];
+    };
+    static_assert(sizeof(MaterialVertexLayoutStride) == 48, "must match rx::asset::PoolVertex's own stride exactly");
+    VkVertexInputBindingDescription vertexBinding{};
+    vertexBinding.binding = 0;
+    vertexBinding.stride = sizeof(MaterialVertexLayoutStride);
+    vertexBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription positionAttribute{};
+    positionAttribute.location = 0;
+    positionAttribute.binding = 0;
+    positionAttribute.format = VK_FORMAT_R32G32B32_SFLOAT;
+    positionAttribute.offset = offsetof(MaterialVertexLayoutStride, position);
+    VkPipelineVertexInputStateCreateInfo vertexInputState{};
+    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputState.vertexBindingDescriptionCount = 1;
+    vertexInputState.pVertexBindingDescriptions = &vertexBinding;
+    vertexInputState.vertexAttributeDescriptionCount = 1;
+    vertexInputState.pVertexAttributeDescriptions = &positionAttribute;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterizationState{};
+    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizationState.lineWidth = 1.0F;
+    VkPipelineMultisampleStateCreateInfo multisampleState{};
+    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depthStencilState{};
+    depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencilState.depthTestEnable = VK_TRUE;
+    depthStencilState.depthWriteEnable = VK_TRUE;
+    depthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+    VkPipelineRenderingCreateInfo renderingCreateInfo{};
+    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingCreateInfo.depthAttachmentFormat = depthFormat;
+    VkPipelineShaderStageCreateInfo vertStage{};
+    vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = depthPrepassPass.vertModule;
+    vertStage.pName = "main";
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingCreateInfo;
+    pipelineInfo.stageCount = 1;
+    pipelineInfo.pStages = &vertStage;
+    pipelineInfo.pVertexInputState = &vertexInputState;
+    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizationState;
+    pipelineInfo.pMultisampleState = &multisampleState;
+    pipelineInfo.pDepthStencilState = &depthStencilState;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = depthPrepassPass.layoutBundle.layout;
+    pipelineInfo.renderPass = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex = -1;
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &depthPrepassPass.pipeline) !=
+        VK_SUCCESS) {
+        RX_LOG_ERROR("sample_09_scene: vkCreateGraphicsPipelines failed for the depth prepass");
+        destroyCompiledPass(device, depthPrepassPass);
         return false;
     }
     return true;
@@ -684,6 +873,10 @@ struct App {
 
     std::filesystem::path sharedShaderDir;
     std::filesystem::path shadowShaderDir;
+    // [Phase 5 Stage 2 Task 15, #51]
+    std::filesystem::path depthShaderDir;
+    std::filesystem::path clusterShaderDir;
+    std::optional<rx::rhi::ComputePipelineCache> computePipelineCache;
 
     CompiledPass tonemapPass;
     VkSampler defaultSampler = VK_NULL_HANDLE;
@@ -898,6 +1091,47 @@ struct App {
     rx::shadow::ShadowFrustumFit shadowFit;
     glm::vec3 lightDirWorld{0.4F, -1.0F, 0.3F};  // travel direction (matches LightRecord::direction's own convention).
 
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] The scene-path MAIN-
+    // CAMERA depth prepass -- T15's own OWNED addition to the charter frame
+    // pipeline ("depth -> shadows -> clustered light assignment -> opaque
+    // lighting"), delivering a sampleable "sceneDepth" resource through the
+    // graph (see declareGraph()'s own comment). Built OUTSIDE MaterialSystem
+    // [RC3 precedent, applied here to the main camera], own minimal
+    // per-draw buffer -- mirrors App::shadowCaster/shadowDrawDataBuffer's
+    // own shape exactly, just REVERSED-Z (D13 main-camera convention)
+    // instead of the shadow caster's STANDARD-Z.
+    CompiledPass depthPrepassPass;
+    std::optional<rx::rhi::PerFrameStorageBuffer> depthPrepassDrawDataBuffer;
+    std::vector<DepthPrepassDrawData> depthPrepassDrawDataRows;
+    uint32_t depthPrepassDrawDataCapacityRows = 0;
+
+    // [Phase 5 Stage 2 Task 15, #51] T14's clustered light-assignment
+    // compute chain, integrated into this sample's own per-frame pipeline.
+    // `clusterPipelines` owns the compiled compute PSOs + N-frames-in-
+    // flight descriptor pools (rx::cluster::ClusterPipelines, T15's own
+    // multi-FIF extension); `clusterFrameInputs` is the per-frame-mutable
+    // struct its recorded pass callbacks read BY REFERENCE every
+    // execute() call (see ClusterFrameInputs' own header comment) --
+    // `clusterLightsBuffer`/`clusterLightRows` are this sample's own
+    // per-frame CPU-built light list (rx::cluster::buildClusterLightList()),
+    // uploaded into `clusterLightsBuffer`'s current frame slot each frame,
+    // with `clusterFrameInputs.lightsBuffer` pointed at that SAME slot's
+    // real VkBuffer before executor->execute() runs.
+    std::optional<rx::cluster::ClusterPipelines> clusterPipelines;
+    rx::cluster::ClusterFrameInputs clusterFrameInputs;
+    std::optional<rx::rhi::PerFrameStorageBuffer> clusterLightsBuffer;
+    std::vector<rx::cluster::ClusterLightGpu> clusterLightRows;
+    rx::scene::froxel::FroxelGridParams clusterGrid;
+    // Bindless indices for T14's own three named uint[] graph resources
+    // (clusterOffsets/clusterWriteCounts/clusterLightIndices) -- registered
+    // ONCE, lazily, the first time each is realized (mirrors
+    // App::shadowMapHandle's own "physical resource never resized/evicted,
+    // so the handle stays valid every subsequent frame" precedent).
+    rx::rhi::BindlessHandle clusterOffsetsHandle;
+    rx::rhi::BindlessHandle clusterWriteCountsHandle;
+    rx::rhi::BindlessHandle clusterLightIndicesHandle;
+    bool clusteringEnabled = false;
+
     // Per-frame culling output -- reused, caller-owned storage [D26 amendment].
     rx::scene::ViewLists viewLists;
     rx::scene::ShadowLists shadowLists;
@@ -1047,6 +1281,8 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
     const std::filesystem::path basePath = basePathDirectory();
     app->sharedShaderDir = basePath / "material_shaders";
     app->shadowShaderDir = basePath / "shadow_shaders";
+    app->depthShaderDir = basePath / "depth_shaders";
+    app->clusterShaderDir = basePath / "cluster_shaders";
 
     app->materialSystem = rx::material::MaterialSystem::create(*app->device, *app->bindless,
                                                                  basePath / "scene_pipeline.cache", app->sharedShaderDir);
@@ -1110,6 +1346,38 @@ std::unique_ptr<App> makeApp(const std::string& windowTitle, uint32_t width, uin
         RX_LOG_ERROR("sample_09_scene: ShadowCasterPipeline::create failed");
         return nullptr;
     }
+
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Depth prepass
+    // pipeline -- built outside MaterialSystem, same posture as the
+    // shadow caster above (see App::depthPrepassPass's own header comment).
+    if (!buildDepthPrepassPipeline(app->device->device(), *compiler, app->bindless->descriptorSetLayout(),
+                                    kDepthFormat, app->depthShaderDir / "depth_prepass.vert.slang",
+                                    app->depthPrepassPass)) {
+        RX_LOG_ERROR("sample_09_scene: buildDepthPrepassPipeline failed");
+        return nullptr;
+    }
+
+    // [Phase 5 Stage 2 Task 15, #51] T14's clustered light-assignment
+    // compute chain -- rx::rhi::ComputePipelineCache (Task 2's compute
+    // facility) + rx::cluster::ClusterPipelines, built with
+    // FrameSync::kFramesInFlight descriptor pools (T15's own multi-FIF
+    // extension -- see ClusterPipelines' own FRAMES-IN-FLIGHT DESIGN
+    // comment) so this LIVE per-frame consumer never resets a descriptor
+    // pool a still-in-flight GPU submission might reference.
+    auto computeCache = rx::rhi::ComputePipelineCache::create(app->device->device(), basePath / "cluster.pipeline_cache");
+    if (!computeCache.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: ComputePipelineCache::create failed");
+        return nullptr;
+    }
+    app->computePipelineCache = std::move(*computeCache);
+    auto clusterPipelines = rx::cluster::ClusterPipelines::create(app->device->device(), *app->computePipelineCache,
+                                                                    *compiler, app->clusterShaderDir,
+                                                                    rx::rhi::FrameSync::kFramesInFlight);
+    if (!clusterPipelines.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: ClusterPipelines::create failed");
+        return nullptr;
+    }
+    app->clusterPipelines = std::move(*clusterPipelines);
 
     return app;
 }
@@ -1332,6 +1600,25 @@ void destroyShadowResources(App& app) {
         vkDestroySampler(device, app.shadowCompareSampler, nullptr);
         app.shadowCompareSampler = VK_NULL_HANDLE;
     }
+    // [Phase 5 Stage 2 Task 15, #51] Same PerFrameStorageBuffer TEARDOWN
+    // CONTRACT as shadowDrawDataBuffer above.
+    if (app.depthPrepassDrawDataBuffer.has_value() && app.bindless.has_value()) {
+        app.depthPrepassDrawDataBuffer->release(*app.bindless);
+    }
+    app.depthPrepassDrawDataBuffer.reset();
+    if (app.clusterLightsBuffer.has_value() && app.bindless.has_value()) {
+        app.clusterLightsBuffer->release(*app.bindless);
+    }
+    app.clusterLightsBuffer.reset();
+    // [Phase 5 Stage 2 Task 15, #51] Bindless registrations ONLY (the
+    // graph-transient buffers they point at are the Executor's own
+    // TransientPool's to destroy) -- same "release the slot, not the
+    // resource" reasoning as shadowMapHandle above.
+    if (app.bindless.has_value()) {
+        app.bindless->release(app.clusterOffsetsHandle);
+        app.bindless->release(app.clusterWriteCountsHandle);
+        app.bindless->release(app.clusterLightIndicesHandle);
+    }
 }
 
 void destroyApp(App& app) {
@@ -1397,6 +1684,10 @@ void destroyApp(App& app) {
     }
     app.environment.reset();
     destroyCompiledPass(app.device->device(), app.tonemapPass);
+    // [Phase 5 Stage 2 Task 15, #51]
+    destroyCompiledPass(app.device->device(), app.depthPrepassPass);
+    app.clusterPipelines.reset();
+    app.computePipelineCache.reset();
     if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
         app.bindless->release(app.defaultSamplerHandle);
     }
@@ -2278,6 +2569,49 @@ bool setupShadow(App& app) {
     return true;
 }
 
+// [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Sizes/builds the depth
+// prepass's own per-draw buffer (SAME capacity as app.drawDataCapacityRows
+// -- see setupShadow()'s own identical reasoning immediately above, this
+// function's own sibling) and the clustered-lighting light-list buffer
+// (rx::rhi::PerFrameStorageBuffer<ClusterLightGpu>, kMaxClusterLights rows
+// per frame-in-flight slot). Always called (unlike setupShadow(), which
+// --stress mode skips) -- the depth prepass/clustered lighting are both
+// independent of whether this run has a directional key light+shadow.
+bool setupDepthPrepassAndClustering(App& app) {
+    app.depthPrepassDrawDataCapacityRows = app.drawDataCapacityRows;
+    app.depthPrepassDrawDataRows.assign(app.depthPrepassDrawDataCapacityRows, DepthPrepassDrawData{});
+    const VkDeviceSize depthBytes = std::max<VkDeviceSize>(
+        static_cast<VkDeviceSize>(app.depthPrepassDrawDataCapacityRows) * sizeof(DepthPrepassDrawData),
+        sizeof(DepthPrepassDrawData));
+    auto depthBuffer = rx::rhi::PerFrameStorageBuffer::create(*app.allocator, *app.bindless, depthBytes);
+    if (!depthBuffer.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: PerFrameStorageBuffer::create (depth prepass draw data, {} rows) failed",
+                     app.depthPrepassDrawDataCapacityRows);
+        return false;
+    }
+    app.depthPrepassDrawDataBuffer = std::move(*depthBuffer);
+
+    // [Phase 5 Task 15, #51] The clustered light-list buffer -- ONE
+    // rx::cluster::ClusterLightGpu[kMaxClusterLights] row-array PER
+    // frame-in-flight slot, registered into BindlessTable's dedicated
+    // kClusterLightBufferBinding class (see PerFrameStorageBuffer::create()'s
+    // own `kind` parameter, Phase 5 Task 15 addition).
+    app.clusterLightRows.reserve(kMaxClusterLights);
+    const VkDeviceSize clusterLightsBytes =
+        static_cast<VkDeviceSize>(kMaxClusterLights) * sizeof(rx::cluster::ClusterLightGpu);
+    auto clusterBuffer = rx::rhi::PerFrameStorageBuffer::create(*app.allocator, *app.bindless, clusterLightsBytes,
+                                                                  nullptr, rx::rhi::FrameSync::kFramesInFlight,
+                                                                  rx::rhi::BindlessResourceKind::ClusterLightBuffer);
+    if (!clusterBuffer.has_value()) {
+        RX_LOG_ERROR("sample_09_scene: PerFrameStorageBuffer::create (cluster lights, {} rows) failed",
+                     kMaxClusterLights);
+        return false;
+    }
+    app.clusterLightsBuffer = std::move(*clusterBuffer);
+    app.clusteringEnabled = true;
+    return true;
+}
+
 // --- Per-frame update -----------------------------------------------------
 // Cull+collapse (DrawListBuilder::build()/buildShadow()), populate the CPU
 // staging mirror of both D26.1 draw-data buffers from the resulting
@@ -2362,6 +2696,35 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
     }
     const float envIntensityExposed = envDesc.intensity * preExposure;
 
+    // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pass constants
+    // -- computed ONCE per frame, broadcast to every row below (same
+    // "per-pass, repeated per row" shape every other per-pass RxDrawData
+    // field in this loop already follows). `clusteringReady` mirrors
+    // `app.shadowMapHandle.isValid()`'s own "handle not yet registered on
+    // the very first frame" fallback -- see recordForwardChunk()'s own
+    // lazy-registration comment for clusterOffsets/WriteCounts/LightIndices.
+    const glm::mat4 clusterViewTransposed = glm::transpose(app.flyCamera.camera.view());
+    const bool clusteringReady = app.clusteringEnabled && app.clusterOffsetsHandle.isValid() &&
+                                  app.clusterWriteCountsHandle.isValid() && app.clusterLightIndicesHandle.isValid() &&
+                                  app.clusterLightsBuffer.has_value();
+    // [Phase 5 Task 15, #51] Builds this frame's flat clustered light list
+    // from the Scene's currently-alive Point/Spot lights (rx::cluster::
+    // buildClusterLightList(), T14's own device-free CPU builder --
+    // Directional lights are skipped by construction, matrix-p5t15's own
+    // row 1) -- ONE build per frame, in `app.flyCamera.camera.view()`'s own
+    // space, matching the SAME view matrix every row's own `clusterView`
+    // field below broadcasts (the shading-side lookup and the CPU-side
+    // culling-list build must agree on this transform, or a light would be
+    // assigned to a froxel grid built against a DIFFERENT view than the one
+    // the shading pass re-derives its own froxel index from).
+    app.clusterLightRows = rx::cluster::buildClusterLightList(*app.scene, app.flyCamera.camera.view());
+    if (app.clusterLightRows.size() > kMaxClusterLights) {
+        RX_LOG_WARN("sample_09_scene: {} live Point/Spot lights exceeds this sample's own kMaxClusterLights ({}) -- "
+                     "truncating (a content-scale limit of THIS SAMPLE, not of rx_cluster's own capacity model)",
+                     app.clusterLightRows.size(), kMaxClusterLights);
+        app.clusterLightRows.resize(kMaxClusterLights);
+    }
+
     const auto transforms = app.scene->transformsSpan();
     for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
         const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
@@ -2378,6 +2741,29 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired field, inert -- see MaterialVertex::ambientColor's own header comment.
         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
         row.materialIndex = payload.materialIndex;
+        // [Phase 5 Stage 2 Task 15, #51] Clustered Forward+ per-pixel
+        // lookup inputs -- `clusterEnabled==0` (the default, left
+        // untouched) when the grid's own graph resources are not yet
+        // registered (clusteringReady==false) reproduces byte-identical
+        // pre-Task-15 behavior for that one frame, same fallback shape as
+        // the shadow sentinel below.
+        if (clusteringReady) {
+            row.clusterEnabled = 1;
+            row.clusterCountX = app.clusterGrid.countX;
+            row.clusterCountY = app.clusterGrid.countY;
+            row.clusterCountZ = app.clusterGrid.countZ;
+            row.clusterTanHalfFovY = app.clusterGrid.tanHalfFovY;
+            row.clusterAspectRatio = app.clusterGrid.aspectRatio;
+            row.clusterZLightFar = app.clusterGrid.zLightFar;
+            row.clusterInvLinearizer = app.clusterGrid.invLinearizer;
+            row.clusterOffsetsBufferIndex = app.clusterOffsetsHandle.index();
+            row.clusterWriteCountsBufferIndex = app.clusterWriteCountsHandle.index();
+            row.clusterLightIndicesBufferIndex = app.clusterLightIndicesHandle.index();
+            row.clusterLightsBufferIndex = app.clusterLightsBuffer->bindlessIndex(app.currentFrameSlot);
+            row.clusterView = clusterViewTransposed;
+        } else {
+            row.clusterEnabled = 0;
+        }
         if (hasEnvironment) {
             row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
             row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
@@ -2468,6 +2854,28 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
 void uploadSceneFrameGpuBuffers(App& app, uint32_t frameSlot) {
     app.currentFrameSlot = frameSlot;
 
+    // [Phase 5 Stage 2 Task 15, #51] `clusterLightsBufferIndex` is a
+    // FRAME-SLOT-DEPENDENT bindless index (rx::rhi::PerFrameStorageBuffer::
+    // bindlessIndex(frameSlot) -- a DIFFERENT real index per slot, unlike
+    // envIrradianceCubeIndex/etc., which are registered ONCE, not per
+    // frame-in-flight slot) -- it cannot be known inside updateSceneFrame()
+    // (which runs BEFORE `frameSlot` itself is known -- see this function's
+    // own CALLER CONTRACT comment) and so is patched into every already-
+    // built row HERE, right before the upload, mirroring
+    // recordForwardChunk()'s own `app.drawDataBuffer->bindlessIndex(app.
+    // currentFrameSlot)` push-constant read -- just resolved once, on the
+    // CPU, into the row data instead of a push constant (this field lives
+    // in RxDrawData, not a push-constant struct, per this ticket's own
+    // "extend RxDrawData" ruling).
+    if (app.clusteringEnabled && app.clusterLightsBuffer.has_value()) {
+        const uint32_t clusterLightsIndex = app.clusterLightsBuffer->bindlessIndex(frameSlot);
+        for (rx::material::DrawDataGpu& row : app.drawDataRows) {
+            if (row.clusterEnabled != 0) {
+                row.clusterLightsBufferIndex = clusterLightsIndex;
+            }
+        }
+    }
+
     if (!app.viewLists.payloads.empty()) {
         const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(rx::material::DrawDataGpu);
         app.drawDataBuffer->write(frameSlot, app.drawDataRows.data(), bytes);
@@ -2477,9 +2885,100 @@ void uploadSceneFrameGpuBuffers(App& app, uint32_t frameSlot) {
         const VkDeviceSize bytes = app.shadowLists.payloads.size() * sizeof(rx::shadow::ShadowDrawData);
         app.shadowDrawDataBuffer->write(frameSlot, app.shadowDrawDataRows.data(), bytes);
     }
+
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Depth prepass draw
+    // data -- ONE row per ViewLists payload, SAME index space as
+    // app.drawDataRows above (model+viewProj only -- see
+    // App::depthPrepassDrawDataRows' own comment).
+    if (!app.viewLists.payloads.empty()) {
+        const auto transforms = app.scene->transformsSpan();
+        const glm::mat4 viewProjTransposed = glm::transpose(app.flyCamera.camera.viewProj());
+        for (size_t i = 0; i < app.viewLists.payloads.size(); ++i) {
+            const rx::scene::DrawPayload& payload = app.viewLists.payloads[i];
+            DepthPrepassDrawData& row = app.depthPrepassDrawDataRows[i];
+            row.model = glm::transpose(transforms[payload.instanceDataIndex]);
+            row.viewProj = viewProjTransposed;
+        }
+        const VkDeviceSize bytes = app.viewLists.payloads.size() * sizeof(DepthPrepassDrawData);
+        app.depthPrepassDrawDataBuffer->write(frameSlot, app.depthPrepassDrawDataRows.data(), bytes);
+    }
+
+    // [Phase 5 Stage 2 Task 15, #51] The clustered light list itself --
+    // uploaded into THIS frame's own slot, and `app.clusterFrameInputs`
+    // (read BY REFERENCE by rx::cluster::ClusterPipelines' own recorded
+    // pass callbacks, every execute() call -- see ClusterFrameInputs' own
+    // header comment) updated to point at it, right before this same
+    // frame's `executor->execute()` call reaches those callbacks.
+    if (app.clusteringEnabled && app.clusterLightsBuffer.has_value()) {
+        const uint32_t lightCount = static_cast<uint32_t>(app.clusterLightRows.size());
+        if (lightCount > 0) {
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(lightCount) * sizeof(rx::cluster::ClusterLightGpu);
+            app.clusterLightsBuffer->write(frameSlot, app.clusterLightRows.data(), bytes);
+        }
+        app.clusterFrameInputs.lightsBuffer = app.clusterLightsBuffer->bufferHandle(frameSlot);
+        app.clusterFrameInputs.lightCount = lightCount;
+        app.clusterFrameInputs.frameSlot = frameSlot;
+    }
 }
 
 // --- Recording -------------------------------------------------------------
+
+// [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] The scene-path MAIN-
+// CAMERA depth prepass -- FIRST in the charter frame pipeline ("depth ->
+// shadows -> clustered light assignment -> opaque lighting"), see
+// declareGraph()'s own comment. Renders the [0, opaqueCommandCount) OPAQUE
+// partition of app.viewLists, MASK commands EXCLUDED (see
+// buildDepthPrepassPipeline()'s own header comment for why, unlike
+// recordShadowPass() below).
+void recordDepthPrepassPass(rx::graph::PassContext& ctx, App& app) {
+    if (app.viewLists.opaqueCommandCount == 0 || !app.resolveMaterialIndexToHandle) {
+        return;
+    }
+    VkCommandBuffer cmd = ctx.cmd;
+    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width), static_cast<float>(ctx.renderArea.height),
+                        0.0F, 1.0F};
+    VkRect2D scissor{{0, 0}, ctx.renderArea};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.depthPrepassPass.pipeline);
+    VkDescriptorSet set = app.bindless->descriptorSet();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.depthPrepassPass.layoutBundle.layout, 0, 1, &set,
+                             0, nullptr);
+    DepthPrepassPushConstants push{app.depthPrepassDrawDataBuffer->bindlessIndex(app.currentFrameSlot)};
+    vkCmdPushConstants(cmd, app.depthPrepassPass.layoutBundle.layout, app.depthPrepassPass.pushConstantStages,
+                       app.depthPrepassPass.pushConstantOffset, app.depthPrepassPass.pushConstantSize, &push);
+
+    for (const rx::scene::BlockRange& blockRange : app.viewLists.blocks) {
+        // Clip this block's own command range to the OPAQUE+MASK partition
+        // [0, opaqueCommandCount) -- a block whose range starts at/past
+        // that boundary (a BLEND-only block entry -- see ViewLists' own
+        // "the same blockId can legitimately appear as two separate
+        // entries" comment, draw_list.h) is safely skipped entirely.
+        const uint32_t rangeBegin = blockRange.firstCommand;
+        const uint32_t rangeEnd = std::min(blockRange.firstCommand + blockRange.commandCount, app.viewLists.opaqueCommandCount);
+        if (rangeBegin >= rangeEnd) {
+            continue;
+        }
+        app.geometryPool->bind(cmd, blockRange.blockId);
+        for (uint32_t i = rangeBegin; i < rangeEnd; ++i) {
+            const rx::scene::DrawCommand& c = app.viewLists.commands[i];
+            // [OPAQUE-ONLY, MASK EXCLUDED -- buildDepthPrepassPipeline()'s
+            // own header comment] `c.firstInstance` is this command's own
+            // representative payload index (D26.3's instancing-collapse
+            // groups only identical-draw-identity instances together,
+            // materialIndex included, so every instance this ONE command
+            // spans shares the SAME alphaMode).
+            const rx::scene::DrawPayload& payload = app.viewLists.payloads[c.firstInstance];
+            const rx::material::MaterialHandle handle = app.resolveMaterialIndexToHandle(payload.materialIndex);
+            if (app.materialSystem->fixedFunctionState(handle).alphaMode != rx::material::AlphaMode::Opaque) {
+                continue;
+            }
+            vkCmdDrawIndexed(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance);
+        }
+    }
+}
+
 void recordShadowPass(rx::graph::PassContext& ctx, App& app) {
     if (!app.shadowEnabled || app.shadowLists.commands.empty()) {
         return;
@@ -2553,6 +3052,32 @@ void recordForwardChunk(rx::graph::PassContext& ctx, App& app, uint32_t chunkInd
             }
             app.shadowMapHandle = app.bindless->registerSampledImage(shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             app.lastShadowMapView = shadowView;
+        }
+    }
+    if (chunkIndex == 0 && app.clusteringEnabled) {
+        // [Phase 5 Stage 2 Task 15, #51] Lazily register T14's own three
+        // named uint[] graph resources into bindless, ONCE -- mirrors
+        // app.shadowMapHandle's own "physical resource never resized/
+        // evicted afterward, so the handle stays valid every subsequent
+        // frame" precedent immediately above: these buffers' declared
+        // sizes (froxel count / maxTotalLightIndices) never change across
+        // this run's own lifetime (the cluster grid's own SHAPE is frozen
+        // at declareGraph()'s one declare-time call), so the render
+        // graph's transient pool keeps their physical backing stable --
+        // register once, reuse the SAME bindless index every frame
+        // thereafter, exactly like the shadowmap registration above (just
+        // never needing the "did the view change" re-check, since this
+        // sample never resizes the grid mid-run).
+        if (!app.clusterOffsetsHandle.isValid()) {
+            app.clusterOffsetsHandle = app.bindless->registerGenericStorageBuffer(ctx.buffer("clusterOffsets"), VK_WHOLE_SIZE);
+        }
+        if (!app.clusterWriteCountsHandle.isValid()) {
+            app.clusterWriteCountsHandle =
+                app.bindless->registerGenericStorageBuffer(ctx.buffer("clusterWriteCounts"), VK_WHOLE_SIZE);
+        }
+        if (!app.clusterLightIndicesHandle.isValid()) {
+            app.clusterLightIndicesHandle =
+                app.bindless->registerGenericStorageBuffer(ctx.buffer("clusterLightIndices"), VK_WHOLE_SIZE);
         }
     }
 
@@ -2726,14 +3251,74 @@ rx::graph::AttachmentDesc shadowAttachmentDesc() {
     return desc;
 }
 
-void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat) {
+// [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] The charter frame-
+// pipeline spine this stage needs (docs/superpowers/specs/2026-08-09-
+// toolchain-platform-rhi-design.md's own "depth -> shadows -> clustered
+// light assignment -> opaque lighting..." target, quoted in full in the
+// gate matrix): "depth_prepass" (T15's own addition) -> "shadow" (D21/RC3,
+// pre-existing) -> "cluster_count"/"cluster_prefix_sum"/"cluster_scatter"
+// (T14's own compute chain, integrated here) -> "forward" (opaque
+// lighting, now REUSING "depth_prepass"'s own "sceneDepth" output instead
+// of clearing a fresh "depth" attachment) -> "tonemap" -> overlay ->
+// backbuffer. `viewportWidth`/`viewportHeight` are the CONCRETE (not
+// swapchain-relative-fractional) pixel dimensions this declare-time call
+// resolves the cluster grid's own XY tiling against (rx::cluster::
+// ClusterPipelines::addClusterPasses()'s own "grid SHAPE resolved ONCE,
+// here, at declare time" contract) -- runHeadless()/runPresent() pass
+// kHeadlessWidth/Height or the real (already-created-by-this-point)
+// swapchain extent respectively.
+void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFormat, uint32_t viewportWidth,
+                   uint32_t viewportHeight) {
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Depth prepass --
+    // FIRST in the charter's own pass chain, delivering "sceneDepth" (a
+    // REAL, sampleable graph resource -- imageUsage unions in
+    // VK_IMAGE_USAGE_SAMPLED_BIT automatically the moment any pass in this
+    // graph addTextureInput()s it, per rx_graph's own PhysicalResource::
+    // imageUsage union rule; T19/T26's own future passes are exactly that
+    // future consumer) through the render graph, per RC5's own mandate.
+    // REVERSED-Z [D13 main-camera convention] -- same swapchainRelative
+    // ReversedDepthDesc() helper "forward" used for its own former "depth"
+    // resource below.
+    graph.addPass("depth_prepass")
+        .setDepthStencilOutput("sceneDepth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+        .setExecute([&app](rx::graph::PassContext& ctx) { recordDepthPrepassPass(ctx, app); });
+
     if (app.shadowEnabled) {
         graph.addPass("shadow")
             .setDepthStencilOutput("shadowmap", shadowAttachmentDesc())
             .setExecute([&app](rx::graph::PassContext& ctx) { recordShadowPass(ctx, app); });
     }
 
+    // [Phase 5 Stage 2 Task 15, #51] T14's clustered light-assignment
+    // compute chain -- declared ONCE, here (this render graph's own
+    // "declare once, execute() every frame" split -- see
+    // rx::cluster::ClusterFrameInputs' own header comment for why its
+    // recorded pass callbacks read `app.clusterFrameInputs` BY REFERENCE
+    // every frame instead). `app.clusterGrid` captures the returned
+    // FroxelGridParams for updateSceneFrame()'s own per-row broadcast
+    // (froxel index derivation on the shading side must use this EXACT
+    // grid, never re-derive it).
+    rx::cluster::ClusterParams clusterParams;
+    clusterParams.maxLightsPerFroxel = kMaxLightsPerFroxel;
+    clusterParams.maxTotalLightIndices = kMaxTotalLightIndices;
+    app.clusterGrid = app.clusterPipelines->addClusterPasses(graph, app.clusterFrameInputs, app.flyCamera.camera,
+                                                                viewportWidth, viewportHeight, clusterParams);
+
     rx::graph::Pass& forward = graph.addPass("forward");
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] "forward" REUSES
+    // "sceneDepth" (the depth prepass's own output) as its OWN depth-
+    // stencil output, rather than a fresh "depth" resource -- the render
+    // graph's own write-after-write chain (Pass::setDepthStencilOutput()'s
+    // documented "tolerates multiple writers of the same name" shape,
+    // render_graph.cpp) resolves this SECOND write's own load semantics to
+    // VK_ATTACHMENT_LOAD_OP_LOAD automatically (Executor::execute()'s own
+    // `attachmentEverWritten` tracking) -- "forward" therefore reuses the
+    // prepass's own already-correct depth values (GREATER_OR_EQUAL/
+    // depthWriteEnable=true re-derives byte-identical values for every
+    // opaque pixel the prepass already wrote, and correctly tests/writes
+    // fresh values for MASK/doubleSided geometry the prepass skipped) --
+    // never a second CLEAR, and never a private depth copy (matching RC5's
+    // own "T19/T26... may not ship a private depth copy" mandate).
     if (app.shadowEnabled) {
         // [Phase 4 exit fix wave, C1] THE fix: "forward" genuinely CONSUMES
         // "shadowmap" through the graph -- this both (a) un-culls the
@@ -2752,7 +3337,10 @@ void declareGraph(rx::graph::RenderGraph& graph, App& app, VkFormat backbufferFo
         forward.addTextureInput("shadowmap");
     }
     forward.addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
-        .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+        .setDepthStencilOutput("sceneDepth", swapchainRelativeReversedDepthDesc(kDepthFormat))
+        .addStorageBufferInput("clusterOffsets")
+        .addStorageBufferInput("clusterWriteCounts")
+        .addStorageBufferInput("clusterLightIndices")
         .setExecuteChunked(
             [&app](rx::graph::PassContext& ctx, uint32_t chunkIndex, uint32_t chunkCount) {
                 recordForwardChunk(ctx, app, chunkIndex, chunkCount);
@@ -3110,6 +3698,15 @@ int runHeadless(const Args& args) {
         expectedRecordsIn = kDefaultVisibleInstances;  // 1 submesh per instance.
         expectedDrawsSubmitted = kDefaultDrawsSubmitted;
     }
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Depth prepass +
+    // clustered-lighting buffer sizing -- runs for EVERY branch above
+    // (including --stress, which skips setupShadow() but still wants the
+    // depth prepass/clustered lighting active; see this function's own
+    // header comment).
+    if (!setupDepthPrepassAndClustering(*app)) {
+        destroyApp(*app);
+        return 1;
+    }
     app->sceneReady = true;
 
     app->overlay = rx::debug_ui::Overlay::create(*app->device, *app->window, app->device->swapchainFormat());
@@ -3123,7 +3720,7 @@ int runHeadless(const Args& args) {
     const VkFormat targetFormat = app->device->swapchainFormat();
 
     rx::graph::RenderGraph graph;
-    declareGraph(graph, *app, targetFormat);
+    declareGraph(graph, *app, targetFormat, kHeadlessWidth, kHeadlessHeight);
     rx::graph::CompileInfo compileInfo;
     compileInfo.swapchainWidth = kHeadlessWidth;
     compileInfo.swapchainHeight = kHeadlessHeight;
@@ -3620,6 +4217,12 @@ int runPresent(const Args& args) {
         }
         RX_LOG_INFO("sample_09_scene: default helmet grid loaded -- {} instance(s)", app->renderableHandles.size());
     }
+    // [Phase 5 Stage 2 Task 15, #51, gate ruling RC5] Same depth prepass +
+    // clustered-lighting setup as runHeadless() above.
+    if (!setupDepthPrepassAndClustering(*app)) {
+        destroyApp(*app);
+        return 1;
+    }
     app->sceneReady = true;
     app->flyCamera.camera.aspectRatio =
         static_cast<float>(app->device->swapchainExtent().width) / static_cast<float>(std::max<uint32_t>(1U, app->device->swapchainExtent().height));
@@ -3642,7 +4245,8 @@ int runPresent(const Args& args) {
     app->window->setRelativeMouseMode(app->mouseCapture.captured());
 
     rx::graph::RenderGraph graph;
-    declareGraph(graph, *app, app->device->swapchainFormat());
+    declareGraph(graph, *app, app->device->swapchainFormat(), app->device->swapchainExtent().width,
+                 app->device->swapchainExtent().height);
 
     // [Phase 5 Task 5, ticket #41] rx::frame_loop::PresentLoop now owns
     // FrameSync, the per-swapchain-image VkImageViews, and this graph's own

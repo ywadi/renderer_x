@@ -200,6 +200,22 @@ struct ClusterFrameInputs {
     // writes -- bound DIRECTLY... not through a graph declaration").
     VkBuffer lightsBuffer = VK_NULL_HANDLE;
     uint32_t lightCount = 0;
+
+    // [Phase 5 Task 15, #51 -- LOAD-BEARING, not a convenience field] Which
+    // of ClusterPipelines' own `framesInFlight` descriptor-set slots THIS
+    // frame's recorded pass callbacks read/write -- see
+    // ClusterPipelines::create()'s own FRAMES-IN-FLIGHT DESIGN comment.
+    // Read FRESH, every `Executor::execute()` call, by the SAME recorded
+    // lambdas that read `lightsBuffer`/`lightCount` above (never frozen at
+    // addClusterPasses()'s own declare-time call) -- this is what actually
+    // makes the multi-buffering real: selecting a DIFFERENT slot's already-
+    // allocated descriptor sets each frame is what avoids rewriting a set a
+    // still-in-flight GPU submission from a PRIOR frame might still be
+    // dynamically indexing. Must be `< ClusterPipelines::framesInFlight()`
+    // (clamped, logged, otherwise). Defaults to 0, matching this struct's
+    // other fields' own "byte-identical to T14's one-shot shape when
+    // unused" posture.
+    uint32_t frameSlot = 0;
 };
 
 // Owns the three compiled+cached compute PSOs (count/prefix-sum/scatter)
@@ -213,24 +229,28 @@ struct ClusterFrameInputs {
 // boundary T14's own header comment flagged: "a LIVE per-frame consumer
 // with N frames in flight needs its own multi-buffering strategy"]: this
 // object owns `framesInFlight` INDEPENDENT descriptor pools (one full set
-// of the six per-kernel descriptor sets each), selected by
-// addClusterPasses()'s own `frameSlot` argument. ONLY frame slot
-// `frameSlot`'s own pool is reset (vkResetDescriptorPool) + rewritten on a
-// given addClusterPasses() call -- a DIFFERENT frame slot's pool, and
-// therefore any descriptor set a still-in-flight GPU submission from a
-// PRIOR call against that OTHER slot might still be dynamically indexing,
-// is never touched. This is the same "N independent physical resources,
-// selected by frameSlot, so a fresh CPU-side write/reset never races a
-// still-in-flight GPU read/use of a DIFFERENT frame's own copy" discipline
-// `rx::rhi::PerFrameStorageBuffer`/`rx::material::MaterialSystem::
-// beginFrame()` already establish elsewhere in this codebase (see
-// per_frame_storage_buffer.h's own top comment) -- applied here to
-// descriptor SETS instead of a host-visible buffer's bytes.
+// of the six per-kernel descriptor sets each), ALL allocated ONCE, here, at
+// create() time -- addClusterPasses() below NEVER resets or reallocates
+// any of them. Each frame, the recorded pass callbacks it declares
+// (addClusterPasses() is called EXACTLY ONCE, at graph-declare time --
+// see ClusterFrameInputs' own header comment) read `frameInputs.frameSlot`
+// FRESH, on every `Executor::execute()` call, and both WRITE that slot's
+// descriptors (`vkUpdateDescriptorSets` -- a plain rewrite, not a reset;
+// legal Vulkan usage as long as no command buffer currently referencing
+// that exact set is still in flight) AND BIND that same slot's sets for
+// the dispatch. A caller cycling `frameInputs.frameSlot` through [0,
+// framesInFlight) in lock-step with its own frame-in-flight index (the
+// SAME index `rx::rhi::PerFrameStorageBuffer`/`rx::material::
+// MaterialSystem::beginFrame()` already use elsewhere in this codebase --
+// see per_frame_storage_buffer.h's own top comment for the identical "one
+// physical copy per frame-in-flight slot" discipline) never rewrites a
+// slot a still-in-flight GPU submission from a PRIOR frame might still be
+// dynamically indexing, because that prior frame used a DIFFERENT slot.
 // `framesInFlight=1` (the default) reproduces this class's PRE-Task-15
-// one-shot/test-scoped behavior byte-for-byte (a single pool, always reset
-// on every call, `frameSlot` always resolving to that same one slot) --
-// every one of T14's own existing tests/bench, which never pass either new
-// parameter, is therefore unaffected.
+// one-shot/test-scoped behavior byte-for-byte (one pool, `frameSlot`
+// always resolving to that same one slot) -- every one of T14's own
+// existing tests/bench, which never set either new field, is therefore
+// unaffected.
 //
 // Main-thread-only (D5) -- builds real Vulkan pipeline objects, same
 // convention as every other rx_rhi_vk/rx_graph factory.
@@ -285,14 +305,13 @@ public:
     //
     // [Phase 5 Task 15, #51] `frameInputs` is captured BY REFERENCE inside
     // the recorded pass callbacks -- `frameInputs.lightsBuffer`/
-    // `.lightCount` are read FRESH on every `Executor::execute()` call
-    // (never frozen at THIS declare-time call), which is what makes
-    // per-frame-varying light data/count reach these once-declared passes
-    // correctly -- see ClusterFrameInputs' own header comment. `frameSlot`
-    // selects which of this object's own `framesInFlight` descriptor pools
-    // this call resets+rewrites (see this class's own FRAMES-IN-FLIGHT
-    // DESIGN comment); out-of-range values are clamped (modulo
-    // `framesInFlight`), logged.
+    // `.lightCount`/`.frameSlot` are ALL read FRESH on every `Executor::
+    // execute()` call (never frozen at THIS declare-time call), which is
+    // what makes per-frame-varying light data/count/slot-selection reach
+    // these once-declared passes correctly -- see ClusterFrameInputs' own
+    // header comment, in particular `.frameSlot`'s own (out-of-range
+    // values are clamped, logged, at execute time -- not here, since this
+    // call never reads `frameInputs.frameSlot` itself).
     //
     // The grid's own SHAPE (countX/Y/Z, tanHalfFovY, aspectRatio,
     // zLightNear/Far, linearizer) is resolved ONCE, here, from `camera`/
@@ -309,8 +328,7 @@ public:
                                                                          const rx::scene::Camera& camera,
                                                                          uint32_t viewportWidth,
                                                                          uint32_t viewportHeight,
-                                                                         const ClusterParams& params = {},
-                                                                         uint32_t frameSlot = 0);
+                                                                         const ClusterParams& params = {});
 
     [[nodiscard]] uint32_t framesInFlight() const { return static_cast<uint32_t>(frameSlots_.size()); }
 
@@ -325,9 +343,9 @@ private:
     // [Phase 5 Task 15, #51] One full set of the six per-kernel descriptor
     // sets (set-0 empty placeholder + set-1 real bindings, per kernel),
     // backed by ITS OWN VkDescriptorPool -- see this class's own
-    // FRAMES-IN-FLIGHT DESIGN comment. Reset+reallocated wholesale on every
-    // addClusterPasses() call THAT SELECTS this slot (never touched by a
-    // call selecting a different slot).
+    // FRAMES-IN-FLIGHT DESIGN comment. Allocated ONCE, at create() time;
+    // NEVER reset -- every frame that selects this slot only REWRITES
+    // set-1's descriptor contents (vkUpdateDescriptorSets) in place.
     struct FrameSlot {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         VkDescriptorSet countSet0 = VK_NULL_HANDLE;

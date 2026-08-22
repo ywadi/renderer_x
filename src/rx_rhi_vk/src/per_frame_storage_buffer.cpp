@@ -97,6 +97,15 @@ bool PerFrameStorageBuffer::write(uint32_t frameSlot, const void* data, VkDevice
     return true;
 }
 
+VkBuffer PerFrameStorageBuffer::bufferHandle(uint32_t frameSlot) const {
+    if (frameSlot >= buffers_.size() || !buffers_[frameSlot].has_value()) {
+        RX_LOG_ERROR("rx::rhi::PerFrameStorageBuffer::bufferHandle: frameSlot {} out of range (framesInFlight={})",
+                     frameSlot, buffers_.size());
+        return VK_NULL_HANDLE;
+    }
+    return buffers_[frameSlot]->handle();
+}
+
 uint32_t PerFrameStorageBuffer::bindlessIndex(uint32_t frameSlot) const {
     if (frameSlot >= handles_.size()) {
         RX_LOG_ERROR("rx::rhi::PerFrameStorageBuffer::bindlessIndex: frameSlot {} out of range (framesInFlight={})",

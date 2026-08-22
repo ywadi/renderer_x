@@ -128,6 +128,16 @@ public:
     // this instance's own `bytesPerSlot`.
     bool write(uint32_t frameSlot, const void* data, VkDeviceSize bytes);
 
+    // [Phase 5 Task 15, #51] The raw VkBuffer handle backing slot
+    // `frameSlot` -- for a caller that needs to bind this slot's buffer
+    // directly (a VkDescriptorBufferInfo a NON-bindless descriptor set
+    // references, e.g. rx::cluster::ClusterFrameInputs::lightsBuffer's own
+    // consumer, T14's own dedicated per-kernel descriptor sets, entirely
+    // separate from BindlessTable) rather than only through its bindless
+    // INDEX (bindlessIndex() below). Returns VK_NULL_HANDLE if `frameSlot`
+    // is out of range.
+    [[nodiscard]] VkBuffer bufferHandle(uint32_t frameSlot) const;
+
     // Bindless STORAGE_BUFFER index for slot `frameSlot` -- the value a
     // draw's own push-constant/globals-shaped field embeds to address this
     // slot's buffer from a shader. Returns an invalid (index() == 0,
