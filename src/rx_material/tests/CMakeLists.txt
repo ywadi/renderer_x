@@ -59,13 +59,18 @@ add_executable(rx_material_gpu_tests
     # attenuation value probes, directional regression, pre-exposure
     # coherence. See that file's own header comment.
     test_standard_pbr_punctual_gpu.cpp
+    # Phase 5 Stage 2 Task 15 [#51]: shaders/material/cluster_lighting.slang's
+    # own shading-side per-pixel froxel lookup -- exact membership value
+    # assertion + revert-discrimination proof. See that file's own header
+    # comment.
+    test_cluster_shading_gpu.cpp
 )
 # [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
 # pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads
 # camera.exposure()/rx::scene::exposure::exposure(ev100) to compute the
 # expected pre-multiplied lightColor it asserts against -- the ONE case in
 # this binary that needs Camera's exposure math linked in.
-target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_scene rx_rhi_vk rx_platform doctest::doctest)
+target_link_libraries(rx_material_gpu_tests PRIVATE rx_material rx_shadow rx_scene rx_cluster rx_rhi_vk rx_platform doctest::doctest)
 rx_shader_deploy_runtime_libs(rx_material_gpu_tests)
 
 target_compile_definitions(rx_material_gpu_tests PRIVATE
@@ -83,6 +88,11 @@ target_compile_definitions(rx_material_gpu_tests PRIVATE
   # rx_ibl, which owns the BAKE chain's own shaders, a distinct concern
   # from the skybox pass this file's own test targets).
   RX_IBL_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/ibl"
+  # [Phase 5 Stage 2 Task 15, #51] test_cluster_shading_gpu.cpp's own
+  # rx::cluster::ClusterPipelines::create() call needs T14's own compute
+  # kernel directory -- same macro name/value rx_cluster/tests/CMakeLists.txt
+  # already defines for its own (separate) test binary.
+  RX_CLUSTER_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders/cluster"
 )
 
 # --validate: same developer/CI-gate opt-in every other GPU-backed test

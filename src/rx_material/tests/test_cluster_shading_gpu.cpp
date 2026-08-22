@@ -1,0 +1,613 @@
+// src/rx_material/tests/test_cluster_shading_gpu.cpp -- Phase 5 Stage 2
+// Task 15 [#51, gate matrix-p5t15-clustered-shading.md]: value-asserted
+// GPU proof of the SHADING-SIDE per-pixel froxel lookup
+// (shaders/material/cluster_lighting.slang's `rx_evaluateClusteredLights()`
+// / `clusterFroxelIndex()`), exercised directly (not through a full
+// rasterized StandardPbr triangle -- test_standard_pbr_punctual_gpu.cpp's
+// own job is the BRDF/single-slot-punctual math) via a tiny dedicated
+// compute probe (shaders/material/test_cluster_shading_probe.slang, TEST-
+// ONLY, see that file's own header comment).
+//
+// SCENARIO -- mirrors T14's own "behind-camera exclusion" methodology
+// (test_cluster_membership_gpu.cpp) from the SHADING side instead of the
+// culling side: a camera at the origin looking down -Z; ONE probe
+// fragment at world (0,0,-20) (comfortably inside a middle Z-slice,
+// avoiding slice-0's own documented looseness -- task-14-report.md's
+// "Honest design note"); TWO synthetic Point lights, run through the
+// REAL T14 compute chain (rx::cluster::ClusterPipelines::addClusterPasses()):
+//   - Light A ("in-froxel"): world (0,0,-19), 1 unit from the probe along
+//     the SAME axis as its normal (NdotL==1 exactly, isolating distance
+//     attenuation -- test_standard_pbr_punctual_gpu.cpp's own established
+//     "matched-pose" methodology), RED-only color (10,0,0) candela.
+//   - Light B ("excluded"): world (0,0,+50) -- BEHIND the camera, entirely
+//     outside every froxel in the grid by construction (T14's own proven
+//     exclusion case) -- GREEN-only color (0,10,0) candela, deliberately
+//     bright so any leakage would be obviously visible.
+//
+// ACCEPTANCE [matrix-p5t15's own row]: "a fragment's accumulated lighting
+// includes ONLY the lights in ITS OWN froxel's record range... a light
+// entirely outside a fragment's froxel must contribute exactly zero, not
+// merely 'small'". The probe's own output `.g` channel (Light B's sole
+// contribution channel) must be EXACTLY 0.0 -- not merely small -- while
+// `.r` (Light A's channel) matches the closed-form Lambertian value
+// exactly (Fd_Lambert() == 1/pi, NdotL==1, distSq==1, rangeWindow==1).
+#include <doctest/doctest.h>
+#include <rx_cluster/cluster_lighting.h>
+#include <rx_core/log.h>
+#include <rx_material/draw_data.h>
+#include <rx_material/material_system.h>
+#include <rx_platform/window.h>
+#include <rx_rhi_vk/bindless.h>
+#include <rx_rhi_vk/buffer.h>
+#include <rx_rhi_vk/command.h>
+#include <rx_rhi_vk/compute_pipeline.h>
+#include <rx_rhi_vk/context.h>
+#include <rx_rhi_vk/device.h>
+#include <rx_rhi_vk/pipeline_layout.h>
+#include <rx_scene/camera.h>
+#include <rx_scene/froxel_grid.h>
+#include <rx_scene/scene.h>
+#include <rx_shader/compiler.h>
+#include <rx_shader/reflection.h>
+
+#include <rx_graph/executor.h>
+#include <rx_graph/render_graph.h>
+#include <rx_task/scheduler.h>
+
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifndef RX_MATERIAL_SHADER_DIR
+#error "RX_MATERIAL_SHADER_DIR must be defined by this test binary's own CMakeLists.txt"
+#endif
+#ifndef RX_CLUSTER_SHADER_DIR
+#error "RX_CLUSTER_SHADER_DIR must be defined by this test binary's own CMakeLists.txt"
+#endif
+
+namespace {
+
+struct Fixture {
+    rx::platform::Window window;
+    rx::rhi::Context context;
+    rx::rhi::Device device;
+    rx::rhi::BindlessTable bindless;
+    rx::rhi::Allocator allocator;
+};
+
+std::optional<Fixture> makeFixture(const char* title) {
+    auto window = rx::platform::Window::create(title, 64, 64, /*visible=*/false);
+    if (!window.has_value()) {
+        MESSAGE("no display backend available, skipping rx_cluster shading GPU test");
+        return std::nullopt;
+    }
+    auto extensions = window->requiredVulkanInstanceExtensions();
+    if (extensions.empty()) {
+        MESSAGE("video driver reports no Vulkan surface extensions, skipping rx_cluster shading GPU test");
+        return std::nullopt;
+    }
+    auto context = rx::rhi::Context::create(extensions, /*enableValidation=*/true);
+    REQUIRE(context.has_value());
+    VkSurfaceKHR surface = window->createVulkanSurface(context->instance());
+    REQUIRE(surface != VK_NULL_HANDLE);
+    auto device = rx::rhi::Device::create(*context, surface);
+    REQUIRE(device.has_value());
+
+    // [Phase 5 Task 15, #51] genericStorageBuffers/clusterLightBuffers --
+    // this test registers T14's own three named uint[] outputs plus the
+    // hand-built ClusterLightGpu[] array, mirroring how a real material
+    // pipeline's own compiled program (standard_pbr.slang -> cluster_
+    // lighting.slang) unconditionally references bindings 5/6 -- this
+    // probe shader does too (`import cluster_lighting;`).
+    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/1, /*samplers=*/1, /*storageBuffers=*/1};
+    capacities.comparisonSamplers = 1;
+    capacities.cubeImages = 1;
+    capacities.genericStorageBuffers = 4;
+    capacities.clusterLightBuffers = 1;
+    auto bindless = rx::rhi::BindlessTable::create(device->physicalDevice(), device->device(), capacities);
+    REQUIRE(bindless.has_value());
+
+    auto allocator = rx::rhi::Allocator::create(*context, *device);
+    REQUIRE(allocator.has_value());
+
+    return Fixture{std::move(*window), std::move(*context), std::move(*device), std::move(*bindless),
+                    std::move(*allocator)};
+}
+
+std::filesystem::path freshCachePath(const char* name) {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() / (std::string("rx_cluster_shading_test_") + name + ".cache");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return path;
+}
+
+// --- The probe compute pipeline [test-only, see the .slang file's own
+// header comment] -- built via plain rx::shader::Compiler + rx_rhi_vk::
+// PipelineLayoutBuilder, mirroring rx_cluster::cluster_lighting.cpp's own
+// buildKernel() shape exactly (the SAME "compile -> reflect -> external-
+// set-0-substituted layout -> vkCreateComputePipelines" sequence). -----
+struct ProbePipeline {
+    VkDevice device = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    rx::rhi::PipelineLayoutBundle layoutBundle;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    rx::shader::ShaderLayoutInfo layoutInfo;
+
+    ~ProbePipeline() {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+        if (module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(device, module, nullptr);
+        }
+    }
+    ProbePipeline() = default;
+    ProbePipeline(const ProbePipeline&) = delete;
+    ProbePipeline& operator=(const ProbePipeline&) = delete;
+    ProbePipeline(ProbePipeline&&) = delete;
+    ProbePipeline& operator=(ProbePipeline&&) = delete;
+};
+
+std::unique_ptr<ProbePipeline> buildProbePipeline(VkDevice device, rx::rhi::BindlessTable& bindless) {
+    // [Slang runtime-compiles this file EVERY test-binary run -- no C++
+    // rebuild needed for a source edit, exactly like every other Slang-
+    // backed GPU test in this codebase -- this is what makes the revert-
+    // discrimination proof below (sabotage cluster_lighting.slang, re-run,
+    // revert) work without a rebuild.]
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    const std::filesystem::path path =
+        std::filesystem::path(RX_MATERIAL_SHADER_DIR) / "test_cluster_shading_probe.slang";
+    rx::shader::CompileResult compileResult = compiler->compileFromFile(path.string(), {"csProbe"});
+    if (!compileResult.ok) {
+        RX_LOG_ERROR("rx_cluster shading test: probe shader compile failed: {}", compileResult.diagnostics);
+    }
+    REQUIRE(compileResult.ok);
+    REQUIRE(compileResult.entryPointCode.size() == 1);
+
+    auto layoutInfo = rx::shader::reflect(compileResult);
+    REQUIRE(layoutInfo.has_value());
+
+    auto probe = std::make_unique<ProbePipeline>();
+    probe->device = device;
+    probe->layoutInfo = *layoutInfo;
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = compileResult.entryPointCode[0].code.size() * sizeof(uint32_t);
+    moduleInfo.pCode = compileResult.entryPointCode[0].code.data();
+    REQUIRE(vkCreateShaderModule(device, &moduleInfo, nullptr, &probe->module) == VK_SUCCESS);
+
+    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, *layoutInfo, bindless.descriptorSetLayout());
+    REQUIRE(layoutBundle.has_value());
+    probe->layoutBundle = std::move(*layoutBundle);
+
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = probe->module;
+    stage.pName = "main";
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage = stage;
+    pipelineInfo.layout = probe->layoutBundle.layout;
+    REQUIRE(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &probe->pipeline) ==
+            VK_SUCCESS);
+    return probe;
+}
+
+struct ProbeParamsGpu {
+    uint32_t clusterCountX;
+    uint32_t clusterCountY;
+    uint32_t clusterCountZ;
+    float clusterTanHalfFovY;
+    float clusterAspectRatio;
+    float clusterZLightFar;
+    float clusterInvLinearizer;
+    uint32_t clusterOffsetsBufferIndex;
+    uint32_t clusterWriteCountsBufferIndex;
+    uint32_t clusterLightIndicesBufferIndex;
+    uint32_t clusterLightsBufferIndex;
+};
+
+struct ProbeResult {
+    std::array<glm::vec3, 1> diffuse{};
+    std::array<glm::vec3, 1> specular{};
+};
+
+// Runs the FULL T14 compute chain (rx::cluster::ClusterPipelines) plus
+// this file's own probe pass, in ONE graph / ONE runOnce() -- mirrors
+// rx_cluster's own cluster_gpu_fixture.h::runCluster() shape, extended
+// with the probe. `lights` is the hand-built (not Scene-derived, for
+// exact test control) ClusterLightGpu row array.
+ProbeResult runProbe(Fixture& fixture, rx::cluster::ClusterPipelines& pipelines, ProbePipeline& probe,
+                     const std::vector<rx::cluster::ClusterLightGpu>& lights, const rx::scene::Camera& camera,
+                     uint32_t viewportWidth, uint32_t viewportHeight, const rx::cluster::ClusterParams& params,
+                     glm::vec3 probeWorldPos) {
+    using rx::graph::PassContext;
+    using rx::graph::QueueClass;
+    using rx::graph::RenderGraph;
+
+    VkDevice device = fixture.device.device();
+
+    auto scheduler = rx::task::Scheduler::create();
+    REQUIRE(scheduler != nullptr);
+    auto executor = rx::graph::Executor::create(fixture.device, *scheduler);
+    REQUIRE(executor != nullptr);
+
+    auto lightsBuffer = fixture.allocator.createHostVisibleBuffer(
+        std::max<VkDeviceSize>(sizeof(rx::cluster::ClusterLightGpu),
+                                static_cast<VkDeviceSize>(lights.size()) * sizeof(rx::cluster::ClusterLightGpu)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    REQUIRE(lightsBuffer.has_value());
+    if (!lights.empty()) {
+        std::memcpy(lightsBuffer->mappedData(), lights.data(), lights.size() * sizeof(rx::cluster::ClusterLightGpu));
+        lightsBuffer->flush();
+    }
+    rx::rhi::BindlessHandle lightsHandle =
+        fixture.bindless.registerClusterLightBuffer(lightsBuffer->handle(), VK_WHOLE_SIZE);
+    REQUIRE(lightsHandle.isValid());
+
+    const rx::cluster::ClusterFrameInputs frameInputs{lightsBuffer->handle(), static_cast<uint32_t>(lights.size()),
+                                                        /*frameSlot=*/0};
+
+    RenderGraph graph;
+    const rx::scene::froxel::FroxelGridParams grid =
+        pipelines.addClusterPasses(graph, frameInputs, camera, viewportWidth, viewportHeight, params);
+
+    auto testPositions = fixture.allocator.createHostVisibleBuffer(sizeof(glm::vec3), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    REQUIRE(testPositions.has_value());
+    std::memcpy(testPositions->mappedData(), &probeWorldPos, sizeof(glm::vec3));
+    testPositions->flush();
+
+    const glm::mat4 viewTransposed = glm::transpose(camera.view());
+    auto viewBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(glm::mat4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    REQUIRE(viewBuffer.has_value());
+    std::memcpy(viewBuffer->mappedData(), &viewTransposed, sizeof(glm::mat4));
+    viewBuffer->flush();
+
+    auto outDiffuse = fixture.allocator.createHostVisibleBuffer(
+        sizeof(glm::vec3), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    REQUIRE(outDiffuse.has_value());
+    auto outSpecular = fixture.allocator.createHostVisibleBuffer(
+        sizeof(glm::vec3), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    REQUIRE(outSpecular.has_value());
+    // [Slang forbids a second `[[vk::push_constant]]` block alongside
+    // material.slang's own `gMaterialGlobals` -- see the .slang file's own
+    // header comment -- so ProbeParams travels as an ordinary bound
+    // uniform buffer (set 1, binding 0) instead.]
+    auto probeParamsBuffer = fixture.allocator.createHostVisibleBuffer(sizeof(ProbeParamsGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    REQUIRE(probeParamsBuffer.has_value());
+
+    VkDescriptorPoolSize poolSizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    VkDescriptorPool probeSetPool = VK_NULL_HANDLE;
+    REQUIRE(vkCreateDescriptorPool(device, &poolInfo, nullptr, &probeSetPool) == VK_SUCCESS);
+    VkDescriptorSetAllocateInfo setAllocInfo{};
+    setAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setAllocInfo.descriptorPool = probeSetPool;
+    setAllocInfo.descriptorSetCount = 1;
+    setAllocInfo.pSetLayouts = &probe.layoutBundle.setLayouts[1];
+    VkDescriptorSet probeSet = VK_NULL_HANDLE;
+    REQUIRE(vkAllocateDescriptorSets(device, &setAllocInfo, &probeSet) == VK_SUCCESS);
+
+    // [rx_graph's own RenderGraph::compile() requires a backbuffer source
+    // even for a compute-only graph -- mirrors tools/rx_cluster_bench's
+    // own "present" dummy color pass precedent.]
+    rx::graph::AttachmentDesc bbDesc;
+    bbDesc.format = VK_FORMAT_R8G8B8A8_UNORM;
+    graph.addPass("present").addColorOutput("bb", bbDesc);
+    graph.setBackbufferSource("bb");
+
+    // [Fix round] Declared OUTSIDE the lambda (not local to setExecute())
+    // so this function's own caller can release() them after runOnce()
+    // completes -- this function is called MULTIPLE times per TEST_CASE
+    // (the positive scenario, the sabotaged re-run, the restored re-run),
+    // and this fixture's own BindlessTable genericStorageBuffers capacity
+    // is finite; never releasing these three registrations between calls
+    // exhausts it by the second call, reproduced directly while writing
+    // this test.
+    rx::rhi::BindlessHandle offsetsHandle;
+    rx::rhi::BindlessHandle writeCountsHandle;
+    rx::rhi::BindlessHandle lightIndicesHandle;
+    graph.addPass("cluster_shading_probe", QueueClass::AsyncCompute)
+        .addStorageBufferInput("clusterOffsets")
+        .addStorageBufferInput("clusterWriteCounts")
+        .addStorageBufferInput("clusterLightIndices")
+        .setSideEffect()
+        .setExecute([&](PassContext& ctx) {
+            offsetsHandle = fixture.bindless.registerGenericStorageBuffer(ctx.buffer("clusterOffsets"), VK_WHOLE_SIZE);
+            writeCountsHandle =
+                fixture.bindless.registerGenericStorageBuffer(ctx.buffer("clusterWriteCounts"), VK_WHOLE_SIZE);
+            lightIndicesHandle =
+                fixture.bindless.registerGenericStorageBuffer(ctx.buffer("clusterLightIndices"), VK_WHOLE_SIZE);
+            REQUIRE(offsetsHandle.isValid());
+            REQUIRE(writeCountsHandle.isValid());
+            REQUIRE(lightIndicesHandle.isValid());
+
+            ProbeParamsGpu probeParams{grid.countX,
+                                        grid.countY,
+                                        grid.countZ,
+                                        grid.tanHalfFovY,
+                                        grid.aspectRatio,
+                                        grid.zLightFar,
+                                        grid.invLinearizer,
+                                        offsetsHandle.index(),
+                                        writeCountsHandle.index(),
+                                        lightIndicesHandle.index(),
+                                        lightsHandle.index()};
+            std::memcpy(probeParamsBuffer->mappedData(), &probeParams, sizeof(probeParams));
+            probeParamsBuffer->flush();
+
+            std::array<VkDescriptorBufferInfo, 5> bufferInfos{
+                VkDescriptorBufferInfo{probeParamsBuffer->handle(), 0, VK_WHOLE_SIZE},
+                VkDescriptorBufferInfo{testPositions->handle(), 0, VK_WHOLE_SIZE},
+                VkDescriptorBufferInfo{viewBuffer->handle(), 0, VK_WHOLE_SIZE},
+                VkDescriptorBufferInfo{outDiffuse->handle(), 0, VK_WHOLE_SIZE},
+                VkDescriptorBufferInfo{outSpecular->handle(), 0, VK_WHOLE_SIZE},
+            };
+            std::array<VkWriteDescriptorSet, 5> writes{};
+            for (uint32_t i = 0; i < writes.size(); ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = probeSet;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[i].pBufferInfo = &bufferInfos[i];
+            }
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+            VkDescriptorSet bindlessSet = fixture.bindless.descriptorSet();
+            std::array<VkDescriptorSet, 2> sets{bindlessSet, probeSet};
+            vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probe.pipeline);
+            vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probe.layoutBundle.layout, 0,
+                                      static_cast<uint32_t>(sets.size()), sets.data(), 0, nullptr);
+            vkCmdDispatch(ctx.cmd, 1, 1, 1);
+        });
+
+    rx::graph::CompileInfo compileInfo;
+    compileInfo.swapchainWidth = viewportWidth;
+    compileInfo.swapchainHeight = viewportHeight;
+    compileInfo.swapchainFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    graph.compile(compileInfo);
+    executor->realize(graph);
+
+    // A real (if unused) backbuffer image -- "present"'s own addColorOutput
+    // needs a real target to write into.
+    VkImageCreateInfo bbImageInfo{};
+    bbImageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    bbImageInfo.imageType = VK_IMAGE_TYPE_2D;
+    bbImageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    bbImageInfo.extent = {viewportWidth, viewportHeight, 1};
+    bbImageInfo.mipLevels = 1;
+    bbImageInfo.arrayLayers = 1;
+    bbImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    bbImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    bbImageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    bbImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage bbImage = VK_NULL_HANDLE;
+    REQUIRE(vkCreateImage(device, &bbImageInfo, nullptr, &bbImage) == VK_SUCCESS);
+    VkMemoryRequirements bbMemReq{};
+    vkGetImageMemoryRequirements(device, bbImage, &bbMemReq);
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(fixture.device.physicalDevice(), &memProps);
+    uint32_t bbMemType = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((bbMemReq.memoryTypeBits & (1U << i)) != 0U &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
+            bbMemType = i;
+            break;
+        }
+    }
+    REQUIRE(bbMemType != UINT32_MAX);
+    VkMemoryAllocateInfo bbAllocInfo{};
+    bbAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bbAllocInfo.allocationSize = bbMemReq.size;
+    bbAllocInfo.memoryTypeIndex = bbMemType;
+    VkDeviceMemory bbMemory = VK_NULL_HANDLE;
+    REQUIRE(vkAllocateMemory(device, &bbAllocInfo, nullptr, &bbMemory) == VK_SUCCESS);
+    REQUIRE(vkBindImageMemory(device, bbImage, bbMemory, 0) == VK_SUCCESS);
+    VkImageViewCreateInfo bbViewInfo{};
+    bbViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    bbViewInfo.image = bbImage;
+    bbViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    bbViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    bbViewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView bbView = VK_NULL_HANDLE;
+    REQUIRE(vkCreateImageView(device, &bbViewInfo, nullptr, &bbView) == VK_SUCCESS);
+
+    auto cmdCtx = rx::rhi::CommandContext::create(device, fixture.device.graphicsQueue(), fixture.device.graphicsQueueFamily());
+    REQUIRE(cmdCtx.has_value());
+    cmdCtx->runOnce(
+        [&](VkCommandBuffer cmd) { executor->execute(graph, cmd, bbImage, bbView, {viewportWidth, viewportHeight}); });
+
+    vkDestroyImageView(device, bbView, nullptr);
+    vkDestroyImage(device, bbImage, nullptr);
+    vkFreeMemory(device, bbMemory, nullptr);
+
+    outDiffuse->invalidate();
+    outSpecular->invalidate();
+    ProbeResult result;
+    std::memcpy(result.diffuse.data(), outDiffuse->mappedData(), sizeof(glm::vec3));
+    std::memcpy(result.specular.data(), outSpecular->mappedData(), sizeof(glm::vec3));
+
+    vkDestroyDescriptorPool(device, probeSetPool, nullptr);
+    fixture.bindless.release(lightsHandle);
+    fixture.bindless.release(offsetsHandle);
+    fixture.bindless.release(writeCountsHandle);
+    fixture.bindless.release(lightIndicesHandle);
+    return result;
+}
+
+bool near(float actual, float expected, float absTolerance) { return std::fabs(actual - expected) <= absTolerance; }
+
+}  // namespace
+
+TEST_CASE("Clustered shading: exact per-froxel membership from the SHADING side -- an in-froxel light "
+          "contributes its own closed-form value, a light entirely outside the probe's froxel (behind the "
+          "camera, T14's own proven exclusion case) contributes EXACTLY zero") {
+    auto fixtureOpt = makeFixture("rx_cluster_shading_membership");
+    if (!fixtureOpt.has_value()) {
+        return;
+    }
+    Fixture fixture = std::move(*fixtureOpt);
+
+    auto computeCache = rx::rhi::ComputePipelineCache::create(fixture.device.device(), freshCachePath("chain"));
+    REQUIRE(computeCache.has_value());
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    auto pipelinesOpt = rx::cluster::ClusterPipelines::create(fixture.device.device(), *computeCache, *compiler,
+                                                                RX_CLUSTER_SHADER_DIR, /*framesInFlight=*/1);
+    REQUIRE(pipelinesOpt.has_value());
+    rx::cluster::ClusterPipelines pipelines = std::move(*pipelinesOpt);
+
+    auto probe = buildProbePipeline(fixture.device.device(), fixture.bindless);
+
+    rx::scene::Camera camera;  // default: position (0,0,0), looking down -Z, 60deg vfov.
+    camera.aspectRatio = 1.0F;
+    constexpr uint32_t kViewport = 256;
+    rx::cluster::ClusterParams params;  // defaults: kDefaultZLightNear=5, kDefaultZLightFar=100.
+
+    // Probe fragment: 20 units down -Z -- comfortably inside a middle
+    // Z-slice (see this file's own header comment for why NOT near
+    // zLightNear==5, slice 0's own documented looseness).
+    const glm::vec3 probeWorldPos(0.0F, 0.0F, -20.0F);
+
+    // Light A ("in-froxel"): 1 unit closer to the camera than the probe,
+    // along the SAME axis the probe's own fixed normal (0,0,1) points --
+    // NdotL==1 exactly (test_standard_pbr_punctual_gpu.cpp's own
+    // established matched-pose methodology).
+    // [Fix round] Cull radius comes from the SAME production derivation
+    // buildClusterLightList() uses (rx::scene::froxel::pointLightCullRadius(),
+    // an illuminance-cutoff-based radius) -- NOT an arbitrary large
+    // constant. A hardcoded 1000-unit radius (this test's own original,
+    // wrong draft) makes EVERY light's culling "sphere" reach every froxel
+    // in the grid regardless of real position, silently defeating the
+    // whole "behind-camera exclusion" scenario this TEST_CASE exists to
+    // prove -- reproduced directly while writing this test (Light B leaked
+    // through at exactly its own closed-form inverse-square value, proving
+    // it was genuinely, wrongly INCLUDED, not a rounding artifact).
+    const float kCullCutoffLux = 1.0F;
+    rx::cluster::ClusterLightGpu lightA{};
+    const glm::vec3 lightAWorldPos(0.0F, 0.0F, -19.0F);
+    const float lightACullRadius = rx::scene::froxel::pointLightCullRadius(glm::vec3(10.0F, 0.0F, 0.0F), 0.0F, kCullCutoffLux);
+    lightA.viewPositionRadius =
+        glm::vec4(glm::vec3(camera.view() * glm::vec4(lightAWorldPos, 1.0F)), lightACullRadius);
+    lightA.viewAxisSinInverse = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+    lightA.cosSquaredFlags = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // isSpot=0 -> Point.
+    lightA.shadingTypeRangeAngle = glm::vec4(1.0F, 0.0F, 0.0F, 0.0F);  // Point, range=0 (infinite).
+    lightA.shadingPositionWorld = glm::vec4(lightAWorldPos, 0.0F);
+    lightA.shadingColorCandela = glm::vec4(10.0F, 0.0F, 0.0F, 0.0F);  // RED-only.
+    lightA.shadingSpotDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+
+    // Light B ("excluded"): BEHIND the camera (positive view-space Z) --
+    // T14's own proven exclusion case (test_cluster_membership_gpu.cpp's
+    // "Behind-camera" scenario), reused here from the shading side.
+    rx::cluster::ClusterLightGpu lightB{};
+    const glm::vec3 lightBWorldPos(0.0F, 0.0F, 50.0F);
+    const float lightBCullRadius = rx::scene::froxel::pointLightCullRadius(glm::vec3(0.0F, 10.0F, 0.0F), 0.0F, kCullCutoffLux);
+    lightB.viewPositionRadius =
+        glm::vec4(glm::vec3(camera.view() * glm::vec4(lightBWorldPos, 1.0F)), lightBCullRadius);
+    lightB.viewAxisSinInverse = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+    lightB.cosSquaredFlags = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+    lightB.shadingTypeRangeAngle = glm::vec4(1.0F, 0.0F, 0.0F, 0.0F);
+    lightB.shadingPositionWorld = glm::vec4(lightBWorldPos, 0.0F);
+    lightB.shadingColorCandela = glm::vec4(0.0F, 10.0F, 0.0F, 0.0F);  // GREEN-only, deliberately bright.
+    lightB.shadingSpotDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+
+    const std::vector<rx::cluster::ClusterLightGpu> lights{lightA, lightB};
+    ProbeResult result = runProbe(fixture, pipelines, *probe, lights, camera, kViewport, kViewport, params, probeWorldPos);
+
+    // Closed form: Fd_Lambert()=1/pi, NdotL=1, distSq=1 (Light A is
+    // exactly 1 unit away), rangeWindow=1 (range=0 -> no window).
+    // outDiffuse.r = diffuseColor.r(1) * (1/pi) * colorCandela.r(10) * attenuation(1) * NdotL(1) = 10/pi.
+    const float expectedDiffuseR = 10.0F / static_cast<float>(M_PI);
+    CAPTURE(result.diffuse[0].r);
+    CAPTURE(result.diffuse[0].g);
+    CAPTURE(result.diffuse[0].b);
+    CHECK(near(result.diffuse[0].r, expectedDiffuseR, 0.02F));
+    // EXACT zero, not merely small -- matrix-p5t15's own acceptance text.
+    CHECK(result.diffuse[0].g == 0.0F);
+    CHECK(result.specular[0].g == 0.0F);
+
+    // --- Revert-discrimination proof [empirical, this task's own standing
+    // rule] -- sabotage cluster_lighting.slang's own NdotL early-out
+    // (invert the comparison, which makes EVERY light -- Light A included
+    // -- get skipped), re-run (no C++ rebuild needed -- Slang compiles at
+    // test-binary runtime), confirm the diffuse.r contribution collapses
+    // to EXACTLY 0, then restore and re-confirm green. Proves the
+    // membership/accumulation mechanism this TEST_CASE's own positive
+    // assertion relies on is load-bearing, not vacuously true. ---------
+    const std::filesystem::path clusterLightingPath =
+        std::filesystem::path(RX_MATERIAL_SHADER_DIR) / "cluster_lighting.slang";
+    std::ifstream inFile(clusterLightingPath, std::ios::binary);
+    REQUIRE(inFile.is_open());
+    std::ostringstream originalStream;
+    originalStream << inFile.rdbuf();
+    inFile.close();
+    const std::string original = originalStream.str();
+
+    const std::string needle = "if (NdotL <= 0.0) {";
+    const std::string sabotaged_needle = "if (NdotL > 0.0) {";
+    const size_t pos = original.find(needle);
+    REQUIRE(pos != std::string::npos);
+    std::string sabotaged = original;
+    sabotaged.replace(pos, needle.size(), sabotaged_needle);
+    {
+        std::ofstream outFile(clusterLightingPath, std::ios::binary | std::ios::trunc);
+        REQUIRE(outFile.is_open());
+        outFile << sabotaged;
+    }
+    // [Fix round] `probe` (the compiled VkPipeline) was already built
+    // (buildProbePipeline(), above) from the PRE-sabotage source -- Slang
+    // compiles once, at pipeline-BUILD time, not per-dispatch, so simply
+    // re-running the SAME already-linked VkPipeline against the new file
+    // contents is a no-op (reproduced directly while writing this test:
+    // the "sabotaged" run below returned the UNCHANGED, correct value
+    // until this rebuild was added). Rebuilding here is what actually
+    // picks up the on-disk edit, exactly mirroring every other sabotage-
+    // discrimination proof in this codebase's own established convention
+    // ("no C++ rebuild needed" refers to this TEST BINARY not needing a
+    // recompile -- the SHADER pipeline itself still must be rebuilt from
+    // the edited source, same as reloadChanged()'s own hot-reload path
+    // would do in production).
+    probe = buildProbePipeline(fixture.device.device(), fixture.bindless);
+
+    ProbeResult sabotagedResult =
+        runProbe(fixture, pipelines, *probe, lights, camera, kViewport, kViewport, params, probeWorldPos);
+    CAPTURE(sabotagedResult.diffuse[0].r);
+    CHECK(sabotagedResult.diffuse[0].r == 0.0F);
+
+    {
+        std::ofstream outFile(clusterLightingPath, std::ios::binary | std::ios::trunc);
+        REQUIRE(outFile.is_open());
+        outFile << original;
+    }
+    std::ifstream verifyFile(clusterLightingPath, std::ios::binary);
+    std::ostringstream verifyStream;
+    verifyStream << verifyFile.rdbuf();
+    REQUIRE(verifyStream.str() == original);
+    probe = buildProbePipeline(fixture.device.device(), fixture.bindless);
+
+    ProbeResult restoredResult =
+        runProbe(fixture, pipelines, *probe, lights, camera, kViewport, kViewport, params, probeWorldPos);
+    CHECK(near(restoredResult.diffuse[0].r, expectedDiffuseR, 0.02F));
+    CHECK(restoredResult.diffuse[0].g == 0.0F);
+}
