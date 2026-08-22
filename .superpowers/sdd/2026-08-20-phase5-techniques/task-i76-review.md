@@ -380,3 +380,79 @@ hang-injection scenario re-run end-to-end, now terminating itself via a
 diagnosed `SIGABRT` at ~50s instead of hanging indefinitely. Both disclosed
 limitations are honest, low-risk scope decisions, independently checked
 rather than rubber-stamped. No findings remain open from either round.
+
+## Re-review (Wine regression fix)
+
+Scoped re-review of `5691d45` (base `6dbdd2e`, new worktree
+`/media/ywadi/second/renderer_x-worktrees/i76-wine-fix`) — closes a
+`windows-cross-zig` CI regression (run `32573745354`) on `main`, which was
+already red on `30c4b56`+`62d7d89` (both merged as `6dbdd2e`, confirmed on
+`origin/main`).
+
+### Verdict: CLOSED.
+
+**1. Root-cause claim — independently re-measured, not trusted.** Pulled
+CI run `32573745354`'s failed log directly via `gh run view --log-failed`:
+confirms `REQUIRE( 10000µs < 2000µs )`, both calibration samples `0 us
+CPU`, `62 | 61 passed | 1 failed`, byte-for-byte matching the report's
+citation. Wrote and cross-compiled my own standalone `clock_getres()` +
+busy-loop probe (not reused from the fix), ran it under the CI-identical
+Wine session (private `Xvfb :77`, `toolchain_check.exe` warm-up first,
+`WINEARCH=win64`):
+
+| Platform | My `clock_getres(CLOCK_THREAD_CPUTIME_ID)` | Report's claim | Busy-loop (~5ms) deltas observed |
+|---|---:|---:|---|
+| Linux (native) | 1ns | 1ns | 4995/5001/5001/4997/5001 µs — fine-grained |
+| Windows/Wine (this toolchain) | 15,625,000ns | 15,625,000ns | 0/0/10000/0/10000 µs — quantized to whole ticks |
+
+Exact match on both platforms; the qualitative claim (fine vs. quantized) is
+directly demonstrated, not inferred.
+
+**2. Fix design — runtime-measured, scoped, no coverage loss.** Read the
+diff: `cpuTimeResolutionUsable` is computed via a real `clock_getres()`
+call at test runtime, not an `#ifdef _WIN32`/platform guess. The 1ms
+cutover sits with wide margin on both sides of the two actually-measured
+values (7 orders of magnitude above Linux's 1ns, >10x below Wine's
+15.625ms). Confirmed the primary check (`CHECK(maxTextureRegistrationsInOneTick
+<= 1)`) is **not present in the diff's changed lines at all** — only
+referenced in new comments — it remains unconditional on every platform.
+Diff is test-file-only (`src/rx_asset/tests/async_import_test.cpp`, 74
+insertions/1 deletion, confirmed via `git show --stat`); no engine code
+touched.
+
+**3. CI-identical Wine re-run.**
+
+| Check | Result |
+|---|---|
+| WALL-CLOCK GATE alone under Wine (fix applied) | 1/1 passed, 27/27 assertions; loud skip `MESSAGE` present, citing `maxPumpCpuDuration this run was 10000 us against a ceiling of 2000 us` — the exact value that would have failed pre-fix |
+| CI-identical filtered set (`ctest -E '<regex>'`, 15 tests) | **15/15 green**, 87.12s (report: 93.0s) — `rx_asset_gltf_gpu_tests` itself: 50.76s |
+| Sabotage under Wine (early `return true` removed, `import_gltf.cpp`) | **`CHECK( 5 <= 1 )` fired** — primary check still catches it, secondary net still shows its own skip `MESSAGE` in the same run (not silently dropped, not silently re-enabled) |
+
+Sabotage reverted byte-identically (md5 `ed9cdd77dc5679093946d193294ce387`
+before/after, `git diff --stat` empty).
+
+**4. Linux confirmation.** `rx_asset_gltf_gpu_tests`, lavapipe, `--validate`:
+**62/62 test cases, 1351/1351 assertions, 0 failed**; zero unfiltered
+`validation error` lines (86 total hits, all tagged `known false
+positive`). NVIDIA already proven this round by the implementer per the
+report — not re-run, matching the brief's own "skip unless something looks
+off" allowance; nothing here looked off.
+
+**5. Hygiene.** Single commit; author/committer `Yousef Wadi
+<ywadi85@gmail.com>` (both); no AI attribution (grep over the full commit
+message: no match); not pushed (`5691d45` absent from `git branch -r` and
+from `origin/main`, confirmed via `git merge-base --is-ancestor`); file
+list is exactly the one file the report claims, consistent with pathspec
+staging rather than a broad `git add`. Both checkouts clean at the end:
+worktree shows only expected untracked build/dep-cache dirs (no tracked
+diff); main checkout shows only the pre-existing `progress.md`
+modification.
+
+### Overall verdict: ALL ADDRESSED — clears main's Windows red.
+
+Root cause re-measured independently and matches exactly; the fix is a
+genuine runtime measurement, not a platform guess, correctly scoped to the
+secondary check only; the primary, timing-independent defect-class proof
+is verified still unconditional and still catches the sabotage under Wine
+with the secondary net skipped; CI-identical Wine set is 15/15; Linux
+unaffected. No findings.

@@ -508,3 +508,181 @@ parameter is defaulted (`kDefaultShutdownJoinDeadline`, 30s) at every one
 of this project's ~119 existing call sites — none required changes.
 
 Commit: `62d7d89` on `task/i76-asset-flake` (base `30c4b56`), not pushed.
+
+## Wine regression fix
+
+`30c4b56`+`62d7d89` merged to `main` (`6dbdd2e`). The `linux-native` CI job
+went green, but `windows-cross-zig` failed: CI run `32573745354`, test
+`8/15` — `rx_asset_gltf_gpu_tests ..........***Failed   36.76 sec`. This
+had been green on the immediately prior push (T14, run `32564785861`).
+Closed in a fresh worktree (`i76-wine-fix`, branch `task/i76-wine-fix`,
+base `6dbdd2e`) per the coordinator's own charter, main left untouched
+beyond this report.
+
+### Reproduction
+
+`rx_asset_gltf_gpu_tests` genuinely runs under Wine — it is **not** in
+the Wine CI job's own GPU-exclusion regex
+(`rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|rx_cluster_gpu|rx_conformance|sample`),
+because Wine's `winevulkan` passthrough hands it a real, working
+`VkDevice` (backed by the CI runner's own `lavapipe` on the host side).
+Reproduced locally with the CI-identical command (`windows-cross-zig`
+preset built fresh in the new worktree; a private `Xvfb`-backed Wine
+session warmed up with `toolchain_check.exe` first, matching CI's own
+warm-up step):
+
+```
+ctest --preset windows-cross-zig -E '<the CI regex above>' -R rx_asset_gltf_gpu --output-on-failure
+```
+
+**Reproduced on the first try, byte-for-byte identical to the CI log**:
+
+```
+FATAL ERROR: REQUIRE( maxPumpCpuDuration < kCiStallDetector ) is NOT correct!
+  values: REQUIRE( 10000µs <  2000µs )
+[doctest] test cases:   62 |   61 passed | 1 failed | 0 skipped
+```
+
+The exact same single `TEST_CASE` (WALL-CLOCK GATE), the exact same
+values (`10000µs`/`2000µs`), on both the CI run and this local
+reproduction — confirmed via `gh run view 32573745354 --log-failed`
+directly against the archived CI log, not inferred.
+
+**The "InvalidFileData" flood was a red herring, not the regression.**
+`grep -c InvalidFileData` on the CI log returns 2004 hits, but every one
+of them precedes the WALL-CLOCK GATE's own `TEST CASE:` header and
+belongs to a *different*, pre-existing, unrelated `TEST_CASE`:
+`importGltfAsync: [race regression] repeated garbage-bytes imports...`,
+which deliberately imports 2000 iterations of garbage bytes and asserts
+zero races (`race regression: 0 / 2000 iterations observed
+stage-terminal before the completion callback fired` — passed cleanly).
+Each intentional garbage-byte import logs one `RX_LOG_ERROR` line for its
+own expected parse failure, accounting for the 2004 hits exactly. This
+test predates issue #76 entirely (Issue #30 round 2) and was unaffected
+by `30c4b56`/`62d7d89`; it produces the identical log flood on every
+green Wine run too. The doctest summary itself is unambiguous: **62 |
+61 passed | 1 failed** — exactly one failing assertion, the WALL-CLOCK
+GATE's own `REQUIRE`.
+
+### Root cause
+
+`30c4b56` switched the WALL-CLOCK GATE's stall-detector basis from
+wall-clock time to `clock_gettime(CLOCK_THREAD_CPUTIME_ID, ...)`,
+reasoning (correctly, on Linux) that it measures only time a thread
+spends actually executing, immune to OS-scheduling noise. That reasoning
+implicitly assumed the clock has FINE resolution on every platform this
+binary runs on. Measured directly, on this exact toolchain
+(`clock_getres()`, both a standalone probe and in-binary):
+
+| Platform | `clock_getres(CLOCK_THREAD_CPUTIME_ID)` |
+|---|---|
+| Linux (native) | **1ns** |
+| Windows (cross-compiled via zig/mingw-w64, run under Wine) | **15,625,000ns (15.625ms)** |
+
+15.625ms is the classic Windows system clock tick (1/64 second).
+mingw-w64's `clock_gettime()` shim for this clock ID is backed by
+`GetThreadTimes()`, which the Windows kernel (and Wine's own faithful
+emulation of it) updates only once per tick — confirmed directly with a
+busy-loop probe cross-compiled and run under Wine: five ~5ms-cost
+"small" operations measured deltas of exactly `10000000`/`20000000` ns
+(10ms/20ms, whole-tick multiples), never anything finer. **Not fixable
+from user space**: `timeBeginPeriod(1)` (the standard Windows API for
+requesting finer scheduler-tick granularity) was tried against this exact
+toolchain under Wine and changed neither `clock_getres()`'s reported
+value nor the measured per-call granularity at all — per-thread CPU-time
+accounting on Windows is a mechanism entirely separate from the periodic
+timer interrupt that API controls.
+
+Every real operation this gate measures costs single-digit milliseconds
+(see the report's own earlier MULTIPLIER DERIVATION sections) — an order
+of magnitude *below* a 15.625ms tick. On this platform, every sample this
+gate takes therefore reads as either exactly `0` (no tick boundary
+crossed during the call) or a spurious whole multiple of one tick (a
+boundary happened to be crossed) — precisely the `0 us CPU` calibration
+readings and the `10000µs` spike both the CI log and the local
+reproduction show, byte-for-byte. This is not corruption, not a byte-source
+bug, and not a liveness issue — it is the coarse clock producing exactly
+the numbers its own resolution predicts, compared as if they meant
+something finer.
+
+### Fix
+
+Measure `clock_getres(CLOCK_THREAD_CPUTIME_ID, ...)` once, at runtime
+(not an `#ifdef _WIN32`/platform-macro guess — the actual, measured
+condition), and skip the secondary CPU-time `REQUIRE` — **loudly**, via a
+`MESSAGE` citing the measured resolution and stating explicitly that this
+is a deliberate, justified accommodation — only when the resolution
+exceeds a 1ms cutover. That cutover sits seven orders of magnitude above
+Linux's own measured value (1ns) and more than one order of magnitude
+below Windows/Wine's own measured value (15,625,000ns): picked with
+deliberate margin on both sides of the two values that were actually
+measured, not tuned to a borderline case, so it cannot misfire on either
+platform this binary runs on today.
+
+**No coverage is lost on any platform.** The PRIMARY defect-class proof
+this round's own earlier fix already established —
+`CHECK(maxTextureRegistrationsInOneTick <= 1)`, fully timing-independent
+— is completely untouched by this change and runs, asserted, identically
+on every platform. The CPU-time `REQUIRE` was already explicitly
+documented (this report's own "Fix round 2" section) as a *secondary*
+safety net, not the sabotage-discrimination proof — this fix only
+disables that secondary net on the one platform where it is
+mathematically incapable of measuring anything meaningful, and only after
+measuring that fact directly rather than assuming it.
+
+### Test evidence
+
+**Wine reproduction, before/after** (CI-identical command, private Xvfb,
+Wine session warmed up first):
+
+| | Before | After |
+|---|---|---|
+| `rx_asset_gltf_gpu_tests` under Wine | `REQUIRE(10000µs < 2000µs)` FAILED — 61/62 test cases | **62/62 test cases, 0 failed** |
+| Full Wine-filtered `ctest` set (15 tests, CI's own regex) | 1/15 failed | **15/15 (100%) green** (93.0s) |
+
+Repeated 5x standalone under Wine after the fix: **5/5 clean**. The loud
+skip diagnostic is present and reads exactly as designed:
+
+```
+MESSAGE: wall-clock gate: CLOCK_THREAD_CPUTIME_ID resolution on this platform is too coarse to use as a
+CI-blocking secondary safety net (measured via clock_getres(), see cpuTimeResolutionUsable's own comment
+above for the full derivation) -- SKIPPING the REQUIRE(maxPumpCpuDuration < kCiStallDetector) check on
+THIS run only; the PRIMARY defect-class proof (maxTextureRegistrationsInOneTick <= 1, above) is unaffected
+and still asserted.
+```
+
+**Discrimination re-proof under Wine**: re-applied the exact same
+sabotage this round's own earlier discrimination proof used
+(`marshalGltfImportPrepareStep()`'s early `return true` commented out,
+`import_gltf.cpp`) and rebuilt for `windows-cross-zig`. The primary count
+check still fires under Wine even with the secondary CPU-time check
+skipped: `CHECK( maxTextureRegistrationsInOneTick <= 1 )` → `CHECK( 5 <=
+1 )` failed, test case FAILED — confirming the platform-independent proof
+this round's earlier fix established genuinely holds on every platform,
+not just the two Linux drivers. Sabotage reverted byte-identically
+(`git diff` empty, confirmed) before committing.
+
+**Linux, both drivers, unaffected** (this fix does not change behavior at
+all on Linux — `cpuTimeResolutionUsable` measures `true` there, so the
+identical `REQUIRE` fires exactly as before):
+
+| Condition | Driver | N | Fails |
+|---|---|---:|---:|
+| Standalone (post-fix, false-positive check) | NVIDIA | 40 | 0 |
+| Standalone (post-fix, false-positive check) | lavapipe | 40 | 0 |
+| Sabotage discrimination | NVIDIA | 5 | 5/5 caught |
+| Sabotage discrimination | lavapipe | 5 | 5/5 caught |
+
+**Full suite, both Linux drivers, serial (`ctest -j1`), final state**:
+**44/44 green** on lavapipe (142.8s) and **44/44 green** on NVIDIA
+(228.0s).
+
+### Scope
+
+Touches only `src/rx_asset/tests/async_import_test.cpp` (74 insertions, 1
+deletion) — no engine code changed; this was a test-side measurement-
+soundness gap, not a production defect. `Scheduler`, `import_gltf.cpp`,
+and every other file this round previously touched are unchanged by this
+commit.
+
+Commit: `5691d45` on `task/i76-wine-fix` (base `6dbdd2e`), not pushed.
