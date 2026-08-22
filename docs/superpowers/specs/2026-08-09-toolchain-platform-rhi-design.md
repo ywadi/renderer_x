@@ -547,3 +547,35 @@ it is out of scope for *this* spec only, not out of scope for the project:
   Phase 9 = SDK/DLL (ship line; tooling/profiling threads through
   phases 5-9 rather than standing alone). Plan documents remain the
   per-phase source of truth; this entry fixes only the sequence.
+
+- **Temporal upscaling + frame generation (owner-ratified, 2026-08-22):**
+  a single "temporal upscaler" work package — FSR2 (FidelityFX SDK,
+  open source, Vulkan backend; the portable default — Steam Deck is
+  AMD) and DLSS Super Resolution (Streamline/NGX; NVIDIA-only, runtime
+  capability-gated per the optional-capability-with-fallback rule,
+  redistribution licensing to be settled at integration) behind one
+  backend interface. Sequenced AFTER TAA lands (TAA is the ruled AA
+  direction per the no-MSAA decision): the prerequisites are identical
+  and shared — per-object motion vectors (previous-frame transforms in
+  draw data, velocity target in the render graph), sub-pixel projection
+  jitter, and the already-delivered HDR scene color + real EV100
+  exposure value. FSR3 frame generation is a SEPARATE, later line item
+  (optical flow, frame interpolation, present pacing on the centralized
+  PresentLoop); DLSS Frame Generation additionally exceeds the local
+  test hardware (RTX 2080 tests SR only — FG needs Ada). Verification
+  note: upscaler rounds need real-driver runs; CI has no vendor GPUs.
+
+- **Hardware ray tracing (owner-ratified sequencing, 2026-08-22):**
+  phase-sized optional capability with fallback parity, never baseline
+  (reaffirms the existing RT registry posture). Earliest sensible start
+  is AFTER Phase 6's pooled global geometry buffers (BLAS builds want
+  pooled geometry; streaming later affects AS residency). Scope ladder:
+  (1) entry = ray-query soft shadows inside the existing forward pass +
+  a denoiser (NRD or FidelityFX Denoiser — the denoiser is a real
+  integration, not a detail; RT effects at real-time sample counts are
+  noise without one); (2) RT reflections; (3) RT GI — each rung its own
+  round with the fallback path engineered to the same perf bar (Deck
+  RDNA2 has ray query but slow — fallback parity is the gate). Slang
+  compiles RT stages; rx_graph needs AS resource types + build-pass
+  barriers; VMA covers scratch/AS memory. Local test hardware: RTX 2080
+  (Turing) has HW RT — real-driver rounds are testable on the desk.
