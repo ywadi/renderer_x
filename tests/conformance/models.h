@@ -72,11 +72,12 @@ struct ConformanceModel {
     // material's own roughnessFactor to a fixed 0.02 -- see main.cpp's own
     // kPerturbedRoughnessValue) fails it with a real margin. Measured
     // lavapipe divergence against the committed references, all six
-    // mandatory models: MetalRoughSpheres 0.43%, MetalRoughSpheresNo
-    // Textures 0.58%, EmissiveStrengthTest 0.03%, CompareEmissiveStrength
-    // 0.30%, TextureTransformTest 1.62% (the worst real-content case --
-    // thin UV-transform edge antialiasing, expected), AlphaBlendModeTest
-    // 0.47% -- every measured value is under 1.7%. The discrimination
+    // mandatory models: MetalRoughSpheres 0.6748%,
+    // MetalRoughSpheresNoTextures 1.1482%, EmissiveStrengthTest 0.2201%,
+    // CompareEmissiveStrength 0.8198%, TextureTransformTest 1.6758% (the
+    // worst real-content case -- thin UV-transform edge antialiasing,
+    // expected), AlphaBlendModeTest 0.9972% -- every measured value is
+    // under 1.7%. The discrimination
     // proof measures 3.87% -- 2.5% sits with real margin on both sides
     // (>45% headroom over the worst real case, >35% below the
     // discrimination value) without being so wide it stops

@@ -542,6 +542,22 @@ std::array<float, 4> uvTransformParam(const rx::asset::TextureRef& ref) {
 struct App {
     std::optional<rx::platform::Window> window;
     std::optional<rx::rhi::Context> context;
+    // Set once in makeApp() (below) and handed to rx::rhi::Device::create()
+    // immediately afterward -- NOT independently destroyed by destroyApp():
+    // Device::create() takes ownership of the surface it is given
+    // unconditionally (device.h's own doc comment on that function) and its
+    // destructor (Device::destroyAll(), device.cpp) already calls
+    // vkDestroySurfaceKHR on it as part of `app.device.reset()` below. This
+    // field stays populated with the same (Device-owned) handle value after
+    // that point purely so makeApp()'s own error paths can still read it;
+    // an explicit second vkDestroySurfaceKHR call in destroyApp() would be a
+    // real double-destroy of this handle, not a fix for a leak -- confirmed
+    // empirically (fix-round Finding 3 probe, task-11-report.md): it trips
+    // VUID-vkDestroySurfaceKHR-surface-01266 immediately (a live swapchain
+    // still references the surface at that point) followed by
+    // VUID-vkDestroySurfaceKHR-surface-parameter when Device's own destructor
+    // runs against the same, already-destroyed handle. Same pattern as
+    // samples/08_gltf_viewer's own identical `App::surface` field.
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     std::optional<rx::rhi::Device> device;
     std::optional<rx::rhi::Allocator> allocator;
@@ -953,6 +969,9 @@ void destroyApp(App& app) {
     app.bindless.reset();
     app.uploader.reset();
     app.allocator.reset();
+    // This also destroys `app.surface` (Device::destroyAll(), device.cpp) --
+    // see the App::surface field's own comment above for why no separate
+    // vkDestroySurfaceKHR call belongs in this function.
     app.device.reset();
 }
 

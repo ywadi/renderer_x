@@ -676,6 +676,13 @@ jobs:
       # [Phase 5 Stage 1 Task 9, ticket #45 -- the compute IBL bake chain:
       # every TEST_CASE builds a real windowed VkDevice and dispatches real
       # compute passes through rx_graph's Executor, same GPU-backed reason],
+      # rx_conformance [Phase 5 Stage 1 Task 11, ticket #47 -- every
+      # rx_conformance_* ctest entry (tests/conformance/CMakeLists.txt)
+      # builds a real windowed VkDevice, bakes a full IBL environment, and
+      # renders a named glTF conformance model through the real
+      # forward+tonemap pass before an offscreen readback and pixel
+      # comparison -- arguably a heavier GPU workload than several of the
+      # binaries already excluded above, same GPU-backed reason],
       # and every sample_*_headless gate are excluded: Wine in CI has no real Vulkan
       # device to hand them, and that is a real, documented environment
       # limitation -- not a silent pass. rx_core, rx_platform,
@@ -706,7 +713,7 @@ jobs:
       # (:77), not this one.
       - name: Test under wine (xvfb; GPU tests excluded -- no Vulkan under Wine)
         run: >-
-          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|sample' --output-on-failure
+          ctest --preset windows-cross-zig -E 'rx_rhi_vk|rx_graph_gpu|rx_material_gpu|rx_material_brdf_gpu|rx_debug_ui_gpu|rx_frame_loop_gpu|rx_ibl_gpu|rx_conformance|sample' --output-on-failure
           --output-junit ${{ github.workspace }}/ctest-results-windows-cross-zig.xml
 
       - name: Build budget check
