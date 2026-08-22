@@ -773,4 +773,174 @@ TEST_CASE("Scheduler::pumpMain's RX_ASSERT_MAIN_THREAD guard fires, naming pumpM
   CHECK(capture.contexts[0] == "Scheduler::pumpMain");
 }
 
+#ifdef RX_TASK_SHUTDOWN_HANG_PROBE_PATH
+// ---------------------------------------------------------------------
+// [Issue #76 teardown-hang fix] Subprocess-based proof of the bounded-
+// shutdown path -- see shutdown_hang_probe.cpp's own header comment for
+// why this MUST run out-of-process: the path under test ends in a real
+// std::abort() (SIGABRT), which would take this ENTIRE doctest binary
+// (every other TEST_CASE in it) down with it if exercised in-process.
+// RX_TASK_SHUTDOWN_HANG_PROBE_PATH is only ever defined on non-Windows
+// builds (CMakeLists.txt's own `if(NOT CMAKE_SYSTEM_NAME STREQUAL
+// "Windows")` guard, mirroring rx_shader/CMakeLists.txt's identical
+// precedent) -- fork()/execv()/waitpid() below have no portable Windows
+// equivalent, and this is the only place in this file that needs any.
+// ---------------------------------------------------------------------
+
+#include <csignal>
+#include <cstdio>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace {
+
+struct ProbeResult {
+  bool setupFailed = false;  // pipe()/fork() itself failed -- an environment problem, not the fix under test
+  bool reapedWithinTimeout = false;
+  bool exitedNormally = false;  // WIFEXITED -- valid only if reapedWithinTimeout
+  int exitCode = -1;            // WEXITSTATUS -- valid only if exitedNormally
+  bool signaled = false;        // WIFSIGNALED -- valid only if reapedWithinTimeout
+  int signalNumber = -1;        // WTERMSIG -- valid only if signaled
+  std::string output;           // child's combined stdout+stderr
+};
+
+// Runs RX_TASK_SHUTDOWN_HANG_PROBE_PATH <deadlineMs> as a child process,
+// captures its combined stdout+stderr, and waits for it to exit -- bounded
+// by `outerTimeout`, a TEST-SIDE safety net only (generous relative to
+// `deadlineMs`, NOT part of the production contract under test, which is
+// `deadlineMs` itself) so a genuine regression in the fix fails this
+// TEST_CASE normally instead of hanging ctest. Never calls doctest's own
+// REQUIRE/CHECK internally -- matches this file's own waitUntil() helper
+// convention above: report, let the caller assert.
+ProbeResult runShutdownHangProbe(int deadlineMs, std::chrono::milliseconds outerTimeout) {
+  ProbeResult result;
+
+  int pipeFds[2];
+  if (pipe(pipeFds) != 0) {
+    result.setupFailed = true;
+    return result;
+  }
+
+  // Precomputed BEFORE fork(): only async-signal-safe operations are
+  // guaranteed safe in the child between fork() and execv() when the
+  // parent process might be multi-threaded at the moment of the fork()
+  // call (it may well be here -- other TEST_CASEs in this same binary
+  // create/destroy real Schedulers) -- std::snprintf into a fixed
+  // stack buffer, done here, avoids any dynamic allocation on the
+  // child's side of that window entirely.
+  char deadlineArg[32];
+  std::snprintf(deadlineArg, sizeof(deadlineArg), "%d", deadlineMs);
+
+  const pid_t child = fork();
+  if (child < 0) {
+    close(pipeFds[0]);
+    close(pipeFds[1]);
+    result.setupFailed = true;
+    return result;
+  }
+
+  if (child == 0) {
+    // Child: redirect both stdout and stderr to the write end of the pipe
+    // (the probe's own diagnostic goes to stderr; capturing both loses
+    // nothing and is simplest). No allocation, no C++ runtime machinery
+    // beyond what execv() itself needs -- see the comment on deadlineArg
+    // above for why.
+    dup2(pipeFds[1], STDOUT_FILENO);
+    dup2(pipeFds[1], STDERR_FILENO);
+    close(pipeFds[0]);
+    close(pipeFds[1]);
+    char* argv[] = {const_cast<char*>(RX_TASK_SHUTDOWN_HANG_PROBE_PATH), deadlineArg, nullptr};
+    execv(RX_TASK_SHUTDOWN_HANG_PROBE_PATH, argv);
+    // execv() only returns on failure -- _exit(), never exit(), to skip
+    // this (forked, not exec'd) process's own copy of any atexit/static-
+    // destructor machinery it inherited from the parent.
+    _exit(127);
+  }
+
+  // Parent.
+  close(pipeFds[1]);
+
+  // Drain the pipe into result.output while the child runs -- read() on a
+  // pipe blocks only until SOME data or EOF arrives, so this never spins;
+  // the child closing its own fd copy (at exit, whether via abort() or a
+  // normal return) is what makes read() return 0 (EOF) and this loop
+  // unblock on its own.
+  char buffer[4096];
+  ssize_t n = 0;
+  while ((n = read(pipeFds[0], buffer, sizeof(buffer))) > 0) {
+    result.output.append(buffer, static_cast<size_t>(n));
+  }
+  close(pipeFds[0]);
+
+  const auto deadline = std::chrono::steady_clock::now() + outerTimeout;
+  int status = 0;
+  while (true) {
+    const pid_t reaped = waitpid(child, &status, WNOHANG);
+    if (reaped == child) {
+      result.reapedWithinTimeout = true;
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(child, SIGKILL);
+      waitpid(child, &status, 0);  // reap the now-killed child regardless
+      result.reapedWithinTimeout = false;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  if (result.reapedWithinTimeout) {
+    if (WIFEXITED(status)) {
+      result.exitedNormally = true;
+      result.exitCode = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+      result.signaled = true;
+      result.signalNumber = WTERMSIG(status);
+    }
+  }
+
+  return result;
+}
+
+}  // namespace
+
+TEST_CASE("Scheduler::~Scheduler() aborts LOUDLY, naming the stuck worker-task-lane thread, when a "
+          "runOnWorkerThread() closure hangs permanently past its shutdownJoinDeadline "
+          "[issue #76 teardown-hang fix, subprocess-based]") {
+  // A short deadline (well under the outer safety-net bound below and
+  // this binary's own 120s ctest TIMEOUT) keeps this test fast while
+  // exercising the EXACT SAME code path Scheduler::kDefaultShutdownJoinDeadline
+  // (30s) protects in production -- only the configured deadline VALUE
+  // differs, never the mechanism under test.
+  constexpr int kProbeDeadlineMs = 3000;
+  const ProbeResult result =
+      runShutdownHangProbe(kProbeDeadlineMs, std::chrono::milliseconds(kProbeDeadlineMs + 15000));
+
+  INFO("probe output:\n", result.output);
+  REQUIRE_FALSE(result.setupFailed);
+  REQUIRE(result.reapedWithinTimeout);
+  // SIGABRT, not a normal exit -- proves the process failed LOUDLY via
+  // std::abort() rather than either returning normally (the
+  // bounded-shutdown fix not firing at all) or being killed by this
+  // test's own outer safety net (that path also sets
+  // reapedWithinTimeout == true, but via SIGKILL, not SIGABRT, and
+  // result.output would be missing the diagnostic the CHECKs below look
+  // for -- so this REQUIRE alone already discriminates all three
+  // outcomes).
+  REQUIRE(result.signaled);
+  CHECK(result.signalNumber == SIGABRT);
+  CHECK_FALSE(result.exitedNormally);
+
+  // The diagnostic itself: names the stuck thread (the dedicated
+  // worker-task-lane thread -- exactly where a runOnWorkerThread()
+  // closure runs) and cites the deadline, not a generic/unlabeled crash.
+  CHECK(result.output.find("shutdown-join deadline") != std::string::npos);
+  CHECK(result.output.find("worker-task lane thread") != std::string::npos);
+  // The IO thread was never given any work in this reproduction -- must
+  // not be misreported as the stuck one.
+  CHECK(result.output.find("STUCK: IO thread") == std::string::npos);
+}
+
+#endif  // RX_TASK_SHUTDOWN_HANG_PROBE_PATH
+
 #endif  // RX_DEBUG_CHECKS

@@ -12,10 +12,13 @@
 #include <rx_core/profile.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -147,7 +150,8 @@ class ClosureQueue {
 // left anywhere in this file.
 class ClosureQueueLoopTask final : public enki::IPinnedTask {
  public:
-  ClosureQueueLoopTask(uint32_t threadNum, ClosureQueue& queue) : enki::IPinnedTask(threadNum), queue_(queue) {}
+  ClosureQueueLoopTask(uint32_t threadNum, ClosureQueue& queue, const char* name)
+      : enki::IPinnedTask(threadNum), queue_(queue), name_(name) {}
 
   void Execute() override {
     while (true) {
@@ -169,13 +173,30 @@ class ClosureQueueLoopTask final : public enki::IPinnedTask {
         return;
       }
       for (auto& fn : batch) {
+        // [Issue #76 teardown-hang fix] Set/cleared around the ONE call
+        // that can run arbitrary caller code (and therefore hang) --
+        // sampled by ~Scheduler()'s own bounded-shutdown watchdog, after
+        // its deadline has already elapsed, to name which dedicated
+        // thread (if either) was stuck at that moment. A plain
+        // release/acquire atomic: this is a best-effort DIAGNOSTIC read
+        // taken once, well after the fact, not a correctness-load-bearing
+        // synchronization point.
+        executingClosure_.store(true, std::memory_order_release);
         fn();
+        executingClosure_.store(false, std::memory_order_release);
       }
     }
   }
 
+  [[nodiscard]] bool isExecutingClosureForDiagnostics() const {
+    return executingClosure_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] const char* name() const { return name_; }
+
  private:
   ClosureQueue& queue_;
+  const char* name_;
+  std::atomic<bool> executingClosure_{false};
 };
 
 uint32_t resolveWorkerCount(uint32_t requested) {
@@ -223,9 +244,15 @@ struct Scheduler::Impl {
   // Minor finding; unchanged in spirit by this fix round's own redesign.
   std::atomic<bool> acceptingIoTasks{true};
   std::atomic<size_t> droppedAtIntakeCount{0};
+
+  // [Issue #76 teardown-hang fix] See scheduler.h's own create()/~Scheduler()
+  // doc comments for the full contract this bounds.
+  std::chrono::milliseconds shutdownJoinDeadline{Scheduler::kDefaultShutdownJoinDeadline};
 };
 
-Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
+Scheduler::Scheduler(uint32_t workerCount, std::chrono::milliseconds shutdownJoinDeadline)
+    : impl_(std::make_unique<Impl>()) {
+  impl_->shutdownJoinDeadline = shutdownJoinDeadline;
   impl_->resolvedWorkerCount = resolveWorkerCount(workerCount);
 
   enki::TaskSchedulerConfig config;
@@ -263,8 +290,9 @@ Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
   impl_->ioThreadNum = impl_->taskScheduler.GetNumTaskThreads() - 1;
   impl_->workerLaneThreadNum = impl_->taskScheduler.GetNumTaskThreads() - 2;
 
-  impl_->ioLoopTask = std::make_unique<ClosureQueueLoopTask>(impl_->ioThreadNum, impl_->ioQueue);
-  impl_->workerLoopTask = std::make_unique<ClosureQueueLoopTask>(impl_->workerLaneThreadNum, impl_->workerQueue);
+  impl_->ioLoopTask = std::make_unique<ClosureQueueLoopTask>(impl_->ioThreadNum, impl_->ioQueue, "IO thread");
+  impl_->workerLoopTask =
+      std::make_unique<ClosureQueueLoopTask>(impl_->workerLaneThreadNum, impl_->workerQueue, "worker-task lane thread");
   // The ONLY two AddPinnedTask() calls anywhere in this file now -- both
   // at construction, both for a task that lives (and is registered) for
   // this Scheduler's ENTIRE lifetime. No per-submission registration
@@ -277,8 +305,90 @@ Scheduler::Scheduler(uint32_t workerCount) : impl_(std::make_unique<Impl>()) {
       impl_->resolvedWorkerCount, impl_->ioThreadNum, impl_->workerLaneThreadNum);
 }
 
-std::unique_ptr<Scheduler> Scheduler::create(uint32_t workerCount) {
-  return std::unique_ptr<Scheduler>(new Scheduler(workerCount));
+std::unique_ptr<Scheduler> Scheduler::create(uint32_t workerCount, std::chrono::milliseconds shutdownJoinDeadline) {
+  return std::unique_ptr<Scheduler>(new Scheduler(workerCount, shutdownJoinDeadline));
+}
+
+// [Issue #76 teardown-hang fix] Called by ~Scheduler()'s own bounded-
+// shutdown watchdog thread ONLY if WaitforAllAndShutdown() (running
+// concurrently, on the ORIGINAL destructor-calling thread) has not
+// returned within `impl.shutdownJoinDeadline` -- i.e. at least one of
+// this Scheduler's own threads is permanently stuck and will never
+// rejoin on its own. Reproduction recipe: a runOnWorkerThread() closure
+// that never returns (e.g. rx_asset's own async import compute phase
+// wedged in an infinite loop) -- see task-i76-report.md's "Fix round 1
+// (teardown-hang closure)" section for the full writeup and this file's
+// own subprocess-based test (scheduler_test.cpp) that exercises exactly
+// this path end-to-end.
+//
+// WHY ABORT RATHER THAN DETACH: giving up and letting ~Scheduler() return
+// anyway -- leaving the stuck OS thread(s) running detached -- is not a
+// safe option. That thread still holds bare references into THIS
+// Scheduler's own Impl (the ClosureQueue it reads from, the
+// enki::TaskScheduler it is pinned into) and into whatever engine/GPU
+// state the caller's own closure was touching when it hung. Once
+// ~Scheduler() returns, the caller is free to tear down everything
+// downstream of it (Device, Allocator, GPU memory) -- a detached thread
+// that later wakes up (or was merely extremely slow, not truly stuck) and
+// resumes touching any of that is a guaranteed use-after-free, silently,
+// at an unpredictable later time, with no diagnostic at all in a release
+// build. A fail-fast abort() HERE, NOW, with a clear diagnostic naming
+// what was stuck, is strictly safer and more debuggable than that --
+// exactly the same "silent corruption is worse than a loud crash"
+// reasoning rx::core::debug::assertMainThreadImpl()'s own default
+// violation hook already applies to a main-thread guard violation
+// (debug_checks.cpp) -- this is the identical posture, applied to a
+// different guard.
+// Takes plain extracted values (not `const Scheduler::Impl&`) deliberately
+// -- `Impl` is a private nested type, and this is a free function, not a
+// member of Scheduler, so it has no access to it; ~Scheduler() itself
+// (below, a genuine member function) is what reads impl_ and passes the
+// already-extracted diagnostic values in.
+[[noreturn]] void reportStuckShutdownAndAbort(std::chrono::milliseconds deadline, bool ioStuck, const char* ioName,
+                                               bool workerStuck, const char* workerName, uint32_t resolvedWorkerCount) {
+  std::string stuck;
+  if (ioStuck) {
+    stuck += ioName;
+  }
+  if (workerStuck) {
+    if (!stuck.empty()) {
+      stuck += " AND ";
+    }
+    stuck += workerName;
+  }
+  if (stuck.empty()) {
+    // Neither of this Scheduler's two individually-nameable dedicated
+    // threads was mid-closure at the moment we sampled -- the stuck
+    // thread is most likely one of the ordinary [1, resolvedWorkerCount]
+    // parallelFor() pool threads, which this Scheduler does not track
+    // per-thread execution state for (parallelFor() itself is a blocking
+    // call on ITS OWN caller already; adding that tracking would cost
+    // every parallelFor() chunk callback an extra atomic store/load pair
+    // for a diagnostic this project has never needed until now -- not
+    // justified by this fix's own scope). Named honestly as "likely one
+    // of N" rather than claiming a precision this design does not have.
+    stuck = "neither the IO thread nor the worker-task lane thread (most likely one of the " +
+            std::to_string(resolvedWorkerCount) +
+            " ordinary parallelFor() worker thread(s) -- not individually nameable here)";
+  }
+
+  RX_LOG_ERROR(
+      "rx::task::Scheduler: teardown did NOT complete within its {}ms shutdown-join deadline -- STUCK: {}. A "
+      "permanently-hung engine thread cannot be safely detached (it still holds live references into this "
+      "Scheduler's own state and whatever engine/GPU resources its own closure was touching) -- aborting now, "
+      "loudly, rather than risking a silent later use-after-free once this process's own teardown continues "
+      "past this point and frees that state out from under it.",
+      deadline.count(), stuck);
+  // spdlog's default logger is not guaranteed to flush before a SIGABRT
+  // tears the process down (no auto-flush policy is configured --
+  // rx_core/src/log.cpp) -- flush explicitly so the diagnostic above is
+  // actually observable (this is the whole point of a "LOUD" diagnostic;
+  // a message that never reaches the log sink before the process dies
+  // would defeat it).
+  if (auto logger = spdlog::default_logger()) {
+    logger->flush();
+  }
+  std::abort();
 }
 
 Scheduler::~Scheduler() {
@@ -310,7 +420,59 @@ Scheduler::~Scheduler() {
   // pinned task already handed to enkiTS (here: exactly the two
   // persistent loop tasks) has actually returned from Execute(), before
   // it joins any thread.
+  //
+  // [Issue #76 teardown-hang fix] This call has NO built-in timeout, and
+  // if one of this Scheduler's own threads is permanently stuck inside a
+  // caller-supplied closure, it blocks forever -- see
+  // reportStuckShutdownAndAbort()'s own comment above for the full
+  // rationale and scheduler.h's own ~Scheduler() doc comment for the
+  // public contract. A dedicated watchdog thread races
+  // `impl_->shutdownJoinDeadline` against this SAME call below, which
+  // stays on THIS (the destructor's own calling) thread, unchanged --
+  // deliberately NOT moved onto the watchdog thread itself: enkiTS keys
+  // its own internal bookkeeping (`gtl_threadNum`, a thread_local) to
+  // whichever OS thread first registered as "thread 0" at
+  // Scheduler::create() time (verified directly against the vendored
+  // enkiTS source), so calling ANY enkiTS API from a different,
+  // unregistered OS thread would silently alias that same thread-local
+  // slot -- the identical "never call from an unrelated thread" hazard
+  // parallelFor()'s own doc comment already warns about. The watchdog
+  // thread below therefore never touches `impl_->taskScheduler` at all;
+  // it only races a plain condition_variable deadline against this call
+  // finishing, which is a completely independent concern.
+  //
+  // Happy-path cost: one thread spawn, one condition_variable wait that
+  // is satisfied almost immediately once WaitforAllAndShutdown() below
+  // returns (every real shutdown in this project's own test suite
+  // completes in well under a second), and one join -- no new BLOCKING
+  // wait is added to the call this destructor was already making; the
+  // WaitforAllAndShutdown() call itself is byte-for-byte unchanged.
+  bool shutdownComplete = false;
+  std::mutex shutdownCompleteMutex;
+  std::condition_variable shutdownCompleteCv;
+  std::thread shutdownWatchdog([this, &shutdownComplete, &shutdownCompleteMutex, &shutdownCompleteCv] {
+    std::unique_lock<std::mutex> lock(shutdownCompleteMutex);
+    const bool signaledBeforeDeadline = shutdownCompleteCv.wait_for(
+        lock, impl_->shutdownJoinDeadline, [&shutdownComplete] { return shutdownComplete; });
+    if (!signaledBeforeDeadline) {
+      // Never returns -- see reportStuckShutdownAndAbort()'s own comment.
+      // Extracted here (a genuine member-function context, via this
+      // lambda's own enclosing ~Scheduler() scope) since the free
+      // function itself has no access to the private Impl type.
+      reportStuckShutdownAndAbort(impl_->shutdownJoinDeadline, impl_->ioLoopTask->isExecutingClosureForDiagnostics(),
+                                   impl_->ioLoopTask->name(), impl_->workerLoopTask->isExecutingClosureForDiagnostics(),
+                                   impl_->workerLoopTask->name(), impl_->resolvedWorkerCount);
+    }
+  });
+
   impl_->taskScheduler.WaitforAllAndShutdown();
+
+  {
+    std::lock_guard<std::mutex> lock(shutdownCompleteMutex);
+    shutdownComplete = true;
+  }
+  shutdownCompleteCv.notify_all();
+  shutdownWatchdog.join();
 
   // Step 4 [Fix round 1]: both loop tasks have now, by construction (Step
   // 3's own guarantee), fully returned from Execute() -- meaning every

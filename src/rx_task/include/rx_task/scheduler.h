@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -60,7 +61,22 @@ class Scheduler {
   // Returns nullptr if the underlying scheduler failed to start (out-of-
   // memory or a platform thread-creation failure only -- there is no
   // recoverable configuration-error path here).
-  static std::unique_ptr<Scheduler> create(uint32_t workerCount = 0);
+  //
+  // `shutdownJoinDeadline` [issue #76 teardown-hang fix] bounds how long
+  // ~Scheduler() (below) will wait for every worker/IO/worker-task-lane
+  // thread to rejoin before treating one of them as permanently stuck and
+  // aborting -- see ~Scheduler()'s own doc comment for the full contract.
+  // kDefaultShutdownJoinDeadline (30s) is deliberately generous for
+  // production use; a caller with a genuine reason to fail faster (e.g. a
+  // test deliberately proving the bounded-abort path itself, where waiting
+  // the full default would make that test needlessly slow) may pass a
+  // shorter one. Configurable, not hardcoded, precisely so a test can
+  // exercise the SAME production code path this default protects, on a
+  // practical timescale.
+  static constexpr std::chrono::milliseconds kDefaultShutdownJoinDeadline{30000};
+  static std::unique_ptr<Scheduler> create(uint32_t workerCount = 0,
+                                            std::chrono::milliseconds shutdownJoinDeadline =
+                                                kDefaultShutdownJoinDeadline);
 
   // Shuts the underlying task scheduler down: stops accepting new
   // runOnIoThread() submissions, requests shutdown, waits for whatever the
@@ -81,6 +97,30 @@ class Scheduler {
   // pumpMain() is never called again is simply dropped (its captured
   // closure destroyed as an ordinary side effect) -- this is not a
   // drain-to-completion operation for that queue.
+  //
+  // BOUNDED SHUTDOWN [issue #76 teardown-hang fix]: the underlying
+  // enkiTS join (WaitforAllAndShutdown()) has no built-in timeout and
+  // blocks until EVERY thread this Scheduler owns has returned -- if one
+  // of them is permanently stuck (a runOnWorkerThread()/runOnIoThread()
+  // closure that never returns, e.g. a genuine infinite loop or deadlock
+  // inside caller code), this call blocks forever with zero diagnostic,
+  // bounded only by whatever EXTERNAL mechanism eventually kills the
+  // process (this project's own ctest per-test TIMEOUT, by convention).
+  // This destructor now races that join against `shutdownJoinDeadline`
+  // (create()'s own parameter, default kDefaultShutdownJoinDeadline): on
+  // the honest path (every real shutdown this project's own test suite
+  // exercises) the join finishes almost immediately and this destructor
+  // returns exactly as before, with no new blocking wait added to that
+  // path. If the deadline expires first, this destructor logs a LOUD
+  // diagnostic identifying which of this Scheduler's own dedicated
+  // threads (IO thread / worker-task-lane thread) was, at that moment,
+  // still mid-closure, then calls `std::abort()` -- deliberately, not a
+  // detach: a thread that is genuinely stuck still holds live references
+  // into this Scheduler's own state and whatever engine/GPU resources its
+  // closure was touching, so letting it run detached risks a silent
+  // use-after-free at an unpredictable later time once this process's own
+  // teardown continues past it and frees that state out from under it. A
+  // deterministic, loudly-diagnosed crash NOW is strictly safer than that.
   ~Scheduler();
 
   Scheduler(const Scheduler&) = delete;
@@ -273,7 +313,7 @@ class Scheduler {
   uint32_t workerCount() const;
 
  private:
-  explicit Scheduler(uint32_t workerCount);
+  explicit Scheduler(uint32_t workerCount, std::chrono::milliseconds shutdownJoinDeadline);
 
   struct Impl;
   std::unique_ptr<Impl> impl_;
