@@ -377,11 +377,93 @@ struct StandardPbr : IMaterialShader {
                            rx_sampleTexture(gParams.emissiveTexture, gParams.emissiveSampler, emUv).rgb;
 
         // --- Lambertian diffuse + GGX/Smith-correlated/Schlick specular,
-        // one directional light [BRDF baseline, this file's own header
-        // comment; math consumed from brdf.slang -- Task 8 rework]
-        // --------------------------------------------------------------
+        // ONE punctual light -- Directional/Point/Spot [BRDF baseline,
+        // this file's own header comment; math consumed from brdf.slang
+        // -- Task 8 rework; GENERALIZED beyond directional-only by Phase
+        // 5 Stage 2 Task 13, #49] --------------------------------------
+        //
+        // [Task 13] `v.lightType` selects the punctual-light unit/
+        // attenuation model this ONE light-slot term applies -- ported
+        // from `rx::scene::lightmath` (src/rx_scene/light_math.h, the
+        // SAME closed-form functions a device-free C++ unit test asserts
+        // against KHR_lights_punctual's own reference code, README.md,
+        // Khronos glTF commit 2b29723d025a995971726f2989697cdc49b1222a).
+        // Directional stays UNATTENUATED (KHR spec: "Because it is at an
+        // infinite distance, the light is not attenuated") -- `v.
+        // lightDirWorld` is already the constant per-pass "toward light"
+        // unit vector every pre-Task-13 producer populates, so this path
+        // is BYTE-IDENTICAL to the pre-Task-13 code for lightType==0
+        // (every existing DrawDataGpu producer's own default).
+        //
+        // [Task 15's own plan text: "The lit path consumes cluster lists
+        // for point/spot (directional stays direct)"] This single-light
+        // term is a FOUNDATIONAL, forward-compatible mechanism: Task 14/
+        // 15's clustered Forward+ path will later REUSE these exact
+        // attenuation formulas per-light inside a per-pixel froxel light
+        // loop, superseding (for Point/Spot only) the "one light per
+        // draw" data source below with a per-pixel light LIST -- the math
+        // itself does not change, only where the light's own data comes
+        // from.
         float3 viewDir = normalize(v.cameraPosWorld - v.worldPos);
-        float3 lightDir = normalize(v.lightDirWorld);
+        float3 lightDir;
+        float lightAttenuation = 1.0;
+        if (v.lightType == 0u) {
+            // Directional -- constant per-pass direction, no attenuation.
+            lightDir = normalize(v.lightDirWorld);
+        } else {
+            // Point/Spot -- `lightDir` (the "toward light" unit vector
+            // NdotL/the half-vector need) varies per-fragment, derived
+            // from the light's own world position and this fragment's
+            // own (already-per-fragment-varying) worldPos.
+            float3 toLight = v.lightPositionWorld - v.worldPos;
+            float distSq = max(dot(toLight, toLight), 1e-8);
+            float dist = sqrt(distSq);
+            lightDir = toLight / dist;
+
+            // KHR_lights_punctual range-property window [README.md#range-
+            // property, quoted verbatim: "attenuation = max(min(1.0-
+            // (current_distance/range)^4,1),0)/current_distance^2"] --
+            // the LITERAL, un-squared form (gate matrix's own Open
+            // Question resolution: this is what the spec text, its own
+            // reference implementation, AND the pinned glTF-Sample-
+            // Renderer conformance target all agree on; Filament's own
+            // shader squares the window term an extra time, a deliberate
+            // "cinematic" softening this project does NOT port). `v.
+            // lightRange <= 0.0` == "no configured range" (this project's
+            // own established sentinel) -- pure inverse-square, no window.
+            float rangeWindow = 1.0;
+            if (v.lightRange > 0.0) {
+                float ratio = dist / v.lightRange;
+                float ratio4 = ratio * ratio;
+                ratio4 = ratio4 * ratio4;
+                rangeWindow = saturate(1.0 - ratio4);
+            }
+            lightAttenuation = rangeWindow / distSq;
+
+            if (v.lightType == 2u) {
+                // Spot -- additional cone attenuation [KHR reference code,
+                // README.md: "float cd = dot(spotlightDir,
+                // normalizedLightVector); float angularAttenuation =
+                // saturate(cd*lightAngleScale+lightAngleOffset);
+                // angularAttenuation *= angularAttenuation;"].
+                // `normalizedLightVector` there is the vector FROM the
+                // light TOWARD the fragment (the light's own travel
+                // direction at this fragment) -- i.e. `-lightDir` here,
+                // NOT `lightDir` itself (which points the OPPOSITE way,
+                // toward the light, matching NdotL's own convention) --
+                // cross-checked directly against the pinned glTF-Sample-
+                // Renderer's own `getSpotAttenuation()` (punctual.glsl:
+                // `actualCos = dot(normalize(spotDirection),
+                // normalize(-pointToLight))` where `pointToLight =
+                // light.position - worldPosition`, i.e. `-pointToLight ==
+                // worldPosition - light.position`, the SAME travel-
+                // direction vector).
+                float cd = dot(normalize(v.lightSpotDirWorld), -lightDir);
+                float angularAttenuation = saturate(cd * v.lightAngleScale + v.lightAngleOffset);
+                angularAttenuation *= angularAttenuation;
+                lightAttenuation *= angularAttenuation;
+            }
+        }
         float3 halfVec = normalize(viewDir + lightDir);
         float NdotL = max(dot(N, lightDir), 0.0);
         float NdotV = max(dot(N, viewDir), 1e-4);  // clamped away from 0, not 0-able geometry (grazing/back-facing).
@@ -458,7 +540,17 @@ struct StandardPbr : IMaterialShader {
         // forward-looking, would have doubled up with Task 22's own future
         // shadow maps (a REAL direct-light visibility term) once that
         // lands. Direct light is governed by NdotL/shadowing alone.
-        float3 directLight = (diffuse + specular) * v.lightColor * NdotL;
+        // [Task 13] `lightAttenuation` is 1.0 for Directional (unattenuated,
+        // by construction above) -- byte-identical to the pre-Task-13
+        // expression for every existing directional-only producer.
+        // `v.lightColor` is candela for Point/Spot (see this file's own
+        // punctual-light comment above) -- multiplying by the inverse-
+        // square/window/cone attenuation term converts it into the SAME
+        // lux-equivalent-irradiance space the diffuse/specular BRDF terms
+        // already assume, matching Filament's own `light.colorIntensity.
+        // rgb * light.attenuation * NoL` composition (shaders/src/
+        // surface_light_punctual.fs, google/filament v1.75.0).
+        float3 directLight = (diffuse + specular) * v.lightColor * lightAttenuation * NdotL;
 
         // [Phase 5 Task 10, #46, FG1 closure] Image-based lighting --
         // REPLACES the retired FG1 flat ambient/environment term (see

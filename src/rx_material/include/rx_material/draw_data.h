@@ -155,20 +155,53 @@ struct DrawDataGpu {
     float envIntensity = 0.0F;                       // PRE-EXPOSED physical-units scalar (Camera::exposure() already applied).
     // [MATRIX LAYOUT / std430 ARRAY STRIDE -- LOAD-BEARING, see this
     // header's own top comment] ONE padding field, not decorative --
-    // rounds this struct's total size up to a multiple of 16 bytes,
-    // matching the per-element STRIDE Slang's `StructuredBuffer<RxDrawData>
-    // []` (material.slang) actually uses on the GPU side (std430's
-    // array-of-struct stride-rounds-to-largest-member-alignment rule,
-    // 16 bytes here because of this struct's several float4x4/float4
-    // fields). Omitting this padding reproduced a REAL bug directly during
-    // this task's own development: row 0 of a multi-row DrawDataGpu buffer
-    // still read correctly (offset 0 either way), but every row after it
-    // read progressively misaligned/garbage data, because a C++ producer's
-    // tight `sizeof(DrawDataGpu) * rowCount` packing silently disagreed
-    // with the shader's own (16-byte-rounded) real stride.
+    // rounds the struct's size (AS OF Task 10) up to a multiple of 16
+    // bytes, matching the per-element STRIDE Slang's `StructuredBuffer<
+    // RxDrawData>[]` (material.slang) actually uses on the GPU side
+    // (std430's array-of-struct stride-rounds-to-largest-member-alignment
+    // rule, 16 bytes here because of this struct's several float4x4/
+    // float4 fields). Omitting this padding reproduced a REAL bug directly
+    // during Task 10's own development: row 0 of a multi-row DrawDataGpu
+    // buffer still read correctly (offset 0 either way), but every row
+    // after it read progressively misaligned/garbage data, because a C++
+    // producer's tight `sizeof(DrawDataGpu) * rowCount` packing silently
+    // disagreed with the shader's own (16-byte-rounded) real stride. KEPT
+    // (not removed/reused) even though Task 13 appends more fields after
+    // it below -- every subsequent std430-aligned append must land AFTER
+    // this field, at the 384-byte boundary it establishes, never before
+    // it (an earlier draft of this task's own diff got this backwards --
+    // see this file's own git history / task-13-report.md for the
+    // disclosed self-caught defect).
     float _padEnv0 = 0.0F;
+
+    // [Phase 5 Stage 2 Task 13, #49] Generalizes the "one directional
+    // light" term above (`lightDirWorld`/`lightColor`) to Directional/
+    // Point/Spot -- see material.slang's own RxDrawData mirror + this
+    // struct's own top comment for the full field-by-field rationale.
+    // `lightDirWorld`/`lightColor` KEEP their existing semantics for
+    // Directional (constant per-pass "toward light" unit vector / lux
+    // color*intensity, unattenuated); for Point/Spot, `lightColor` instead
+    // holds `color*intensity` in CANDELA and the true per-fragment "toward
+    // light" vector is derived in-shader from `lightPositionWorld`. Every
+    // field below defaults to the exact value that reproduces byte-
+    // identical Directional-only (pre-Task-13) behavior for a row that
+    // never sets them (lightType==0==Directional, lightRange==0==no
+    // window -- irrelevant anyway since Directional never attenuates).
+    // Appended starting at byte offset 384 (a clean 16-byte boundary,
+    // thanks to `_padEnv0` immediately above) -- the four leading scalars
+    // (16 bytes) keep the two trailing `vec4`s naturally 16-byte-aligned
+    // with zero implicit compiler padding on EITHER the C++ or the Slang
+    // std430 side, so this append needs no additional manual pad field.
+    uint32_t lightType = 0;        // 0=Directional, 1=Point, 2=Spot [rx::scene::LightType].
+    float lightRange = 0.0F;       // Point/Spot inverse-square-window radius; 0.0 == infinite range (no windowing).
+    float lightAngleScale = 0.0F;  // Spot cone precomputed scale [rx::scene::lightmath::spotAngleScaleOffset()]; Directional/Point unused.
+    float lightAngleOffset = 0.0F; // Spot cone precomputed offset; Directional/Point unused.
+    glm::vec4 lightPositionWorld{0.0F};        // Point/Spot world position, xyz (w unused). Directional: unused.
+    glm::vec4 lightSpotDirWorld{0.0F, 0.0F, -1.0F, 0.0F};  // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
 };
-static_assert(sizeof(DrawDataGpu) == 384, "DrawDataGpu must stay exactly 384 bytes -- mirrors material.slang's RxDrawData");
+static_assert(sizeof(DrawDataGpu) == 432, "DrawDataGpu must stay exactly 432 bytes (384 + 48 punctual-light bytes, "
+                                           "already a 16-byte multiple with no additional pad) -- mirrors "
+                                           "material.slang's RxDrawData");
 
 // Mirrors material.slang's `RxMaterialGlobals` push-constant struct
 // (`[[vk::push_constant]] ConstantBuffer<RxMaterialGlobals> gMaterialGlobals;`)

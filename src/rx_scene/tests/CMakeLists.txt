@@ -14,6 +14,8 @@ add_executable(rx_scene_tests
     # [Phase 5 Task 5, ticket #41 row 4] FlyCamera -- promoted from
     # samples/09_scene/fly_camera.h.
     fly_camera_test.cpp
+    # [Phase 5 Stage 2 Task 13, #49] KHR_lights_punctual attenuation math.
+    light_math_test.cpp
 )
 target_link_libraries(rx_scene_tests PRIVATE rx_scene doctest::doctest)
 add_test(NAME rx_scene_tests COMMAND rx_scene_tests)

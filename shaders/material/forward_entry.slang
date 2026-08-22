@@ -233,6 +233,17 @@ float4 fragmentMain(VertexStageOutput input) : SV_Target {
     v.envMaxPrefilteredLod = draw.envMaxPrefilteredLod;
     v.envIntensity = draw.envIntensity;
 
+    // [Phase 5 Stage 2 Task 13, #49] The punctual-light bundle -- read
+    // directly off the SAME `draw` row, same "nothing to gain from also
+    // widening VertexStageOutput for a per-pass-constant value" reasoning
+    // as the env* fields immediately above.
+    v.lightType = draw.lightType;
+    v.lightRange = draw.lightRange;
+    v.lightAngleScale = draw.lightAngleScale;
+    v.lightAngleOffset = draw.lightAngleOffset;
+    v.lightPositionWorld = draw.lightPositionWorld.xyz;
+    v.lightSpotDirWorld = draw.lightSpotDirWorld.xyz;
+
     // Default-constructed: every conforming material struct this engine
     // links against is data-free by convention (its bound parameters live
     // in its own module-scope `ParameterBlock<TParams> gParams`, per D8 --

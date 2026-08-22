@@ -5,6 +5,7 @@
 #include <rx_rhi_vk/device.h>
 #include <rx_rhi_vk/upload.h>
 #include <rx_platform/window.h>
+#include <rx_scene/scene.h>
 #include <rx_task/scheduler.h>
 #include <algorithm>
 #include <chrono>
@@ -783,6 +784,95 @@ TEST_CASE("importGltf: cameras (perspective infinite + orthographic) and all 3 l
             REQUIRE(l.outerConeAngle.has_value());
             CHECK(*l.innerConeAngle == doctest::Approx(0.2F));
             CHECK(*l.outerConeAngle == doctest::Approx(0.6F));
+        }
+    }
+    CHECK(sawDirectional);
+    CHECK(sawPoint);
+    CHECK(sawSpot);
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("importGltf -> rx::scene::instantiateImportedLights(): authored glTF punctual lights arrive in "
+          "the Scene with value-asserted intensities/cones [Phase 5 Stage 2 Task 13, #49; gate matrix "
+          "'Authored glTF punctual lights arrive in the Scene with value-asserted intensities/cones' "
+          "acceptance criterion, decoded-value discipline]. Reuses cube_lights_camera.gltf (the SAME "
+          "fixture the plain-parse TEST_CASE above already round-trips at the LightData layer) but drives "
+          "it through the REAL end-to-end path: a GPU-backed registry.importGltf() followed by "
+          "rx::scene::instantiateImportedLights() against a real rx::scene::Scene -- proving the FULL "
+          "chain (fastgltf parse -> LightData -> Scene light), not just the import layer alone.") {
+    auto fixture = makeFixture("import_lights_consumption");
+    if (!fixture) {
+        return;
+    }
+    attachPoolAndScheduler(*fixture);
+    Registry registry;
+    ImportResult result = registry.importGltf(testAssetDir() + "/cube_lights_camera.gltf", *fixture->pool,
+                                                *fixture->scheduler);
+    REQUIRE(result.ok());
+    REQUIRE(result.scene.lights.size() == 3);
+
+    rx::scene::Scene scene([](rx::asset::MeshHandle) { return rx::asset::AABB{}; });
+    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, result.scene.lights);
+    REQUIRE(handles.size() == 3);
+    CHECK(scene.lightCount() == 3);
+
+    bool sawDirectional = false, sawPoint = false, sawSpot = false;
+    for (rx::scene::LightHandle h : handles) {
+        switch (scene.lightType(h)) {
+            case rx::scene::LightType::Directional: {
+                sawDirectional = true;
+                // color=[1,0.9,0.8] * intensity=3.0 -- EXACT pass-through,
+                // lux, no unit conversion (KHR spec: directional
+                // intensity is ALREADY illuminance in lux).
+                const glm::vec3 c = scene.lightColorLux(h);
+                CHECK(c.x == doctest::Approx(3.0F));
+                CHECK(c.y == doctest::Approx(2.7F));
+                CHECK(c.z == doctest::Approx(2.4F));
+                // sun_node: translation (1,1,1), NO rotation -- direction
+                // is local (0,0,-1) unrotated (translation has zero
+                // effect on direction, per KHR spec).
+                const glm::vec3 dir = scene.lightDirection(h);
+                CHECK(dir.x == doctest::Approx(0.0F).epsilon(0.001));
+                CHECK(dir.y == doctest::Approx(0.0F).epsilon(0.001));
+                CHECK(dir.z == doctest::Approx(-1.0F).epsilon(0.001));
+                break;
+            }
+            case rx::scene::LightType::Point: {
+                sawPoint = true;
+                // color=[1,0,0] * intensity=500.0 -- EXACT pass-through,
+                // candela [gate matrix's own worked acceptance criterion:
+                // "1500 candela imports as EXACTLY 1500.0, not
+                // 1500/(4*pi)" -- this fixture uses 500, same principle].
+                const glm::vec3 c = scene.lightColorLux(h);
+                CHECK(c.x == doctest::Approx(500.0F));
+                CHECK(c.y == doctest::Approx(0.0F));
+                CHECK(c.z == doctest::Approx(0.0F));
+                // point_node: translation (2,2,2).
+                CHECK(scene.lightPosition(h) == glm::vec3(2.0F, 2.0F, 2.0F));
+                // range PRESENT in the fixture (10.0) -- not the "absent"
+                // sentinel.
+                CHECK(scene.lightRange(h) == doctest::Approx(10.0F));
+                break;
+            }
+            case rx::scene::LightType::Spot: {
+                sawSpot = true;
+                // color=[0,1,0] * intensity=200.0 -- EXACT pass-through,
+                // candela.
+                const glm::vec3 c = scene.lightColorLux(h);
+                CHECK(c.x == doctest::Approx(0.0F));
+                CHECK(c.y == doctest::Approx(200.0F));
+                CHECK(c.z == doctest::Approx(0.0F));
+                // spot_node: translation (3,3,3), no rotation.
+                CHECK(scene.lightPosition(h) == glm::vec3(3.0F, 3.0F, 3.0F));
+                const glm::vec3 dir = scene.lightDirection(h);
+                CHECK(dir.x == doctest::Approx(0.0F).epsilon(0.001));
+                CHECK(dir.y == doctest::Approx(0.0F).epsilon(0.001));
+                CHECK(dir.z == doctest::Approx(-1.0F).epsilon(0.001));
+                CHECK(scene.lightRange(h) == doctest::Approx(5.0F));
+                CHECK(scene.lightInnerConeAngle(h) == doctest::Approx(0.2F));
+                CHECK(scene.lightOuterConeAngle(h) == doctest::Approx(0.6F));
+                break;
+            }
         }
     }
     CHECK(sawDirectional);

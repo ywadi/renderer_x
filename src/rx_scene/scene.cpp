@@ -294,6 +294,35 @@ LightHandle Scene::createDirectionalLight(const DirectionalLightDesc& desc) {
     return insertLightRecord(record);
 }
 
+LightHandle Scene::createPointLight(const PointLightDesc& desc) {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createPointLight");
+    LightRecord record;
+    record.type = LightType::Point;
+    record.position = desc.position;
+    record.colorLux = desc.colorCandela;  // candela -- see PointLightDesc's own header comment.
+    record.range = desc.range;
+    record.castsShadows = desc.castsShadows;
+    record.channels = desc.channels;
+    // direction/innerConeAngle/outerConeAngle stay at LightRecord's own
+    // inert defaults -- a point light emits uniformly in every direction.
+    return insertLightRecord(record);
+}
+
+LightHandle Scene::createSpotLight(const SpotLightDesc& desc) {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::createSpotLight");
+    LightRecord record;
+    record.type = LightType::Spot;
+    record.direction = desc.dir;
+    record.position = desc.position;
+    record.colorLux = desc.colorCandela;  // candela -- see SpotLightDesc's own header comment.
+    record.range = desc.range;
+    record.innerConeAngle = desc.innerConeAngle;
+    record.outerConeAngle = desc.outerConeAngle;
+    record.castsShadows = desc.castsShadows;
+    record.channels = desc.channels;
+    return insertLightRecord(record);
+}
+
 void Scene::destroyLight(LightHandle handle) {
     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::destroyLight");
     if (!isLiveLightIndex(handle)) {
@@ -316,14 +345,39 @@ bool Scene::isLightAlive(LightHandle handle) const {
     return isLiveLightIndex(handle);
 }
 
+LightType Scene::lightType(LightHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightType");
+    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightType")].type;
+}
+
 glm::vec3 Scene::lightDirection(LightHandle handle) const {
     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightDirection");
     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightDirection")].direction;
 }
 
+glm::vec3 Scene::lightPosition(LightHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightPosition");
+    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightPosition")].position;
+}
+
 glm::vec3 Scene::lightColorLux(LightHandle handle) const {
     RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightColorLux");
     return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightColorLux")].colorLux;
+}
+
+float Scene::lightRange(LightHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightRange");
+    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightRange")].range;
+}
+
+float Scene::lightInnerConeAngle(LightHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightInnerConeAngle");
+    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightInnerConeAngle")].innerConeAngle;
+}
+
+float Scene::lightOuterConeAngle(LightHandle handle) const {
+    RX_ASSERT_MAIN_THREAD("rx::scene::Scene::lightOuterConeAngle");
+    return lightRecords_[requireLiveLight(handle, "rx::scene::Scene::lightOuterConeAngle")].outerConeAngle;
 }
 
 bool Scene::lightCastsShadows(LightHandle handle) const {
@@ -367,6 +421,75 @@ const EnvironmentDesc& Scene::environment() const {
         throw std::out_of_range("rx::scene::Scene::environment");
     }
     return *environment_;
+}
+
+// ---------------------------------------------------------------------
+// Imported-light consumption [Phase 5 Stage 2 Task 13, #49]
+// ---------------------------------------------------------------------
+
+std::vector<LightHandle> instantiateImportedLights(Scene& scene, std::span<const asset::LightData> lights) {
+    RX_ZONE;
+    std::vector<LightHandle> handles;
+    handles.reserve(lights.size());
+    for (const asset::LightData& light : lights) {
+        // Translation column [KHR spec: "the light's position is defined
+        // as the node's world location"].
+        const glm::vec3 position(light.worldTransform[3]);
+        // Local (0,0,-1) rotated by the node's world transform [KHR spec:
+        // "an untransformed light points down the -Z axis"] -- `mat4 *
+        // vec4(0,0,-1,0)` (a DIRECTION, w=0, so translation drops out)
+        // picks out exactly `-worldTransform`'s own third column, which is
+        // correct under non-uniform scale on the OTHER two axes too (the
+        // matrix-vector product never touches column 0/1 at all) --
+        // normalizing removes whatever scale factor local Z itself
+        // carries, matching the spec's own "light properties are
+        // unaffected by node transforms" / "inherited scale does not
+        // affect cone shape" text (scale affects neither the resulting
+        // unit direction nor anything else this function reads).
+        const glm::vec3 direction = glm::normalize(glm::vec3(light.worldTransform * glm::vec4(0.0F, 0.0F, -1.0F, 0.0F)));
+        // Straight pass-through, no unit conversion [KHR spec: "The
+        // intensity represents the luminous intensity... if it were
+        // colored pure white"; "color" is "a wavelength-specific
+        // multiplier"] -- see this function's own header comment (scene.h)
+        // for the full "no lumen->candela rescale" acceptance criterion.
+        const glm::vec3 colorIntensity = light.color * light.intensity;
+
+        switch (light.type) {
+            case asset::LightData::Type::Directional: {
+                DirectionalLightDesc desc;
+                desc.dir = direction;
+                desc.colorLux = colorIntensity;
+                handles.push_back(scene.createDirectionalLight(desc));
+                break;
+            }
+            case asset::LightData::Type::Point: {
+                PointLightDesc desc;
+                desc.position = position;
+                desc.colorCandela = colorIntensity;
+                desc.range = light.range.value_or(0.0F);  // absent -> "no configured range" sentinel.
+                handles.push_back(scene.createPointLight(desc));
+                break;
+            }
+            case asset::LightData::Type::Spot: {
+                SpotLightDesc desc;
+                desc.position = position;
+                desc.dir = direction;
+                desc.colorCandela = colorIntensity;
+                desc.range = light.range.value_or(0.0F);
+                // KHR spec defaults (README.md): innerConeAngle=0,
+                // outerConeAngle=PI/4 -- SAME literals as SpotLightDesc's
+                // own default-member-initializers, restated explicitly
+                // here since `light.innerConeAngle`/`outerConeAngle` are
+                // `std::optional<float>` and this is the exact point that
+                // resolves "absent" to the spec's own documented value.
+                desc.innerConeAngle = light.innerConeAngle.value_or(0.0F);
+                desc.outerConeAngle = light.outerConeAngle.value_or(0.7853981633974483F);
+                handles.push_back(scene.createSpotLight(desc));
+                break;
+            }
+        }
+    }
+    return handles;
 }
 
 namespace detail {

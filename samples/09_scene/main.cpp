@@ -1849,8 +1849,45 @@ bool populateImportedInstances(App& app, const rx::asset::Registry& registry, co
         RX_LOG_ERROR("sample_09_scene: imported scene produced zero renderables");
         return false;
     }
-    app.lightHandle = app.scene->createDirectionalLight(
-        rx::scene::DirectionalLightDesc{app.lightDirWorld, glm::vec3(5.0F, 5.0F, 5.0F), true, 0xFFu});
+
+    // [Phase 5 Stage 2 Task 13, #49] Consume any KHR_lights_punctual
+    // lights the imported glTF itself carries -- EVERY light (any type)
+    // is created in the Scene for real (`scene->lightCount()` reflects
+    // them afterward), satisfying "authored glTF punctual lights arrive
+    // in the Scene" concretely, in a real production code path, not just
+    // a test. This sample's own single-light forward/shadow slot
+    // (`app.lightHandle`) still only ever drives from a DIRECTIONAL light
+    // -- Point/Spot production shading is Task 14/15's clustered scope
+    // (per the plan's own "directional stays direct... [Point/Spot]
+    // consumes cluster lists" framing), not wired to pixels through this
+    // sample's single-light path yet; a scene with only Point/Spot lights
+    // (or none at all, e.g. Sponza) falls back to the SAME hardcoded key
+    // light every earlier round already used here, byte-identical.
+    std::vector<rx::scene::LightHandle> importedLights = rx::scene::instantiateImportedLights(*app.scene, scene.lights);
+    std::optional<rx::scene::LightHandle> importedDirectional;
+    for (rx::scene::LightHandle h : importedLights) {
+        if (app.scene->lightType(h) == rx::scene::LightType::Directional) {
+            importedDirectional = h;
+            break;
+        }
+    }
+    if (importedDirectional.has_value()) {
+        app.lightHandle = *importedDirectional;
+        app.lightDirWorld = app.scene->lightDirection(app.lightHandle);
+        RX_LOG_INFO("sample_09_scene: --scene: using the imported scene's own directional light as the main "
+                     "light ({} total imported light(s))",
+                     importedLights.size());
+    } else {
+        app.lightHandle = app.scene->createDirectionalLight(
+            rx::scene::DirectionalLightDesc{app.lightDirWorld, glm::vec3(5.0F, 5.0F, 5.0F), true, 0xFFu});
+        if (!importedLights.empty()) {
+            RX_LOG_INFO("sample_09_scene: --scene: imported scene has {} Point/Spot light(s) (created in the "
+                         "Scene) but no Directional light -- falling back to the default key light for this "
+                         "sample's own single-light forward/shadow slot (Point/Spot production shading is "
+                         "Task 14/15's clustered scope)",
+                         importedLights.size());
+        }
+    }
 
     rx::asset::AABB totalBounds{};
     for (const rx::asset::AABB& b : app.scene->worldBoundsSpan()) {
@@ -2268,8 +2305,31 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
     // further plumbing here.
     const float preExposure = app.flyCamera.camera.exposure();
     const uint8_t lightChannels = app.hud.lightChannelHighlightOn ? 0xFFu : static_cast<uint8_t>(0xFFu & ~kHighlightChannelBit);
+    // [Phase 5 Stage 2 Task 13, #49] `mainLightDir`/`mainLightColorLux`
+    // read GENERICALLY from `app.scene`'s own LightRecord for
+    // `app.lightHandle` when it is alive -- the real Scene-API consumption
+    // path this sample's own key light previously bypassed entirely (the
+    // pre-Task-13 code below wrote the literal `(5,5,5)` and the separate
+    // CPU-side `app.lightDirWorld` field directly into every row, never
+    // actually reading `Scene::lightColorLux()`/`lightDirection()`).
+    // BYTE-IDENTICAL for every pre-Task-13 producer of `app.lightHandle`
+    // (`populateHelmetGrid()`/`populateImportedInstances()`'s own
+    // fallback path both still create a directional light with EXACTLY
+    // `colorLux=(5,5,5)`/`dir=app.lightDirWorld`) -- the ONLY path where
+    // this now differs is `populateImportedInstances()`'s NEW "the
+    // imported scene had its own directional light" branch, where
+    // `app.lightHandle` carries that light's own real, imported
+    // intensity/direction. `--stress` mode never creates ANY Scene light
+    // (`app.lightHandle` stays at its own default, dead, handle) --
+    // `isLightAlive()` is false there, so this falls back to the SAME
+    // hardcoded `(5,5,5)`/`app.lightDirWorld` pair the pre-Task-13 code
+    // always used, unconditionally, for that mode -- also byte-identical.
+    glm::vec3 mainLightDir = app.lightDirWorld;
+    glm::vec3 mainLightColorLux(5.0F, 5.0F, 5.0F);
     if (app.scene->isLightAlive(app.lightHandle)) {
         app.scene->setLightChannels(app.lightHandle, lightChannels);
+        mainLightDir = app.scene->lightDirection(app.lightHandle);
+        mainLightColorLux = app.scene->lightColorLux(app.lightHandle);
     }
 
     // [Phase 5 Task 10, #46 fix round, task-10-review.md Finding 3/LOW] The
@@ -2297,8 +2357,9 @@ void updateSceneFrame(App& app, rx::task::Scheduler& scheduler) {
         row.model = glm::transpose(model);
         row.normalMatrix = glm::transpose(glm::mat4(normalMat3));
         row.viewProj = viewProjTransposed;
-        row.lightDirWorld = glm::vec4(-glm::normalize(app.lightDirWorld), 0.0F);
-        row.lightColor = glm::vec4(5.0F, 5.0F, 5.0F, 0.0F) * preExposure;
+        row.lightDirWorld = glm::vec4(-glm::normalize(mainLightDir), 0.0F);
+        row.lightColor = glm::vec4(mainLightColorLux, 0.0F) * preExposure;
+        row.lightType = 0;  // Directional -- see this function's own comment above (Point/Spot: Task 14/15's scope).
         row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // retired field, inert -- see MaterialVertex::ambientColor's own header comment.
         row.cameraPosWorld = glm::vec4(cameraPos, 0.0F);
         row.materialIndex = payload.materialIndex;

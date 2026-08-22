@@ -54,6 +54,11 @@ add_executable(rx_material_gpu_tests
     # furnace sanity) + shaders/ibl/skybox.slang's own background pass
     # (camera-ray value probe) -- see that file's own header comment.
     test_standard_pbr_ibl_gpu.cpp
+    # Phase 5 Stage 2 Task 13 [#49]: standard_pbr.slang's generalized
+    # punctual-light term (Directional/Point/Spot) -- falloff/cone-
+    # attenuation value probes, directional regression, pre-exposure
+    # coherence. See that file's own header comment.
+    test_standard_pbr_punctual_gpu.cpp
 )
 # [Phase 5 Task 4/#40] rx_scene: test_standard_pbr_unlit.cpp's own
 # pre-exposure TEST_CASE constructs a real rx::scene::Camera and reads

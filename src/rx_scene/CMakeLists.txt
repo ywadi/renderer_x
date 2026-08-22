@@ -26,6 +26,9 @@ add_library(rx_scene STATIC
     camera.cpp
     scene.cpp
     draw_list.cpp
+    # Phase 5 Stage 2 Task 13 [#49] -- device-free KHR_lights_punctual
+    # attenuation math (see light_math.h's own header comment).
+    light_math.cpp
 )
 target_include_directories(rx_scene PUBLIC include)
 target_link_libraries(rx_scene PUBLIC rx_core rx_asset rx_task)

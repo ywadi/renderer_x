@@ -71,6 +71,21 @@ public struct MaterialVertex {
     public float envMaxPrefilteredLod;
     public float envIntensity;
 
+    // [Phase 5 Stage 2 Task 13, #49] The punctual-light bundle, forwarded
+    // verbatim from the SAME `RxDrawData` row `forward_entry.slang`'s
+    // `fragmentMain` re-reads for its shadow/env fields (NOT carried
+    // through `VertexStageOutput` -- same "per-pass-constant, nothing to
+    // gain from interpolating it" reasoning `envIrradianceCubeIndex` et
+    // al. already establish). See `RxDrawData`'s own header comment
+    // (above, this file) for the full field-by-field unit/semantics
+    // account.
+    public uint lightType;
+    public float lightRange;
+    public float lightAngleScale;
+    public float lightAngleOffset;
+    public float3 lightPositionWorld;
+    public float3 lightSpotDirWorld;
+
     // [BRDF baseline] World-space camera/eye position -- the one piece of
     // per-pass (not per-vertex) data StandardPBR's specular term genuinely
     // needs and neither `worldPos` nor any field above supplies: Schlick
@@ -372,18 +387,42 @@ public struct RxDrawData {
     // to the alignment of its largest member (16 bytes, this struct's own
     // several `float4x4`/`float4` fields) -- exactly the GLSL/HLSL std430
     // array-of-struct rule, verified directly against this exact
-    // mismatch during this task's own development (a struct total NOT a
+    // mismatch during Task 10's own development (a struct total NOT a
     // multiple of 16 bytes makes the SHADER's own real per-row byte
     // stride silently round up beyond what a C++ producer's tight
     // `sizeof(DrawDataGpu) * rowCount` packing assumes -- row 0 still
     // reads correctly, since it sits at offset 0 either way, but every
     // row AFTER it reads progressively misaligned/garbage data. This ONE
-    // padding field is exactly what's needed to bring this struct's own
-    // total size back to a 16-byte multiple (352 + 7 real env fields' 28
-    // bytes + this 4 bytes == 384) -- see draw_data.h's own
-    // `static_assert(sizeof(DrawDataGpu) == 384, ...)` for the other half
-    // of this invariant.
+    // padding field brought the struct's (AS OF Task 10) total size back
+    // to a 16-byte multiple (352 + 7 real env fields' 28 bytes + this 4
+    // bytes == 384) -- KEPT (not reused) by Task 13's own append below,
+    // which starts fresh at this clean 384-byte boundary; see
+    // draw_data.h's own `static_assert(sizeof(DrawDataGpu) == 432, ...)`
+    // for the other half of this invariant.
     public float _padEnv0;
+
+    // [Phase 5 Stage 2 Task 13, #49] Generalizes the "one directional
+    // light" term above (`lightDirWorld`/`lightColor`) to Directional/
+    // Point/Spot -- mirrors `rx::material::DrawDataGpu`'s own tail-append
+    // EXACTLY (draw_data.h, same field order/types, same "starts at a
+    // clean 384-byte boundary, no extra padding needed" reasoning: the
+    // four leading scalars below occupy exactly 16 bytes, keeping both
+    // trailing `float4`s naturally aligned). `lightDirWorld`/`lightColor`
+    // above KEEP their existing semantics for Directional (constant
+    // per-pass "toward light" unit vector / lux `color*intensity`,
+    // unattenuated); for Point/Spot, `lightColor` instead holds
+    // `color*intensity` in CANDELA and the true per-fragment "toward
+    // light" vector is derived by `standard_pbr.slang`'s own punctual
+    // term from `lightPositionWorld` and the shaded fragment's own
+    // `worldPos`. `lightType==0`/`lightRange==0` (both fields' own
+    // defaults) reproduces byte-identical Directional-only (pre-Task-13)
+    // behavior for any row that never sets these fields.
+    public uint lightType;         // 0=Directional, 1=Point, 2=Spot [rx::scene::LightType].
+    public float lightRange;       // Point/Spot inverse-square-window radius; 0.0 == infinite range (no windowing).
+    public float lightAngleScale;  // Spot cone precomputed scale [rx::scene::lightmath::spotAngleScaleOffset()]; Directional/Point unused.
+    public float lightAngleOffset; // Spot cone precomputed offset; Directional/Point unused.
+    public float4 lightPositionWorld;  // Point/Spot world position, xyz (w unused). Directional: unused.
+    public float4 lightSpotDirWorld;   // Spot's own facing/travel direction, world space, xyz (w unused). Directional/Point: unused.
 }
 
 [[vk::binding(2, 0)]]

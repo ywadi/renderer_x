@@ -461,6 +461,198 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------
+// Punctual lights [Phase 5 Stage 2 Task 13, #49] -- the gate matrix's own
+// "Point/spot lights have NO public Scene creation API" row, closed:
+// createPointLight()/createSpotLight() mirror createDirectionalLight()'s
+// own shape+conventions exactly (matrix's own recommendation).
+// ---------------------------------------------------------------------
+
+TEST_CASE("PointLightDesc defaults and field round-trip through createPointLight() [gate matrix 'Point/spot "
+          "lights have NO public Scene creation API' row]") {
+    rx::scene::PointLightDesc desc;
+    CHECK(desc.position == glm::vec3(0.0F, 0.0F, 0.0F));
+    CHECK(desc.colorCandela == glm::vec3(1.0F, 1.0F, 1.0F));
+    CHECK(desc.range == doctest::Approx(0.0F));
+    CHECK(desc.castsShadows);
+    CHECK(desc.channels == 0xFFU);
+
+    desc.position = glm::vec3(2.0F, 4.0F, 6.0F);
+    desc.colorCandela = glm::vec3(1500.0F, 100.0F, 50.0F);  // deliberately unequal per-channel, non-neutral.
+    desc.range = 25.0F;
+    desc.castsShadows = false;
+    desc.channels = 0x2U;
+
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    rx::scene::LightHandle h = scene.createPointLight(desc);
+    CHECK(scene.lightType(h) == rx::scene::LightType::Point);
+    CHECK(scene.lightPosition(h) == glm::vec3(2.0F, 4.0F, 6.0F));
+    // EXACT pass-through -- candela, no conversion (matches the gate
+    // matrix's own "no lumen->candela conversion at import" acceptance
+    // criterion, exercised here at the Scene-API level directly).
+    CHECK(scene.lightColorLux(h) == glm::vec3(1500.0F, 100.0F, 50.0F));
+    CHECK(scene.lightRange(h) == doctest::Approx(25.0F));
+    CHECK_FALSE(scene.lightCastsShadows(h));
+    CHECK(scene.lightChannels(h) == 0x2U);
+}
+
+TEST_CASE("SpotLightDesc defaults (KHR-spec cone-angle defaults 0/PI-over-4) and field round-trip through "
+          "createSpotLight()") {
+    rx::scene::SpotLightDesc desc;
+    CHECK(desc.position == glm::vec3(0.0F, 0.0F, 0.0F));
+    CHECK(desc.dir == glm::vec3(0.0F, 0.0F, -1.0F));
+    CHECK(desc.colorCandela == glm::vec3(1.0F, 1.0F, 1.0F));
+    CHECK(desc.range == doctest::Approx(0.0F));
+    CHECK(desc.innerConeAngle == doctest::Approx(0.0F));
+    CHECK(desc.outerConeAngle == doctest::Approx(0.7853981634F).epsilon(0.0001));  // PI/4 [KHR spec default].
+
+    desc.position = glm::vec3(1.0F, 2.0F, 3.0F);
+    desc.dir = glm::normalize(glm::vec3(1.0F, -1.0F, 0.0F));
+    desc.colorCandela = glm::vec3(200.0F, 200.0F, 200.0F);
+    desc.range = 5.0F;
+    desc.innerConeAngle = 0.2F;
+    desc.outerConeAngle = 0.6F;
+    desc.channels = 0x9U;
+
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    rx::scene::LightHandle h = scene.createSpotLight(desc);
+    CHECK(scene.lightType(h) == rx::scene::LightType::Spot);
+    CHECK(scene.lightPosition(h) == glm::vec3(1.0F, 2.0F, 3.0F));
+    CHECK(scene.lightDirection(h).x == doctest::Approx(desc.dir.x));
+    CHECK(scene.lightDirection(h).y == doctest::Approx(desc.dir.y));
+    CHECK(scene.lightColorLux(h) == glm::vec3(200.0F, 200.0F, 200.0F));
+    CHECK(scene.lightRange(h) == doctest::Approx(5.0F));
+    CHECK(scene.lightInnerConeAngle(h) == doctest::Approx(0.2F));
+    CHECK(scene.lightOuterConeAngle(h) == doctest::Approx(0.6F));
+    CHECK(scene.lightChannels(h) == 0x9U);
+}
+
+TEST_CASE("Directional/Point/Spot lights coexist in Scene's own light storage, independently destroyable, "
+          "lightCount() exact [growing rx_scene lights to the charter's full punctual set, ticket #49's "
+          "own scope line]") {
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    rx::scene::LightHandle dir = scene.createDirectionalLight(rx::scene::DirectionalLightDesc{});
+    rx::scene::LightHandle point = scene.createPointLight(rx::scene::PointLightDesc{});
+    rx::scene::LightHandle spot = scene.createSpotLight(rx::scene::SpotLightDesc{});
+    CHECK(scene.lightCount() == 3);
+    CHECK(scene.lightType(dir) == rx::scene::LightType::Directional);
+    CHECK(scene.lightType(point) == rx::scene::LightType::Point);
+    CHECK(scene.lightType(spot) == rx::scene::LightType::Spot);
+
+    scene.destroyLight(point);
+    CHECK(scene.lightCount() == 2);
+    CHECK_FALSE(scene.isLightAlive(point));
+    CHECK(scene.isLightAlive(dir));
+    CHECK(scene.isLightAlive(spot));
+}
+
+// ---------------------------------------------------------------------
+// instantiateImportedLights() [Phase 5 Stage 2 Task 13, #49] -- converts
+// asset::LightData (already parsed+preserved since Phase 4, per
+// import_gltf.cpp's own KHR_lights_punctual extension parse) into real
+// Scene lights. This device-free TEST_CASE hand-builds LightData directly
+// (no GPU-backed importGltf() needed to exercise the CONVERSION logic
+// itself -- the real end-to-end fastgltf-parse-through-Scene path is
+// covered separately, GPU-backed, in
+// src/rx_asset/tests/import_gltf_gpu_test.cpp, reusing this exact
+// fixture's own committed asset -- assets/test/cube_lights_camera.gltf).
+// ---------------------------------------------------------------------
+
+TEST_CASE("instantiateImportedLights(): value-asserted decoded-value discipline -- EXACT candela/lux "
+          "pass-through (no unit conversion), position/direction derived from the node's own world "
+          "transform, KHR cone-angle defaults applied when absent [gate matrix 'Authored glTF punctual "
+          "lights arrive in the Scene with value-asserted intensities/cones' acceptance criterion]") {
+    std::vector<rx::asset::LightData> lights;
+
+    // Directional -- translated+rotated node (translation must NOT affect
+    // direction; only rotation does, per KHR spec). 90-degree rotation
+    // about +Y maps local (0,0,-1) to world (-1,0,0).
+    {
+        rx::asset::LightData ld;
+        ld.type = rx::asset::LightData::Type::Directional;
+        ld.color = glm::vec3(1.0F, 0.9F, 0.8F);
+        ld.intensity = 3.0F;
+        ld.worldTransform =
+            glm::translate(glm::mat4(1.0F), glm::vec3(100.0F, 200.0F, 300.0F)) *
+            glm::rotate(glm::mat4(1.0F), glm::radians(90.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+        lights.push_back(ld);
+    }
+    // Point -- translation only, no rotation; range PRESENT.
+    {
+        rx::asset::LightData ld;
+        ld.type = rx::asset::LightData::Type::Point;
+        ld.color = glm::vec3(1.0F, 0.0F, 0.0F);
+        ld.intensity = 1500.0F;  // candela [gate matrix's own worked example value].
+        ld.range = 10.0F;
+        ld.worldTransform = glm::translate(glm::mat4(1.0F), glm::vec3(2.0F, 3.0F, 4.0F));
+        lights.push_back(ld);
+    }
+    // Spot -- range/cone angles ABSENT (nullopt) -- must resolve to the
+    // KHR spec's own documented defaults, not zero/garbage.
+    {
+        rx::asset::LightData ld;
+        ld.type = rx::asset::LightData::Type::Spot;
+        ld.color = glm::vec3(0.0F, 1.0F, 0.0F);
+        ld.intensity = 200.0F;
+        ld.worldTransform = glm::translate(glm::mat4(1.0F), glm::vec3(5.0F, 6.0F, 7.0F));
+        // ld.range / innerConeAngle / outerConeAngle left std::nullopt.
+        lights.push_back(ld);
+    }
+
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, lights);
+    REQUIRE(handles.size() == 3);
+    CHECK(scene.lightCount() == 3);
+
+    // Directional: colorLux == color*intensity EXACTLY (lux, no
+    // conversion); direction reflects the 90-degree-about-Y rotation
+    // (translation has zero effect on direction).
+    CHECK(scene.lightType(handles[0]) == rx::scene::LightType::Directional);
+    const glm::vec3 dirColor = scene.lightColorLux(handles[0]);
+    CHECK(dirColor.x == doctest::Approx(3.0F));
+    CHECK(dirColor.y == doctest::Approx(2.7F));
+    CHECK(dirColor.z == doctest::Approx(2.4F));
+    const glm::vec3 dirDirection = scene.lightDirection(handles[0]);
+    CHECK(dirDirection.x == doctest::Approx(-1.0F).epsilon(0.001));
+    CHECK(dirDirection.y == doctest::Approx(0.0F).epsilon(0.001));
+    CHECK(dirDirection.z == doctest::Approx(0.0F).epsilon(0.001));
+
+    // Point: colorCandela == color*intensity EXACTLY (candela, no
+    // conversion -- the gate matrix's own "1500 candela imports as
+    // EXACTLY 1500.0, not 1500/(4*pi)" acceptance criterion); position ==
+    // translation; range == the PRESENT value (not the "absent" sentinel).
+    CHECK(scene.lightType(handles[1]) == rx::scene::LightType::Point);
+    const glm::vec3 pointColor = scene.lightColorLux(handles[1]);
+    CHECK(pointColor.x == doctest::Approx(1500.0F));
+    CHECK(pointColor.y == doctest::Approx(0.0F));
+    CHECK(pointColor.z == doctest::Approx(0.0F));
+    CHECK(scene.lightPosition(handles[1]) == glm::vec3(2.0F, 3.0F, 4.0F));
+    CHECK(scene.lightRange(handles[1]) == doctest::Approx(10.0F));
+
+    // Spot: range/cone-angle absence resolves to the KHR spec's own
+    // documented defaults (0 / PI/4), matching SpotLightDesc's own
+    // default-member-initializer values exactly -- NOT left at 0/0 (which
+    // would be a degenerate, always-fully-attenuated cone).
+    CHECK(scene.lightType(handles[2]) == rx::scene::LightType::Spot);
+    const glm::vec3 spotColor = scene.lightColorLux(handles[2]);
+    CHECK(spotColor.x == doctest::Approx(0.0F));
+    CHECK(spotColor.y == doctest::Approx(200.0F));
+    CHECK(spotColor.z == doctest::Approx(0.0F));
+    CHECK(scene.lightPosition(handles[2]) == glm::vec3(5.0F, 6.0F, 7.0F));
+    CHECK(scene.lightRange(handles[2]) == doctest::Approx(0.0F));  // absent -> "no configured range" sentinel.
+    CHECK(scene.lightInnerConeAngle(handles[2]) == doctest::Approx(0.0F));
+    CHECK(scene.lightOuterConeAngle(handles[2]) == doctest::Approx(0.7853981634F).epsilon(0.0001));
+}
+
+TEST_CASE("instantiateImportedLights(): empty input produces zero lights (no accidental default light "
+          "injected) -- discriminates against a scene with no embedded KHR_lights_punctual data (e.g. "
+          "Sponza) silently gaining a phantom light.") {
+    rx::scene::Scene scene(&fallbackShapedBounds);
+    std::vector<rx::scene::LightHandle> handles = rx::scene::instantiateImportedLights(scene, {});
+    CHECK(handles.empty());
+    CHECK(scene.lightCount() == 0);
+}
+
+// ---------------------------------------------------------------------
 // Environment [Phase 5 Task 10, #46, FG1 closure]
 // ---------------------------------------------------------------------
 

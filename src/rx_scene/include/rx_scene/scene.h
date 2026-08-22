@@ -218,12 +218,76 @@ struct LightRecord {
     bool operator==(const LightRecord&) const = default;
 };
 
-// The only light creation surface Phase 4 exposes publicly [D19; brief:
+// The only light creation surface Phase 4 exposed publicly [D19; brief:
 // "struct DirectionalLightDesc { glm::vec3 dir; glm::vec3 colorLux; bool
-// castsShadows; uint8_t channels = 0xFF; }"].
+// castsShadows; uint8_t channels = 0xFF; }"]. `colorLux` is illuminance
+// [KHR_lights_punctual README.md, Khronos glTF commit
+// 2b29723d025a995971726f2989697cdc49b1222a: "directional lights use
+// illuminance in lux (lm/m^2)... Because it is at an infinite distance,
+// the light is not attenuated"] -- `color * intensity`, never scaled by
+// distance anywhere downstream (standard_pbr.slang's own punctual term).
 struct DirectionalLightDesc {
     glm::vec3 dir{0.0F, -1.0F, 0.0F};
     glm::vec3 colorLux{1.0F, 1.0F, 1.0F};
+    bool castsShadows = true;
+    uint8_t channels = 0xFF;
+};
+
+// [Phase 5 Stage 2 Task 13, #49] Mirrors `DirectionalLightDesc`'s own
+// shape/conventions exactly (gate matrix's own recommendation -- "no new
+// pattern needed, the precedent is already in this same file"). `position`
+// is world-space [KHR spec: "the light's position is defined as the
+// node's world location"]. `colorCandela` is LUMINOUS INTENSITY [KHR spec:
+// "point... lights use luminous intensity in candela (lm/sr)"] --
+// `color * intensity`, in candela, NOT lux -- `Scene`'s own downstream
+// consumer (the shading equation, via `rx::scene::lightmath::
+// rangeAttenuation()`/standard_pbr.slang's ported twin) converts a
+// punctual light's candela intensity into a lux-equivalent irradiance
+// contribution at the shaded point via the inverse-square-law attenuation
+// term, exactly Filament's own `light.colorIntensity.rgb * light.
+// attenuation * NoL` composition (shaders/src/surface_light_punctual.fs,
+// google/filament v1.75.0 pinned commit
+// 0e58877c09afb1aacd09ff640f74d2adcd2a7e80) -- `colorCandela` itself is
+// NEVER unit-converted at creation time (no lumen->candela rescale: a
+// glTF `point`/`spot` light's own `intensity` number is ALREADY candela
+// by spec, see `instantiateImportedLights()`'s own header comment for the
+// "no conversion at import" acceptance criterion this satisfies).
+// `range <= 0.0` means "no configured range" -- pure inverse-square, no
+// windowing (`LightRecord::range`'s own pre-existing "0.0 = inert"
+// sentinel, scene.h's own LightRecord comment -- matches glTF's own
+// "range... undefined... assumed infinite" default exactly, and glTF-
+// Sample-Renderer's identical "negative range means unlimited" reading).
+struct PointLightDesc {
+    glm::vec3 position{0.0F, 0.0F, 0.0F};
+    glm::vec3 colorCandela{1.0F, 1.0F, 1.0F};
+    float range = 0.0F;
+    bool castsShadows = true;
+    uint8_t channels = 0xFF;
+};
+
+// [Phase 5 Stage 2 Task 13, #49] Mirrors `PointLightDesc`'s own shape,
+// adding `dir` (the spot's own FACING/travel direction -- glTF's local
+// -Z axis rotated by the node's world transform, SAME "light travel
+// direction" convention `DirectionalLightDesc::dir` already establishes)
+// and the KHR cone-angle pair. `colorCandela` -- KHR spec, quoted:
+// "Spot light intensity refers to the brightness inside the
+// innerConeAngle (and at the location of the light) and is defined in
+// candela" -- same unit/no-conversion convention as `PointLightDesc::
+// colorCandela` above; the CONE shapes the attenuation multiplicatively,
+// it does not rescale the base candela value.  `innerConeAngle`/
+// `outerConeAngle` default to the KHR spec's own documented defaults
+// (`0`/`PI/4` respectively, README.md's own light-shared-properties
+// table) so a caller that only cares about `outerConeAngle` (the spec's
+// own "engines that don't support two angles... use outerConeAngle...
+// leaving innerConeAngle to implicitly be 0" fallback) gets spec-correct
+// behavior without setting `innerConeAngle` explicitly.
+struct SpotLightDesc {
+    glm::vec3 position{0.0F, 0.0F, 0.0F};
+    glm::vec3 dir{0.0F, 0.0F, -1.0F};
+    glm::vec3 colorCandela{1.0F, 1.0F, 1.0F};
+    float range = 0.0F;
+    float innerConeAngle = 0.0F;
+    float outerConeAngle = 0.7853981633974483F;  // PI/4 [KHR spec default].
     bool castsShadows = true;
     uint8_t channels = 0xFF;
 };
@@ -278,14 +342,46 @@ struct EnvironmentDesc {
     // remap's own natural unit (standard_pbr.slang's own `roughness *
     // maxPrefilteredLod`).
     float maxPrefilteredLod = 0.0F;
-    // [T10's own "physical units" ruling -- see material.slang's own
-    // RxDrawData::envIntensity header comment for the full unit-convention
-    // rationale] Environment radiance/luminance in this scene's own
-    // documented physical-ish unit, PRE-EXPOSURE (i.e. NOT yet multiplied
-    // by `rx::scene::Camera::exposure()` -- a DrawDataGpu/RxSkyboxData
-    // PRODUCER applies that multiply once, per Task 4's own pre-exposure
-    // convention, the same point `lightColor`/`ambientColor` already
-    // apply it at). Default 1.0 -- a neutral, unscaled environment.
+    // [T10's own "physical units" ruling, RECONCILED by Phase 5 Stage 2
+    // Task 13, #49 -- the carried item T10's own gate matrix Open Question
+    // deferred here explicitly ("Task 13... is the documented
+    // reconciliation point")] A LUX-denominated scale factor applied to
+    // the baked environment's own (source-HDR-relative-scale) radiance --
+    // EXACTLY Filament's own `IndirectLight::Builder::intensity(float
+    // envIntensity)` contract, quoted verbatim: "Scale factor applied to
+    // the environment and irradiance such that the result is in lux, or
+    // lumen/m^2 (default = 30000)" (filament/include/filament/
+    // IndirectLight.h:227, google/filament v1.75.0 pinned commit
+    // 0e58877c09afb1aacd09ff640f74d2adcd2a7e80, fetched/quoted this task).
+    // This is the SAME lux unit `DirectionalLightDesc::colorLux` already
+    // claims and a punctual light's post-attenuation contribution resolves
+    // to (`PointLightDesc`/`SpotLightDesc`'s own candela, divided by
+    // distance^2 via `rx::scene::lightmath::rangeAttenuation()`) -- every
+    // one of these three producers feeds the IDENTICAL NdotL/IBL-weighted
+    // shading equation and is pre-exposed by the SAME single
+    // `rx::scene::Camera::exposure()` multiplier (Task 4's convention,
+    // applied once per producer, CPU-side, before upload) -- this is the
+    // "one coherent photometric story" the carried item required.
+    //
+    // DEFAULT (1.0) is DELIBERATELY NOT Filament's own real-world default
+    // (30000 lux, calibrated for an assumed-unscaled outdoor HDR capture
+    // under Filament's OWN artist workflow) -- RendererX's neutral-1.0
+    // default instead follows this codebase's own established regression-
+    // preserving convention (`Camera::exposureOverride`'s identical
+    // engaged-neutral-by-default resolution, Task 4/#40): "no additional
+    // scaling beyond whatever scale the source HDR/procedural fixture's
+    // own texels already encode". A caller that wants Filament's real
+    // photometric default passes `intensity = 30000.0F` explicitly
+    // (cited above) ALONGSIDE a properly configured `Camera` (real
+    // aperture/shutter/ISO or an EV100 override) -- the SAME pre-exposure
+    // pipeline already brings a real-lux-scale environment into a
+    // displayable range, exactly mirroring `exposureOverride`'s own
+    // documented "opt-in real photometric path" resolution. Every current
+    // producer (samples 08/09) keeps its own already-tuned, non-physical
+    // intensity value (1.0/0.4 respectively) UNCHANGED by this
+    // reconciliation -- it is a unit/documentation clarification, not a
+    // value change (see task-13-report.md's own "reconciliation" section
+    // for the full derivation and the empirical exposure-coherence proof).
     float intensity = 1.0F;
 };
 
@@ -428,12 +524,42 @@ public:
 
     // Main-thread-only (D5).
     [[nodiscard]] LightHandle createDirectionalLight(const DirectionalLightDesc& desc);
+    // [Phase 5 Stage 2 Task 13, #49] See `PointLightDesc`/`SpotLightDesc`'s
+    // own header comments for the unit convention (candela, KHR-spec-exact,
+    // no conversion applied here). Main-thread-only (D5).
+    [[nodiscard]] LightHandle createPointLight(const PointLightDesc& desc);
+    [[nodiscard]] LightHandle createSpotLight(const SpotLightDesc& desc);
     void destroyLight(LightHandle handle);
     void setLightChannels(LightHandle handle, uint8_t channels);
 
     [[nodiscard]] bool isLightAlive(LightHandle handle) const;
+    [[nodiscard]] LightType lightType(LightHandle handle) const;
+    // Directional/Spot: the light's own facing/travel direction. Point:
+    // `LightRecord`'s own inert default (unused -- a point light emits
+    // uniformly in every direction).
     [[nodiscard]] glm::vec3 lightDirection(LightHandle handle) const;
+    // Point/Spot only: world-space position [KHR spec]. Directional:
+    // `LightRecord`'s own inert default (unused -- a directional light has
+    // no position, only a direction).
+    [[nodiscard]] glm::vec3 lightPosition(LightHandle handle) const;
+    // Directional: illuminance, lux (`color*intensity`). Point/Spot:
+    // luminous intensity, candela (`color*intensity`) -- see
+    // `DirectionalLightDesc`/`PointLightDesc`/`SpotLightDesc`'s own header
+    // comments for the full unit citation. The FIELD NAME stays
+    // `colorLux` for the underlying `LightRecord` storage (pre-existing,
+    // load-bearing since Phase 4) -- this accessor's own name/doc comment
+    // is what actually documents the per-type unit; callers that need the
+    // unit-neutral phrase use `lightColorLux()` unchanged.
     [[nodiscard]] glm::vec3 lightColorLux(LightHandle handle) const;
+    // Point/Spot only: KHR-spec range-property radius. `0.0` == "no
+    // configured range" (pure inverse-square, unwindowed) -- see
+    // `PointLightDesc::range`'s own header comment. Directional: always 0
+    // (unused; a directional light is never attenuated by distance).
+    [[nodiscard]] float lightRange(LightHandle handle) const;
+    // Spot only: KHR cone angles, radians. Directional/Point: `LightRecord`'s
+    // own inert defaults (unused).
+    [[nodiscard]] float lightInnerConeAngle(LightHandle handle) const;
+    [[nodiscard]] float lightOuterConeAngle(LightHandle handle) const;
     [[nodiscard]] bool lightCastsShadows(LightHandle handle) const;
     [[nodiscard]] uint8_t lightChannels(LightHandle handle) const;
     [[nodiscard]] size_t lightCount() const;
@@ -514,5 +640,59 @@ private:
     // a handle-pool column (see EnvironmentDesc's own singleton rationale).
     std::optional<EnvironmentDesc> environment_;
 };
+
+// [Phase 5 Stage 2 Task 13, #49] Converts every `asset::LightData` an
+// import produced (`ImportedScene::lights` -- parsed and preserved since
+// Phase 4, per `import_gltf.cpp`'s own KHR_lights_punctual extension
+// parse, but never before consumed anywhere in this engine -- the gate
+// matrix's own grep-verified finding) into a real `Scene` light via the
+// matching `create{Directional,Point,Spot}Light()` call.
+//
+// UNIT CONVERSION: NONE. A glTF `LightData::intensity` value is ALREADY in
+// its type's own KHR-spec-correct target unit (lux for directional,
+// candela for point/spot -- README.md: "The intensity represents the
+// luminous intensity that the light would emit if it were colored pure
+// white") -- this is a straight `color * intensity` pass-through per
+// light, never a lumen->candela rescale (that conversion, Filament's own
+// `LightManager::setIntensity(intensity, IntensityUnit::LUMEN_LUX)`
+// formula, exists for a DIFFERENT, lumens-denominated AUTHORING surface
+// Filament itself exposes -- not glTF import, where the file's own number
+// is already the correct unit; see the gate matrix's own "no lumen->
+// candela conversion at import" row for the full citation).
+//
+// POSITION/DIRECTION derivation from `LightData::worldTransform` [KHR
+// spec: "For light types that have a position (point and spot lights),
+// the light's position is defined as the node's world location. For light
+// types that have a direction (directional and spot lights), the light's
+// direction is defined as the 3-vector (0.0, 0.0, -1.0) and the rotation
+// of the node orients the light accordingly"]: `position` is the
+// transform's own translation column; `direction` is the transform's own
+// upper-left 3x3 (rotation, ignoring translation/scale per the spec's own
+// "an untransformed light points down the -Z axis" text) applied to
+// local (0,0,-1), normalized.
+//
+// CONE ANGLES: `LightData::innerConeAngle`/`outerConeAngle` are
+// `std::optional<float>` (import_gltf.cpp only sets them `if
+// (light.innerConeAngle)`/`if (light.outerConeAngle)`, i.e. absent when
+// the source glTF omits them) -- `std::nullopt` maps to the KHR spec's
+// own documented defaults (`0`/`PI/4` respectively), matching
+// `SpotLightDesc`'s own default-member-initializer values exactly (a
+// caller that never touches this function's own optional-unwrapping gets
+// the SAME defaults either way).
+//
+// RANGE: `LightData::range`'s `std::nullopt` (absent in the source glTF)
+// maps to `PointLightDesc::range`/`SpotLightDesc::range`'s own `0.0F`
+// "no configured range" sentinel -- see either struct's own header
+// comment.
+//
+// Returns one `LightHandle` per input light, in the SAME order as
+// `lights` (index-parallel) -- a caller that needs to correlate a created
+// light back to its source `LightData` (e.g. to pick "the first imported
+// directional light" as a production main-light slot) can zip the two
+// spans directly.
+//
+// Main-thread-only (D5) -- forwards to `scene`'s own main-thread-only
+// create*Light() methods, no additional state of its own.
+[[nodiscard]] std::vector<LightHandle> instantiateImportedLights(Scene& scene, std::span<const asset::LightData> lights);
 
 }  // namespace rx::scene

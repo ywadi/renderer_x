@@ -116,7 +116,13 @@ add_executable(rx_asset_gltf_gpu_tests
     draco_compression_test.cpp
 )
 target_include_directories(rx_asset_gltf_gpu_tests PRIVATE ..)
-target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
+# [Phase 5 Stage 2 Task 13, #49] rx_scene: import_gltf_gpu_test.cpp's own
+# import-consumption TEST_CASE calls rx::scene::instantiateImportedLights()
+# against a REAL registry.importGltf() result -- the SAME
+# "one file's own TEST_CASE needs a normally-unrelated library link"
+# precedent test_standard_pbr_unlit.cpp's own pre-exposure TEST_CASE
+# already established for rx_material_gpu_tests' rx_scene link (Task 4).
+target_link_libraries(rx_asset_gltf_gpu_tests PRIVATE rx_asset rx_scene rx_rhi_vk rx_platform rx_task fastgltf::fastgltf doctest::doctest)
 target_compile_definitions(rx_asset_gltf_gpu_tests PRIVATE
     RX_ASSET_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     RX_ASSET_ROOT_DIR="${CMAKE_SOURCE_DIR}"
