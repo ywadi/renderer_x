@@ -227,28 +227,41 @@ struct Args {
     // EnvironmentDesc's own default.
     float envIntensity = 1.0F;
 
-    // [Phase 5 Task 12, #48, Stage 1 checkpoint] `--bench-frames <n>` --
-    // headless-only steady-state frame-time benchmark, run AFTER the
-    // scene has loaded and the environment has baked (runHeadless()'s own
-    // post-D17-gate tail): re-executes `graph` (the SAME forward+skybox+
-    // tonemap pass chain the D17-gated frames already ran) `n` times via
-    // the existing offscreen `captureFrame()`-style submit-and-wait path,
-    // timing each iteration's own wall-clock duration, and logs an
-    // aggregate `sample08: perf frame_bench ...` stats line -- this
-    // sample's own established greppable-stats-line convention (the
-    // "sample08: perf ibl_bake"/"sample08: perf scene=..." lines
-    // above/below both already establish it). 0 (the default) disables
-    // the benchmark entirely -- zero cost to the D17 gate's own two-frame
-    // capture, matching every other sample's own "additive, opt-in via a
-    // dedicated flag" benchmark convention (07_stress's own `--draws`,
-    // 09_scene's own `--stress`). OFFSCREEN, not vsync-gated present-mode
-    // timing -- same "prefer headless measurement" posture this whole
-    // phase's own verification conventions call for (gate ruling
-    // rulings-2026-08-20.md RC7); the number this produces is CPU-record +
-    // GPU-submit-and-wait wall time per iteration, not a real swapchain
-    // frame-pacing measurement -- task-12-report.md's own numbers section
-    // states this methodology explicitly rather than letting the term
-    // "frame time" imply vsync pacing that never happened.
+    // [Phase 5 Task 12, #48, Stage 1 checkpoint; fix round 1 -- the
+    // measured-window rewrite task-12-report.md's own "Fix round 1"
+    // section documents] `--bench-frames <n>` -- headless-only
+    // steady-state frame-time benchmark, run AFTER the scene has loaded
+    // and the environment has baked (runHeadless()'s own post-D17-gate
+    // tail): re-executes `graph` (the SAME forward+skybox+tonemap pass
+    // chain the D17-gated frames already ran) `n` times and logs an
+    // aggregate `sample08: perf frame_bench ...` stats line with TWO
+    // DISTINCT, SEPARATELY-LABELED timed windows per iteration (never
+    // conflated into one number):
+    //   - `cpu_record_{avg,min,p95,max}_ms` -- the HEADLINE metric, timed
+    //     around ONLY `executor->execute()` inside `captureFrame()`'s own
+    //     `runOnce()` record callback (NOT the `vkQueueSubmit`/
+    //     `vkQueueWaitIdle` that call also performs) -- the SAME
+    //     "cpu_record_ms" metric samples/07_stress's and samples/09_scene's
+    //     own runHeadless() publish, directly comparable to theirs [gate
+    //     ruling #15's own A/B comparability contract].
+    //   - `full_{avg,min,p95,max}_ms` -- the WHOLE `captureFrame()` call:
+    //     record + submit-and-wait, THEN a SECOND submit-and-wait for the
+    //     `vkCmdCopyImageToBuffer` readback, a freshly allocated
+    //     host-visible buffer, `invalidate()`, and a full `memcpy` --
+    //     real cost this sample's own headless capture path pays, kept as
+    //     an explicitly-separate secondary figure, never presented as
+    //     "frame time" unqualified (a review round's own instrumented
+    //     measurement found this readback machinery is 88% of the
+    //     previous, undifferentiated published number for the sample's
+    //     own default DamagedHelmet scene on a real NVIDIA driver -- see
+    //     task-12-report.md).
+    // 0 (the default) disables the benchmark entirely -- zero cost to the
+    // D17 gate's own two-frame capture, matching every other sample's own
+    // "additive, opt-in via a dedicated flag" benchmark convention
+    // (07_stress's own `--draws`, 09_scene's own `--stress`). OFFSCREEN,
+    // not vsync-gated present-mode timing -- same "prefer headless
+    // measurement" posture this whole phase's own verification
+    // conventions call for (gate ruling rulings-2026-08-20.md RC7).
     uint32_t benchFrames = 0;
 };
 
@@ -2737,9 +2750,32 @@ int runHeadless(const Args& args) {
 
     // Captures one frame's worth of `graph`'s own execution into a
     // canonical-RGBA8 pixel buffer -- empty (logged) on any failure.
-    auto captureFrame = [&]() -> std::vector<uint8_t> {
-        cmdCtx->runOnce(
-            [&](VkCommandBuffer cmd) { app->executor->execute(graph, cmd, offscreenImage, offscreenView, extent); });
+    // [Phase 5 Task 12, #48, fix round 1] `recordMsOut`, when non-null, is
+    // set to the wall-clock time of ONLY the `executor->execute()` call --
+    // the SAME "cpu_record_ms" metric samples/07_stress's and
+    // samples/09_scene's own runHeadless() publish (timed around ONLY that
+    // call, NOT the readback that follows -- see either sample's own
+    // identical comment), so this sample's own `--bench-frames` number is
+    // now directly comparable to theirs [gate ruling #15's own A/B
+    // comparability contract]. The review round's own instrumented-build
+    // finding is why this parameter exists: the FULL `captureFrame()` call
+    // (record + submit + wait, THEN a second submit+wait for the
+    // `vkCmdCopyImageToBuffer` readback, a fresh host-visible buffer
+    // allocation, `invalidate()`, and a full `memcpy`) is dominated by that
+    // second half for a small scene (88% of the published number for the
+    // default DamagedHelmet scene on a real NVIDIA driver) -- publishing
+    // that undifferentiated total as "frame time" both contradicted this
+    // codebase's own established convention and buried the actual render
+    // cost signal under fixed per-iteration readback machinery cost.
+    auto captureFrame = [&](double* recordMsOut = nullptr) -> std::vector<uint8_t> {
+        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
+            const auto recordStart = std::chrono::steady_clock::now();
+            app->executor->execute(graph, cmd, offscreenImage, offscreenView, extent);
+            if (recordMsOut != nullptr) {
+                *recordMsOut =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recordStart).count();
+            }
+        });
 
         auto readback =
             app->allocator->createHostVisibleBuffer(kHeadlessPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -2933,40 +2969,85 @@ int runHeadless(const Args& args) {
         }
     }
 
-    // --- --bench-frames <n> [Phase 5 Task 12, #48, Stage 1 checkpoint] --
-    // see Args::benchFrames' own comment for the exact methodology this
-    // publishes. Runs AFTER the HUD smoke-test frame above (so the bench
-    // loop's own repeated `beginFrame()`+`captureFrame()` calls draw no
-    // widgets -- an empty HUD pass costs a fixed, tiny amount of recorded-
-    // but-empty command-buffer work per iteration, not a growing one,
-    // matching the D17-gated frames' own "no widgets" cost shape) and
-    // AFTER the "sample08: perf scene=..." cold-start line above, so a
-    // reader greps one process's own log top-to-bottom in the natural
-    // "cold start, then steady state" order. No-op (0 iterations logged)
-    // when the scene never became ready.
+    // --- --bench-frames <n> [Phase 5 Task 12, #48, Stage 1 checkpoint;
+    // fix round 1 -- see task-12-report.md's own "Fix round 1" section for
+    // the review finding this responds to] -- see Args::benchFrames' own
+    // comment for the exact methodology this publishes. Runs AFTER the HUD
+    // smoke-test frame above (so the bench loop's own repeated
+    // `beginFrame()`+`captureFrame()` calls draw no widgets -- an empty HUD
+    // pass costs a fixed, tiny amount of recorded-but-empty command-buffer
+    // work per iteration, not a growing one, matching the D17-gated
+    // frames' own "no widgets" cost shape) and AFTER the
+    // "sample08: perf scene=..." cold-start line above, so a reader greps
+    // one process's own log top-to-bottom in the natural "cold start, then
+    // steady state" order. No-op (0 iterations logged) when the scene
+    // never became ready.
+    //
+    // TWO published metrics, per iteration, both from the SAME capture
+    // (never re-rendered twice): `cpu_record` is `captureFrame()`'s own
+    // `recordMsOut` -- timed around ONLY `executor->execute()`, the
+    // directly-comparable "cpu_record_ms" metric samples/07_stress's and
+    // samples/09_scene's own runHeadless() publish (that lambda's own
+    // header comment has the full citation) -- THIS is the headline
+    // Stage-1 frame-time number. `full` is the previous, WHOLE-call wall
+    // clock (record + submit-and-wait + a second submit-and-wait for the
+    // readback + host-visible-buffer allocation + memcpy) -- kept as a
+    // clearly-separate, clearly-labeled secondary figure (a real cost this
+    // sample's own headless capture path pays, just not "render time"),
+    // never conflated with `cpu_record` again.
     if (app->sceneReady && args.benchFrames > 0) {
-        std::vector<double> iterationMs;
-        iterationMs.reserve(args.benchFrames);
+        std::vector<double> recordMsSamples;
+        std::vector<double> fullMsSamples;
+        recordMsSamples.reserve(args.benchFrames);
+        fullMsSamples.reserve(args.benchFrames);
         for (uint32_t i = 0; i < args.benchFrames; ++i) {
             const auto iterStart = std::chrono::steady_clock::now();
             app->overlay->beginFrame();  // no widgets -- steady-state cost only, matching the D17-gated frames.
-            std::vector<uint8_t> benchPixels = captureFrame();
-            iterationMs.push_back(
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - iterStart).count());
+            double recordMs = 0.0;
+            std::vector<uint8_t> benchPixels = captureFrame(&recordMs);
+            const double fullMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - iterStart).count();
             if (benchPixels.empty()) {
                 RX_LOG_ERROR("sample_08_gltf_viewer: --bench-frames iteration {} capture failed", i);
                 gateOk = false;
                 break;
             }
+            recordMsSamples.push_back(recordMs);
+            fullMsSamples.push_back(fullMs);
         }
-        if (!iterationMs.empty()) {
-            const double sum = std::accumulate(iterationMs.begin(), iterationMs.end(), 0.0);
-            const double avg = sum / static_cast<double>(iterationMs.size());
-            const auto [minIt, maxIt] = std::minmax_element(iterationMs.begin(), iterationMs.end());
+        // p95: nearest-rank on a SORTED COPY (never mutates the
+        // insertion-order vectors above, in case a future caller wants the
+        // per-iteration series itself) -- rank = `ceil(0.95 * N)`, 1-based,
+        // clamped to `[1, N]`, the same nearest-rank convention most
+        // published frame-time percentiles use for a small, finite sample
+        // count.
+        auto percentile95 = [](std::vector<double> samples) -> double {
+            if (samples.empty()) {
+                return 0.0;
+            }
+            std::sort(samples.begin(), samples.end());
+            size_t rank = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(samples.size())));
+            rank = std::clamp<size_t>(rank, 1, samples.size());
+            return samples[rank - 1];
+        };
+        if (!recordMsSamples.empty()) {
+            const double recordSum = std::accumulate(recordMsSamples.begin(), recordMsSamples.end(), 0.0);
+            const double recordAvg = recordSum / static_cast<double>(recordMsSamples.size());
+            const auto [recordMinIt, recordMaxIt] = std::minmax_element(recordMsSamples.begin(), recordMsSamples.end());
+            const double recordP95 = percentile95(recordMsSamples);
+
+            const double fullSum = std::accumulate(fullMsSamples.begin(), fullMsSamples.end(), 0.0);
+            const double fullAvg = fullSum / static_cast<double>(fullMsSamples.size());
+            const auto [fullMinIt, fullMaxIt] = std::minmax_element(fullMsSamples.begin(), fullMsSamples.end());
+            const double fullP95 = percentile95(fullMsSamples);
+
             RX_LOG_INFO(
-                "sample08: perf frame_bench scene='{}' env='{}' frames={} avg_ms={:.3f} min_ms={:.3f} max_ms={:.3f}",
+                "sample08: perf frame_bench scene='{}' env='{}' frames={} "
+                "cpu_record_avg_ms={:.3f} cpu_record_min_ms={:.3f} cpu_record_p95_ms={:.3f} cpu_record_max_ms={:.3f} "
+                "full_avg_ms={:.3f} full_min_ms={:.3f} full_p95_ms={:.3f} full_max_ms={:.3f}",
                 scenePath.string(), app->environmentPath.empty() ? "none" : app->environmentPath,
-                iterationMs.size(), avg, *minIt, *maxIt);
+                recordMsSamples.size(), recordAvg, *recordMinIt, recordP95, *recordMaxIt, fullAvg, *fullMinIt, fullP95,
+                *fullMaxIt);
         }
     }
 

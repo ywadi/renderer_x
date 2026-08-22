@@ -36,16 +36,25 @@ step involved:
 06_materials/
   sample_06_materials[.exe]        # + materials/checker.slang,
                                     #   materials/rim.slang, +
-                                    #   material_shaders/material.slang,
-                                    #   material_shaders/forward_entry.slang
-                                    #   (rx_material's own shared files), the
-                                    #   Slang runtime libs below, and LICENSE
+                                    #   material_shaders/{material,
+                                    #   forward_entry}.slang (rx_material's
+                                    #   own shared files) +
+                                    #   material_shaders/{brdf,
+                                    #   energy_compensation_off,
+                                    #   energy_compensation_on}.slang
+                                    #   (MaterialSystem::create() requires
+                                    #   these unconditionally -- see this
+                                    #   sample's own Redistribution section
+                                    #   below), the Slang runtime libs
+                                    #   below, and LICENSE
 07_stress/
   sample_07_stress[.exe]           # + shaders/stress/*.slang (4 files), the
                                     #   Slang runtime libs below, and LICENSE
 08_gltf_viewer/
   sample_08_gltf_viewer[.exe]      # + material_shaders/{material,
-                                    #   forward_entry,standard_pbr,unlit}.slang,
+                                    #   forward_entry,standard_pbr,unlit,
+                                    #   brdf,energy_compensation_off,
+                                    #   energy_compensation_on}.slang,
                                     #   tonemap.{vert,frag}.slang,
                                     #   ibl_shaders/{equirect_to_cubemap,
                                     #   irradiance_convolve,prefilter_specular,
@@ -56,12 +65,28 @@ step involved:
                                     #   assets/DamagedHelmet/glTF/ (+ its own
                                     #   LICENSE.txt), the Slang runtime libs
                                     #   below, and LICENSE
+09_scene/
+  sample_09_scene[.exe]            # + material_shaders/{material,
+                                    #   forward_entry,standard_pbr,unlit,
+                                    #   brdf,energy_compensation_off,
+                                    #   energy_compensation_on}.slang,
+                                    #   shadow_shaders/shadow_caster.vert.slang,
+                                    #   ibl_shaders/{equirect_to_cubemap,
+                                    #   irradiance_convolve,prefilter_specular,
+                                    #   dfg_lut}.slang (no skybox.slang --
+                                    #   this sample renders no skybox pass),
+                                    #   environments/gate_test_env.hdr,
+                                    #   tonemap.{vert,frag}.slang,
+                                    #   references/grid_scene.png, a
+                                    #   pre-staged assets/DamagedHelmet/glTF/
+                                    #   (+ its own LICENSE.txt), the Slang
+                                    #   runtime libs below, and LICENSE
 ```
 
 `01_triangle` is the one exception to "needs the Slang runtime libs": its
 shaders are precompiled offline by `slangc` at build time, so it ships only
 its two `.spv` files and nothing Slang-related at all [D2] — see its own
-"Redistribution" section below. The other seven do real in-process Slang
+"Redistribution" section below. The other eight do real in-process Slang
 compilation at startup, so each of their directories additionally carries
 `libslang-compiler.so*`/`slang-compiler.dll` plus the `slang-glslang`/
 `slang-glsl-module`/`slang-rt` plugins it dlopens on demand, and the Slang
@@ -738,6 +763,69 @@ standalone-unzipped-copy verification (see `08_gltf_viewer`'s own
 Redistribution section below for the sibling gap that verification pass
 actually set out to check).
 
+## 07_stress
+
+`samples/07_stress/main.cpp` — Phase 4 Stage 0's own exit sample and this
+codebase's parallel-recording benchmark: `--draws N` (default 30000)
+procedural instanced objects (4 mesh/pipeline-state variants, never real
+GPU instancing — each is its own `vkCmdDrawIndexed` call, deliberately, so
+CPU recording cost scales with draw count), laid out on a non-overlapping
+XZ grid under a fixed orthographic top-down camera (no orbit — both the
+static camera and the once-computed, never-re-uploaded instance data are
+deliberate: recomputing either per frame would conflate that cost with the
+one thing this sample measures), drawn through a CHUNKED forward pass
+(`Pass::setExecuteChunked()`) + the same `shaders/multipass/tonemap.*`
+shared shaders every other multi-pass sample reuses.
+
+**`--threads N`** is the sample's own measurement instrument (not an
+engine-wide switch — `docs/threading.md`): it overrides this sample's own
+`Scheduler`'s worker count, which the executor's chunk-count derivation
+self-scales to. `--threads 1` collapses the forward pass to one chunk
+(the serial baseline); the default (no `--threads`) uses
+`hardware_concurrency() - 1` workers (the parallel side of the same A/B
+comparison). This is the mechanism `MANUAL_VERIFICATION.md`'s/CI's own
+single-thread-vs-default-worker-count stress numbers come from.
+
+- **Headless (default, no flags)** — the `ctest` correctness gate
+  (`sample_07_stress_headless`, `--draws 16` — small on purpose, see this
+  sample's own CMakeLists.txt comment): fixed 3 frames, exact
+  draws-submitted/chunk-count/pool-allocation-budget counters, plus four
+  dominance-style analytic pixel probes (one per mesh/pipeline variant),
+  channel-order-exact against the real backbuffer format.
+- **`--draws N`** (default 30000) — instance count; the same flag CI's own
+  stress-numbers steps pass at 30000.
+- **`--threads N`** — worker-count override, described above.
+- **`--present`** — opens a real window rendering the same instanced
+  field continuously, logging a live `stress: fps=... cpu_record_ms=...
+  draws=...` line. Not part of `ctest` — see `MANUAL_VERIFICATION.md`.
+- **`--vsync on|off`** / **`--fullscreen`** — same present-mode controls as
+  every other sample above.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] stress: frame=0 threads=1 cpu_record_ms=... draws=16 chunkCount=1 poolAllocations=...
+[info] sample_07_stress: variant 0 probe world=(...) pixel=(...) ...
+[info] stress headless gate PASSED
+```
+
+**`--present` mode** opens a window showing the full instanced field from
+directly above, logging `stress: fps=... cpu_record_ms=... draws=...`
+roughly once a second; closing it exits with status 0.
+
+### Redistribution
+
+Slang runtime libs + LICENSE, plus `shaders/stress/*.slang` (4 on-disk
+sources: `instanced.{vert,frag}.slang`, `tonemap.{vert,frag}.slang`) —
+no other external asset, since every mesh/instance transform is procedural
+and uploaded by this sample itself, never loaded from disk.
+`tools/package_samples.sh` stages exactly these; unaffected by the Task 12
+packaging fixes above (this sample never links `MaterialSystem`/
+`standard_pbr.slang` at all, so it was never exposed to the
+`brdf.slang`/`energy_compensation_*` gap those fixes closed).
+
 ## 08_gltf_viewer
 
 `samples/08_gltf_viewer/main.cpp` — the **Phase 5 Stage 1 demonstrator**
@@ -918,6 +1006,88 @@ substitute for the actual grant). Verified directly: this sample's
 packaged `.zip` output, unzipped to a directory outside the build tree
 entirely, passes its own headless gate unmodified, and both license texts
 extract byte-identical to their vendored source.
+
+## 09_scene
+
+`samples/09_scene/main.cpp` — the Phase 4 phase-exit sample: the first
+real production consumer of `rx::scene::Scene`/`DrawListBuilder`/
+`rx_debug_ui::Overlay`/the Task 20 platform input surface outside their
+own test suites. Default scene: a 4x4 instanced DamagedHelmet grid (one
+real glTF import, 16 `Scene::createRenderable()` calls, genuine GPU-side
+instancing — `instanceCount > 1` in a single `vkCmdDrawIndexed`, the first
+consumer of that path in this codebase). Frustum + shadow-caster culling
+and instancing collapse run for real every frame; a fitted-ortho shadow
+map (`rx_shadow`) lights the grid. Since Task 10 (#46), the default
+environment fixture is baked and bound the same way `08_gltf_viewer`'s
+own default is (real IBL, no skybox pass here — `08` is the one that
+renders a skybox).
+
+**Fly-through camera** (`--present`): WASD + relative-mouse-mode look +
+gamepad (left stick move, right stick look, triggers = speed multiplier) —
+the Task 20 input surface's own first real consumer. **HUD** (ImGui, via
+`rx_debug_ui::Overlay`): frame time/FPS, cull counters
+(candidates/culled/visible/collapse ratio), a vsync checkbox, per-row
+layer-mask visibility toggles + a light-channel demo toggle, `GeometryPool`
+pool stats, and the D24 per-category memory report — the established HUD
+`08_gltf_viewer`'s own environment/exposure readout (Task 12, #48) now
+follows the same `rx_debug_ui::Overlay` pattern.
+
+- **Headless (default, no flags)** — the `ctest` correctness gate
+  (`sample_09_scene_headless`): exact cull-counter assertions (matrix row
+  24) against the deterministic layer-mask split described in this file's
+  own header comment, plus a D17 tolerance gate against the committed
+  `references/grid_scene.png`, plus a shadow-on-vs-forced-off
+  discrimination re-proof.
+- **`--stress` / `--stress-draws N`** (`sample_09_scene_stress_headless`,
+  64 draws) — STRESS-V2: a self-contained, Registry-free procedural
+  instanced field (4 Unlit material variants) through the same
+  Scene/DrawListBuilder/chunked-executor path, directly A/B-comparable to
+  `07_stress`'s own `cpu_record_ms` numbers (same metric, same
+  methodology) — CI's own stress-numbers steps run this at 30000 draws,
+  single-thread and default-worker-count.
+- **`--scene sponza`** — present-mode-only override to the fetched Sponza
+  asset (`tools/fetch_assets.sh --sponza`; never CI-fetched).
+- **`--threads N`** / **`--vsync on|off`** / **`--fullscreen`** — same
+  conventions as `07_stress`/every earlier sample.
+- **`--present`** — opens a real window; Esc toggles mouse-capture
+  release/recapture, F11 toggles fullscreen. Not part of `ctest` — see
+  `MANUAL_VERIFICATION.md`.
+
+### Expected output
+
+**Headless mode**:
+
+```
+[info] sample_09_scene: D17 grid_scene gate: failingPixels=0/65536 (0.0000%) pass=true
+[info] sample_09_scene: headless gate PASSED
+```
+
+**`--present` mode** opens a window showing the helmet grid (or Sponza,
+under `--scene sponza`) under real IBL + shadowing, with the HUD panel
+described above in the top-left. Closing the window exits with status 0
+and logs `sample_09_scene: window closed cleanly`.
+
+### Redistribution
+
+`material_shaders/` (`material.slang`/`forward_entry.slang`/
+`standard_pbr.slang`/`unlit.slang`/`brdf.slang`/
+`energy_compensation_{off,on}.slang` — the last three closed by Task 12,
+#48, the same gap `06_materials`'/`08_gltf_viewer`'s own Redistribution
+sections above describe) + `shadow_shaders/shadow_caster.vert.slang` +
+`ibl_shaders/`+`environments/gate_test_env.hdr` (also closed by Task 12 —
+this sample's own environment binding silently degraded to zero indirect
+lighting in every redistributed copy before that fix) + the shared
+tonemap shaders + the committed `references/grid_scene.png` + a pre-staged
+DamagedHelmet asset (same dual-license attribution as `08_gltf_viewer`'s
+own copy) + Slang runtime libs + LICENSE. Sponza/Workshop are ALSO staged
+temporarily (owner directive, pre-go-live only — see
+`tools/package_samples.sh`'s own header comment; Workshop is
+skip-if-absent, Sponza is not). Verified directly (Task 12, #48): this
+sample's packaged `.zip` output, unzipped outside the build tree, passes
+its own headless gate unmodified and bakes its environment from the
+unzipped copy's own path (not a dev-tree fallback) on both `linux-native`
+and, independently re-verified by this round's review, `windows-cross-zig`
+under a live Wine execution.
 
 ## Building and running
 
