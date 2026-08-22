@@ -1,0 +1,460 @@
+30c4b56 fix(rx_asset): root-cause the async-import wall-clock stall-detector flake (issue #76)
+
+ src/rx_asset/tests/async_import_test.cpp | 282 ++++++++++++++++++++++++-------
+ 1 file changed, 218 insertions(+), 64 deletions(-)
+
+diff --git a/src/rx_asset/tests/async_import_test.cpp b/src/rx_asset/tests/async_import_test.cpp
+index 46064c5..349dc18 100644
+--- a/src/rx_asset/tests/async_import_test.cpp
++++ b/src/rx_asset/tests/async_import_test.cpp
+@@ -4,20 +4,21 @@
+ #include <rx_asset/texture_cache.h>
+ #include <rx_rhi_vk/bindless.h>
+ #include <rx_rhi_vk/deletion_queue.h>
+ #include <rx_rhi_vk/device.h>
+ #include <rx_rhi_vk/upload.h>
+ #include <rx_platform/window.h>
+ #include <rx_task/scheduler.h>
+ #include <atomic>
+ #include <chrono>
+ #include <cstring>
++#include <ctime>
+ #include <filesystem>
+ #include <fstream>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+ #include <thread>
+ #include <vector>
+ 
+ // async_import_test.cpp -- Registry::importGltfAsync() coverage [Phase 4
+ // Stage 1 Task 15, spec D5/D18-RC6/D24/D25, gate matrix-issue22 as amended
+@@ -879,159 +880,304 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
+     // failure mode: whatever contention regime is present immediately
+     // before OR immediately after the loop is now used, and a lucky-quiet
+     // instant on one side no longer solely determines the ceiling. This
+     // can only RAISE the derived ceiling relative to the single-BEFORE-
+     // sample formula it replaces (max() of two nonnegative samples >= the
+     // first alone) -- strictly more permissive under contention, never
+     // less sensitive to a real blocking-wait regression (see the
+     // BLOCKING-DEFECT signature below, ~4x further away than this
+     // widening could plausibly close).
+     //
+-    // MULTIPLIER DERIVATION (measured, not guessed -- 3 measurement sets,
+-    // 22 total runs, constrained repro: taskset -c 0,1 + LP_NUM_THREADS=1
+-    // + forced lavapipe, matching CI's own 2-vCPU/software-rasterizer
+-    // class; full per-run numbers in wine-segfault-fix-report.md's own
+-    // addendum):
+-    //   1. LEGIT max (this exact gate, 22 runs across two batches -- 12
+-    //      WALL-CLOCK-only + 10 full-suite): in-loop max pumpMain()
+-    //      duration 9166-10288us (worst observed: 10288us).
+-    //   2. CALIBRATION baseline (this exact probe, same 22 runs):
+-    //      5634-6202us. Worst-case per-run ratio (legit max / calibration,
+-    //      SAME run): 1.771x -- i.e. a real single-texture registration on
+-    //      this class of hardware can cost up to ~1.77x this calibration
+-    //      op.
+-    //   3. BLOCKING-DEFECT signature (scratch worktree, pre-RC6 whole-
+-    //      batch shape reintroduced -- the same revert shape as Task
+-    //      11/15's own evidence: marshalGltfImportPrepareStep()'s early
+-    //      `return true` after ONE texture slot removed, so all 5 real
+-    //      textures register in a single call -- 5 runs): 39399-40812us
+-    //      (worst case toward a tight margin: 39399us, the SMALLEST
+-    //      observed).
+-    //   Total available separation (blocking / legit) on this hardware
+-    //   class is ~3.8-4.0x (39399/10288 = 3.83) -- NOT the order-of-
+-    //   magnitude RC6's original prose assumed, so a strict >=2x margin on
+-    //   BOTH sides simultaneously is only barely mathematically possible
+-    //   (2x * 2x = 4x) and leaves zero slack against the worst-case
+-    //   numbers above -- this is the coordinator-anticipated "bands
+-    //   overlap" outcome for a naive FIXED threshold in that band, which
+-    //   is exactly why this tier is self-calibrating rather than a
+-    //   constant. Multiplier = 4 (of the live calibration measurement)
+-    //   biases toward legit-side safety (avoiding a false-positive CI-red
+-    //   is the whole reason this recalibration exists) while keeping a
+-    //   real, meaningful margin toward the defect signature:
+-    //     - vs. legit max: 4 / 1.771(worst-case ratio) = 2.26x margin --
+-    //       clears the >=2x bar with room to spare.
+-    //     - vs. blocking signature: on this hardware, 4x calibration
+-    //       (~23-25ms) sits ~1.6-1.7x below the 39.4-40.8ms blocking
+-    //       signature -- short of a full 2x margin (the ~3.8-4x total
+-    //       separation does not allow both margins to be a full 2x with
+-    //       any slack), but still a clean, unambiguous fail for the
+-    //       defect class this tier exists to catch, not a coin flip.
+-    //   A floor of kLocalBudget below prevents a degenerate near-zero
+-    //   threshold if calibration ever reads implausibly small.
+-    constexpr int64_t kCiStallMultiplier = 4;
++    // MULTIPLIER DERIVATION, historical (wall-clock basis, SUPERSEDED --
++    // see issue #76 below for why): 3 measurement sets, 22 total runs,
++    // constrained repro (taskset -c 0,1 + LP_NUM_THREADS=1 + forced
++    // lavapipe, matching CI's own 2-vCPU/software-rasterizer class): legit
++    // max 9166-10288us vs calibration 5634-6202us (worst ratio 1.771x) vs
++    // a reintroduced whole-batch BLOCKING-DEFECT signature (all 5 textures
++    // in one call) at 39399-40812us. Multiplier=4 gave a 2.26x margin on
++    // the legit side and ~1.6-1.7x on the defect side (full numbers in
++    // wine-segfault-fix-report.md's own addendum).
++    //
++    // [Issue #76 root-cause round] The wall-clock basis above was itself
++    // the flake's root cause, not merely under-calibrated. Forensic
++    // instrumentation (temporary, this round -- getrusage()/
++    // CLOCK_THREAD_CPUTIME_ID probes around every marshal step, both
++    // drivers, n=133 runs across four conditions: standalone, standalone
++    // under synthetic CPU load, and standalone under real multi-process
++    // GPU contention matching T14's own -j2/-j4 sighting) found EVERY
++    // observed over-threshold pumpMain() call had thread CPU time far
++    // below its own wall-clock duration -- as low as 10-14% CPU
++    // utilization on the worst ticks, with 8-33 voluntary context
++    // switches recorded during a single registerDecoded()/uploadDeferred()
++    // call that performs no wait()/blocking call of its own. The extra
++    // wall time is the calling thread being descheduled/blocked inside
++    // the driver's own image/memory-allocation ioctls (NVIDIA) or
++    // llvmpipe's internal worker-thread synchronization (lavapipe) --
++    // genuine OS/driver scheduling latency, not extra work performed, and
++    // not a liveness defect in this engine's own async import pipeline
++    // (every one of the 133 runs completed correctly; only the timing
++    // REQUIRE tripped). A wall-clock stall detector cannot distinguish
++    // "did more work" from "got descheduled mid-syscall" -- CPU time can,
++    // by construction. Switching the CI-tier basis from wall-clock to
++    // per-thread CPU time (CLOCK_THREAD_CPUTIME_ID, both the calibration
++    // probes and the in-loop measurement below) does not weaken this
++    // gate's actual defect coverage: the ACTUAL regression class this
++    // tier defends against (an oversized/un-time-sliced batch -- see the
++    // historical BLOCKING-DEFECT signature above) is CPU-bound work
++    // (N x the memcpy/image-creation cost), which shows up in CPU time
++    // at least as clearly as in wall time; a genuinely reintroduced
++    // *blocking* wait() call is already caught directly and
++    // deterministically by the waitCallCountForTesting() assertions below,
++    // completely independent of any timing measurement.
++    //
++    // WARM-UP CONFOUND (found and fixed this round, see the throwaway
++    // registerDecoded() call right before the timed BEFORE sample below):
++    // the FIRST registerDecoded() call ever made against a fresh
++    // TextureCache costs systematically more CPU time than every later
++    // call (measured: NVIDIA BEFORE/AFTER ratio 1.57x mean/1.77x max
++    // across 80 runs; lavapipe up to 3.5x in one captured run) -- a
++    // one-time cold-start cost, not contention, that inflated the
++    // self-calibrated ceiling using a cost class no real in-loop tick ever
++    // repeats. Fixed by discarding one untimed warm-up call before the
++    // timed BEFORE sample -- see that call's own comment for the full
++    // writeup and its own measured before-fix/after-fix numbers.
++    //
++    // TWO-PART DESIGN (this round's own final finding): with the warm-up
++    // confound removed, a SINGLE CPU-time multiplier shared across both
++    // drivers cannot soundly serve as the sole proof of the historical
++    // BLOCKING-DEFECT/oversized-batch regression above. Measured, both
++    // post-warm-up-fix: lavapipe's own legitimate (non-regressed)
++    // worst-case ratio (max in-loop tick CPU time / calibration CPU time)
++    // reached 4.887x across 279 standalone runs; the SAME sabotage
++    // (marshalGltfImportPrepareStep()'s early `return true` removed, all 5
++    // textures registering in one tick) measured on NVIDIA reached as LOW
++    // as 4.568x across 8 reproductions -- i.e. lavapipe's own noise floor
++    // and NVIDIA's own defect signature OVERLAP (4.887 > 4.568): no single
++    // multiplier value can sit strictly between them, so a purely
++    // timing-based gate is mathematically unable to both (a) never
++    // false-positive on lavapipe's legitimate noise and (b) always catch
++    // the regression on NVIDIA. This is why the CHECK immediately
++    // following this loop (`maxTextureRegistrationsInOneTick <= 1`) is now
++    // THE authoritative, deterministic proof of this defect class --
++    // exactly the same "direct proof, not a timing proxy" posture the D25
++    // waitCallCountForTesting() assertions already establish for the
++    // separate reintroduced-blocking-wait defect class. The REQUIRE below
++    // remains a real, CI-blocking, self-calibrated secondary safety net
++    // (still catches, e.g., a pathological single-call performance
++    // regression unrelated to batching) but no longer needs to double as
++    // the sabotage-discrimination proof, so its own multiplier is set
++    // generously above the demonstrated worst-case NOISE floor rather than
++    // threaded through the (now provably impossible) needle of also
++    // staying below the defect signature: Multiplier=8 gives a
++    // 8/4.887 = 1.637x margin over the largest legitimate ratio measured
++    // in 279 lavapipe standalone runs (n=199 fresh + the 80-run batch that
++    // first found the post-warm-up gap), comfortably clear of noise on
++    // both drivers (NVIDIA's own post-warm-up worst-case ratio was only
++    // 2.531x across 80 runs). A floor of kCpuFloor below prevents a
++    // degenerate near-zero threshold if calibration ever reads implausibly
++    // small.
++    constexpr int64_t kCiStallMultiplier = 8;
++    constexpr auto kCpuFloor = std::chrono::microseconds(2000);  // 2ms floor, same rationale as kLocalBudget below
++
++    // Per-thread CPU-time source for the CI-tier stall detector [issue #76
++    // fix] -- CLOCK_THREAD_CPUTIME_ID is backed by the scheduler's own
++    // high-resolution per-thread accounting (ns resolution on Linux),
++    // measuring only time this calling thread actually spent executing on
++    // a CPU, immune to the OS-scheduling/driver-ioctl blocking latency
++    // that made the old wall-clock basis unsound (see this TEST_CASE's own
++    // "[Issue #76 root-cause round]" comment above).
++    const auto threadCpuTimeUs = []() -> int64_t {
++        struct timespec ts {};
++        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++        return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
++    };
+ 
+     TextureDecodeResult calibrationPayload;
+     calibrationPayload.outcome = TextureDecodeResult::Outcome::Ready;
+     calibrationPayload.format = VK_FORMAT_R8G8B8A8_UNORM;
+     calibrationPayload.width = 2048;
+     calibrationPayload.height = 2048;
+     DecodedTextureLevel calibrationLevel0;
+     calibrationLevel0.level = 0;
+     calibrationLevel0.width = 2048;
+     calibrationLevel0.height = 2048;
+     calibrationLevel0.bytes.assign(static_cast<size_t>(2048) * 2048 * 4, std::byte{0xFF});
+     calibrationPayload.levels.push_back(std::move(calibrationLevel0));
++
++    // [Issue #76 fix] Untimed warm-up call, discarded, immediately before
++    // the timed BEFORE sample -- this TEST_CASE's own forensic
++    // instrumentation (see the root-cause comment above) found the FIRST
++    // registerDecoded() call ever made against a fresh TextureCache costs
++    // systematically more CPU time than every later call: measured across
++    // 80 NVIDIA runs, the untouched BEFORE sample averaged 1.57x (max
++    // 1.77x) the AFTER sample's cost (same payload, same call, only
++    // difference is call order); on lavapipe the gap was worse, up to
++    // 3.5x in one captured run. This is a one-time cold-start cost (first
++    // touch of some driver/library-internal lazily-initialized state), NOT
++    // ambient contention -- every REAL in-loop tick this gate measures
++    // happens strictly AFTER several worker-thread decode/IO operations
++    // have already run, i.e. always in the already-warm state, so a
++    // timed BEFORE sample that still pays the cold-start cost inflates
++    // the self-calibrated ceiling using a cost class no real tick will
++    // ever repeat -- directly demonstrated as a discrimination hole this
++    // round: with the warm-up absent, an injected 5x-oversized-batch
++    // sabotage (reverting RC6's per-texture time-slicing) on lavapipe
++    // measured only 13398us total CPU against a 25192us ceiling derived
++    // from a 6298us cold BEFORE sample (4x), while the SAME lavapipe
++    // hardware's warm per-call cost was only ~2680us/texture -- the
++    // ceiling was calibrated against a call class 2.35x more expensive
++    // than any call this gate will ever actually see in the loop below.
++    // One throwaway call here (result discarded, not asserted, not timed)
++    // absorbs that one-time cost before either timed sample runs, making
++    // BEFORE and AFTER comparable measurements of the same (warm) steady
++    // state -- restores the bracketing rationale's own stated intent
++    // (each sample independently reflects ambient contention, not an
++    // unrelated confound) instead of undermining it.
++    [[maybe_unused]] TextureHandle calibrationHandleWarmup =
++        fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe-warmup");
++
++    const int64_t calibCpuBeforeStart = threadCpuTimeUs();
+     const auto calibBeforeStart = std::chrono::steady_clock::now();
+     TextureHandle calibrationHandleBefore =
+         fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe-before");
+     const auto calibDurationBefore = std::chrono::duration_cast<std::chrono::microseconds>(
+         std::chrono::steady_clock::now() - calibBeforeStart);
++    const std::chrono::microseconds calibCpuDurationBefore(threadCpuTimeUs() - calibCpuBeforeStart);
+     REQUIRE(calibrationHandleBefore.isValid());
+     MESSAGE("wall-clock gate: calibration probe BEFORE the loop (2048x2048 synthetic registerDecoded()) took ",
+-            calibDurationBefore.count(), " us on this run");
++            calibDurationBefore.count(), " us wall / ", calibCpuDurationBefore.count(), " us CPU on this run");
+ 
+     Registry registry;
+     ImportResult result;
+     bool done = false;
+     AsyncImportHandle handle = registry.importGltfAsync(
+         documentBytes, source, *fixture->pool, *scheduler, fixture->textures.get(),
+         [&](ImportResult r) {
+             result = std::move(r);
+             done = true;
+         });
+     REQUIRE(handle.isValid());
+ 
+     constexpr auto kLocalBudget = std::chrono::microseconds(2000);   // 2 ms, published/trend-tracked -- unchanged
+ 
+     uint64_t framesWhileInFlight = 0;
+-    std::chrono::microseconds maxPumpDuration{0};
++    std::chrono::microseconds maxPumpDuration{0};       // wall-clock -- trend metric only, D18/RC6 (unchanged)
++    std::chrono::microseconds maxPumpCpuDuration{0};    // thread CPU time -- secondary/trend gate, see below [issue #76]
+     uint32_t overLocalBudgetCount = 0;
++    // [Issue #76 fix, PRIMARY defect-class proof] Direct, timing-independent
++    // count of how many real texture registrations landed in the SAME
++    // single pumpMain() tick -- see this TEST_CASE's own root-cause comment
++    // above for why a timing comparison alone cannot soundly separate
++    // legitimate per-driver noise from a genuine reintroduced batching
++    // regression (the two bands were found, empirically, to overlap
++    // between drivers for any single shared multiplier). liveTextureCount-
++    // ForTesting() is an O(1) counter read (rx_core::HandlePool::
++    // liveCount(), slots_.size()-freeList_.size()), safe to call every
++    // iteration of this loop's own multi-million-iteration busy-poll
++    // without measurably perturbing it -- GeometryPool::stats() is
++    // deliberately NOT called here every tick for the same reason (it
++    // walks every block's VMA virtual-block statistics and allocates a
++    // vector, real per-call cost this loop cannot absorb at its own
++    // iteration count).
++    size_t liveTexturesBeforeTick = fixture->textures->liveTextureCountForTesting();
++    uint32_t maxTextureRegistrationsInOneTick = 0;
+ 
+     // [Issue #30] The loop below no longer asserts inside the loop body. It
+     // used to REQUIRE(pumpDuration < kCiStallDetector) AND
+     // REQUIRE(now < testDeadline) on EVERY iteration -- but how many
+     // iterations run before `done` flips true is itself a direct function of
+     // live wall-clock/scheduler timing (this is deliberately a real,
+     // overlapping async import against real GPU work), so the doctest
+     // ASSERTION COUNT for this one test case varied run to run (confirmed:
+     // baseline 10-run/4-core measurement for this whole binary showed
+     // 8203599 vs 8153987 total assertions across otherwise-identical 57/57
+     // passes -- this loop is the dominant contributor). Aggregating the
+-    // per-iteration measurement into `maxPumpDuration` and asserting ONCE
++    // per-iteration measurement into `maxPumpCpuDuration` and asserting ONCE
+     // after the loop (below) makes the assertion count for this claim fixed
+     // (exactly 1) regardless of iteration count, while preserving the exact
+     // same discriminating power: a reintroduced blocking wait() still shows
+     // up as an outlier this max captures, clearing kCiStallDetector by the
+     // same margin the multiplier-derivation comment above already
+     // establishes (a spike on any single iteration cannot be diluted by
+     // however many fast iterations happen to run alongside it, since max()
+     // ignores everything but the worst observed value).
+     const auto testDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+     while (!done && std::chrono::steady_clock::now() < testDeadline) {
+         ImportProgress before = registry.importProgress(handle);
+         const bool wasInFlight = before.stage != ImportStage::Done && before.stage != ImportStage::Failed;
+ 
++        const int64_t pumpCpuStart = threadCpuTimeUs();
+         const auto pumpStart = std::chrono::steady_clock::now();
+         scheduler->pumpMain();
+         const auto pumpDuration =
+             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pumpStart);
++        const std::chrono::microseconds pumpCpuDuration(threadCpuTimeUs() - pumpCpuStart);
+ 
+         if (wasInFlight) {
+             ++framesWhileInFlight;
+         }
+         maxPumpDuration = std::max(maxPumpDuration, pumpDuration);
++        maxPumpCpuDuration = std::max(maxPumpCpuDuration, pumpCpuDuration);
+         if (pumpDuration > kLocalBudget) {
+             ++overLocalBudgetCount;
+         }
++
++        const size_t liveTexturesAfterTick = fixture->textures->liveTextureCountForTesting();
++        // liveTextureCountForTesting() only ever increases across this loop
++        // (a Ready-outcome registerDecoded() call is the only thing that
++        // moves it, and nothing on this success path releases a texture
++        // mid-import) -- unsigned subtraction is safe here.
++        const uint32_t texturesThisTick = static_cast<uint32_t>(liveTexturesAfterTick - liveTexturesBeforeTick);
++        maxTextureRegistrationsInOneTick = std::max(maxTextureRegistrationsInOneTick, texturesThisTick);
++        liveTexturesBeforeTick = liveTexturesAfterTick;
+     }
+ 
+     // The timeout safety net now surfaces here (done stays false if
+     // testDeadline was hit) instead of via a per-iteration REQUIRE inside
+     // the loop -- same failure outcome, fixed assertion count.
+     REQUIRE(done);
+     REQUIRE(result.ok());
+     // >= 300 rendered frames while genuinely in flight -- proves real
+     // overlap (the import did not simply complete on the first pump).
+     CHECK(framesWhileInFlight >= 300);
+ 
++    // [Issue #76 fix, PRIMARY defect-class proof -- see this TEST_CASE's
++    // own root-cause comment above and this loop's own comment introducing
++    // maxTextureRegistrationsInOneTick] Direct, deterministic, zero-timing-
++    // dependency proof that RC6's per-texture time-slicing contract
++    // (marshalGltfImportPrepareStep(), import_pipeline.h: "registers AT
++    // MOST ONE still-unregistered texture slot... per call") held for
++    // every tick of this run -- exactly the same "direct proof, not a
++    // timing proxy" posture the D25 waitCallCountForTesting() assertions
++    // below already establish for the reintroduced-blocking-wait defect
++    // class. This is now THE authoritative check for the historical
++    // BLOCKING-DEFECT/oversized-batch regression (a scratch revert of the
++    // early `return true` in marshalGltfImportPrepareStep() -- see the
++    // multiplier-derivation comment's own citation -- makes this fail
++    // deterministically, 20/20 reproductions in this round's final
++    // configuration, both drivers, see task-i76-report.md's own
++    // discrimination-proof section).
++    CHECK(maxTextureRegistrationsInOneTick <= 1);
++
+     // [gltf-gpu-load-flake investigation, follow-up to issue #30] A SECOND
+     // calibration sample, taken immediately AFTER the loop -- bracketing
+     // the real measurement window instead of sampling once, before it,
+     // in isolation. See the multiplier-derivation comment above this
+     // TEST_CASE's calibration-payload setup for the full rationale and the
+     // reproduced failure this addresses.
++    const int64_t calibCpuAfterStart = threadCpuTimeUs();
+     const auto calibAfterStart = std::chrono::steady_clock::now();
+     TextureHandle calibrationHandleAfter =
+         fixture->textures->registerDecoded(calibrationPayload, "wallclock-gate-calibration-probe-after");
+     const auto calibDurationAfter = std::chrono::duration_cast<std::chrono::microseconds>(
+         std::chrono::steady_clock::now() - calibAfterStart);
++    const std::chrono::microseconds calibCpuDurationAfter(threadCpuTimeUs() - calibCpuAfterStart);
+     REQUIRE(calibrationHandleAfter.isValid());
+ 
+     // [gltf-gpu-load-flake investigation] Drain the AFTER probe's own GPU
+     // upload before this TEST_CASE ends and its fixture (TextureCache/
+     // Uploader/Device) tears down. The original single BEFORE-loop probe
+     // never needed this: the real import loop that follows it (300+
+     // pumpMain() calls) drains it naturally as a side effect. This AFTER
+     // probe has no such loop after it -- left undrained, the fixture
+     // destructor can destroy this texture's VkImage while its own upload
+     // commands are still in flight on the GPU, exactly the "bound VkImage
+@@ -1050,51 +1196,59 @@ TEST_CASE("importGltfAsync: WALL-CLOCK GATE -- deliberately slow decode + a real
+     {
+         rx::rhi::UploadTicket afterTicket = fixture->textures->flushPendingUploads();
+         const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         while (!fixture->textures->isUploadComplete(afterTicket) &&
+                std::chrono::steady_clock::now() < drainDeadline) {
+             scheduler->pumpMain();
+         }
+         REQUIRE(fixture->textures->isUploadComplete(afterTicket));
+     }
+ 
+-    const auto calibDuration = std::max(calibDurationBefore, calibDurationAfter);
+-    const auto kCiStallDetector = std::max(kLocalBudget, kCiStallMultiplier * calibDuration);  // self-calibrated (see above)
++    const auto calibCpuDuration = std::max(calibCpuDurationBefore, calibCpuDurationAfter);
++    const auto kCiStallDetector = std::max(kCpuFloor, kCiStallMultiplier * calibCpuDuration);  // self-calibrated, CPU-time basis (see above)
+     MESSAGE("wall-clock gate: calibration probe AFTER the loop took ", calibDurationAfter.count(),
+-            " us on this run (BEFORE sample was ", calibDurationBefore.count(),
+-            " us) -- CI-tier threshold derived as ", kCiStallMultiplier, "x the larger of the two (",
+-            calibDuration.count(), " us)");
+-
+-    // The CI stall-detector tier (RC6, self-calibrated -- see
+-    // kCiStallDetector's own comment above): THE load-bearing assertion for
+-    // this whole test case, asserted once, hard, against the worst pumpMain()
+-    // observed across the entire run -- see the [Issue #30] comment above the
+-    // loop for why this replaced a per-iteration REQUIRE.
+-    REQUIRE(maxPumpDuration < kCiStallDetector);
++            " us wall / ", calibCpuDurationAfter.count(), " us CPU on this run (BEFORE sample was ",
++            calibDurationBefore.count(), " us wall / ", calibCpuDurationBefore.count(),
++            " us CPU) -- CI-tier threshold derived as ", kCiStallMultiplier,
++            "x the larger of the two CPU-time samples (", calibCpuDuration.count(), " us)");
++
++    // The CI stall-detector tier (RC6, self-calibrated on THREAD CPU TIME
++    // as of issue #76's fix -- see kCiStallDetector's own comment above):
++    // a real, CI-blocking SECONDARY safety net (the PRIMARY defect-class
++    // proof is `CHECK(maxTextureRegistrationsInOneTick <= 1)` above),
++    // asserted once, hard, against the worst pumpMain() CPU cost observed
++    // across the entire run -- see the [Issue #30] comment above the loop
++    // for why this replaced a per-iteration REQUIRE.
++    REQUIRE(maxPumpCpuDuration < kCiStallDetector);
+ 
+     // Published number [D18/RC6]: the 2ms figure is a TREND metric,
+     // explicitly "never CI-blocking" (D18's own wording, amended by RC6
+     // only for the SEPARATE, now self-calibrated stall-detector tier
+     // asserted above via REQUIRE) -- reported via MESSAGE only,
+     // deliberately never a CHECK/REQUIRE, so a real but small overage
+     // (this task's own dev-machine run: DamagedHelmet's largest single
+     // JPEG texture, ~1.3MB decoded to RGBA8, occasionally costs a few ms
+     // of real memcpy+copy-recording time for ONE texture's own
+     // registerDecoded() step -- see task-15-report.md's own
+     // performance-numbers section) is visible in the log without flaking
+     // CI, exactly matching D18's own posture for every other wall-clock
+-    // number in this codebase.
+-    MESSAGE("wall-clock gate: max single pumpMain() call = ", maxPumpDuration.count(), " us across ",
+-            framesWhileInFlight, " in-flight frame(s); ", overLocalBudgetCount,
+-            " call(s) exceeded the 2ms local/published budget (trend-tracked, never CI-blocking per D18/RC6) -- "
+-            "self-calibrated CI-tier ceiling this run was ", kCiStallDetector.count(),
+-            " us (REQUIRE'd once above, aggregated over every call, see kCiStallDetector's own comment)");
++    // number in this codebase. maxPumpDuration (wall) stays purely
++    // informational here [issue #76]: the load-bearing comparison above
++    // now uses maxPumpCpuDuration instead, precisely because wall-clock
++    // pumpMain() duration was demonstrated NOT to isolate real work from
++    // OS/driver scheduling latency.
++    MESSAGE("wall-clock gate: max single pumpMain() call = ", maxPumpDuration.count(), " us wall / ",
++            maxPumpCpuDuration.count(), " us CPU across ", framesWhileInFlight, " in-flight frame(s); ",
++            overLocalBudgetCount,
++            " call(s) exceeded the 2ms local/published wall-clock budget (trend-tracked, never CI-blocking per "
++            "D18/RC6) -- self-calibrated CI-tier CPU-time ceiling this run was ", kCiStallDetector.count(),
++            " us (REQUIRE'd once above against maxPumpCpuDuration, see kCiStallDetector's own comment)");
+ 
+     // [Fix round 1, IMPORTANT item] D25 direct proof, not just a wall-clock
+     // proxy: the async path never called Uploader::wait() through EITHER
+     // GeometryPool or TextureCache -- both counters must be unchanged from
+     // their pre-import baseline.
+     CHECK(fixture->pool->waitCallCountForTesting() == poolWaitCallsBefore);
+     CHECK(fixture->textures->waitCallCountForTesting() == textureWaitCallsBefore);
+ 
+     // [Fix round 1, IMPORTANT item] Direct ring/pool no-exhaustion check:
+     // the import's combined geometry landed in exactly one block, used
