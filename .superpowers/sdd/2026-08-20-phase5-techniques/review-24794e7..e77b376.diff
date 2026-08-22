@@ -1,0 +1,3662 @@
+e77b376 feat(tests/conformance): glTF PBR conformance harness vs Khronos Sample Viewer (#47)
+
+ .gitignore                                         |    6 +
+ CMakeLists.txt                                     |    8 +
+ assets/test/ASSET-NOTES.md                         |    1 +
+ shaders/conformance/tonemap_linear.frag.slang      |   47 +
+ tests/conformance/CMakeLists.txt                   |   94 ++
+ tests/conformance/camera_fit.cpp                   |   82 +
+ tests/conformance/camera_fit.h                     |  128 ++
+ tests/conformance/main.cpp                         | 1707 ++++++++++++++++++++
+ tests/conformance/models.h                         |  112 ++
+ .../references/AlphaBlendModeTest/provenance.json  |   57 +
+ .../references/AlphaBlendModeTest/reference.png    |  Bin 0 -> 153252 bytes
+ .../CompareEmissiveStrength/provenance.json        |   57 +
+ .../CompareEmissiveStrength/reference.png          |  Bin 0 -> 62278 bytes
+ .../EmissiveStrengthTest/provenance.json           |   57 +
+ .../references/EmissiveStrengthTest/reference.png  |  Bin 0 -> 29412 bytes
+ .../references/MetalRoughSpheres/provenance.json   |   57 +
+ .../references/MetalRoughSpheres/reference.png     |  Bin 0 -> 131996 bytes
+ .../MetalRoughSpheresNoTextures/provenance.json    |   57 +
+ .../MetalRoughSpheresNoTextures/reference.png      |  Bin 0 -> 261937 bytes
+ .../TextureTransformTest/provenance.json           |   57 +
+ .../references/TextureTransformTest/reference.png  |  Bin 0 -> 38768 bytes
+ tools/fetch_assets.sh                              |  186 ++-
+ tools/fetch_gltf_sample_renderer.sh                |   75 +
+ tools/gltf_conformance/generate_reference.mjs      |  307 ++++
+ tools/gltf_conformance/harness.html                |  232 +++
+ tools/gltf_conformance/package-lock.json           |   59 +
+ tools/gltf_conformance/package.json                |   13 +
+ 27 files changed, 3398 insertions(+), 1 deletion(-)
+
+diff --git a/.gitignore b/.gitignore
+index b893a28..dc86f4b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,10 +6,16 @@ build-*/
+ .cache/
+ .claude/
+ rendererx-samples-*.zip
+ ctest-results-*.xml
+ 
+ # Phase 4 Stage 1 Task 13: tools/fetch_assets.sh downloads Khronos
+ # glTF-Sample-Assets test content (DamagedHelmet mandatory, Sponza
+ # --sponza-only) here -- never committed (D16), fetched/checksum-verified
+ # on demand for local/CI testing only.
+ assets/fetched/
++
++# Phase 5 Stage 1 Task 11 (#47): tools/gltf_conformance's own pinned
++# Playwright install (npm ci output) -- reproducible from package.json/
++# package-lock.json, never committed (same posture as every other
++# language-ecosystem dependency tree in this repo).
++tools/gltf_conformance/node_modules/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 647ec58..a1243f4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -209,10 +209,18 @@ add_subdirectory(samples/07_stress)
+ # samples/common: D17's reusable reference-PNG gate -- add_subdirectory'd
+ # before 08_gltf_viewer (the first sample to link it).
+ add_subdirectory(samples/common)
+ # Issue #31: generic two-PNG comparison host tool built on samples/common's
+ # own gate algorithm -- see tools/compare_rgba8_png/main.cpp's own header
+ # comment. Added after samples/common (its own dependency) and before
+ # 08_gltf_viewer (not a dependency of it, ordering is incidental).
+ add_subdirectory(tools/compare_rgba8_png)
+ add_subdirectory(samples/08_gltf_viewer)
+ add_subdirectory(samples/09_scene)
++
++# Phase 5 Stage 1 Task 11 (#47), gate ruling T11: the glTF PBR conformance
++# harness (rx_conformance_render) -- see tests/conformance/CMakeLists.txt's
++# own header comment for why this is a NEW top-level tests/ tree rather
++# than living under an existing src/*/tests convention. Added last: it
++# links rx_ibl/rx_material/rx_scene/samples' own sample_common, all
++# already defined above.
++add_subdirectory(tests/conformance)
+diff --git a/assets/test/ASSET-NOTES.md b/assets/test/ASSET-NOTES.md
+index c447b84..48eb0bd 100644
+--- a/assets/test/ASSET-NOTES.md
++++ b/assets/test/ASSET-NOTES.md
+@@ -1,3 +1,4 @@
+ - Workshop (Render Scene) by 3DHaupt (sketchfab.com/3d-models/workshop-render-scene-ff29e81ff1564d73bad71d0042f96a28), CC-BY 4.0 — complex-scene test asset (531k tris, 4k textures, GLB), fetched 2026-08-20 to assets/fetched/Workshop/workshop_render_scene.glb (signed-URL download; not scriptable). Test asset only; cleaned out pre-go-live.
+ - BoomBox (glTF-Draco variant) by Microsoft, via github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/BoomBox, CC0-1.0 (Creative Commons Zero / public domain) — real-world KHR_draco_mesh_compression compatibility test asset (Khronos's own canonical Draco-compressed reference model: extensionsRequired=["KHR_draco_mesh_compression"], 1 mesh/1 submesh, 18108 indices, POSITION+NORMAL+TANGENT+TEXCOORD_0 all Draco-compressed, 4 PBR textures ~10MB total), fetched 2026-08-20 via tools/fetch_assets.sh (mandatory tier, per-file sha256-checksummed) to assets/fetched/BoomBox/glTF-Draco/. Not committed to the repo — fetched on demand for local/CI testing, same discipline as DamagedHelmet above it in this script. Gate-tested by src/rx_asset/tests/draco_compression_test.cpp's BoomBox integration test.
+ - assets/test/textures/gate_test_env.exr and samples/08_gltf_viewer/environments/gate_test_env.exr (byte-identical) — procedurally generated, not third-party content: tools/gen_exr_env_fixtures decodes the existing committed samples/08_gltf_viewer/environments/gate_test_env.hdr (Phase 5 Task 10's own procedural fixture, unmodified) via rx::asset::decodeStbImageHdr() and re-encodes those exact floats as HALF-pixel-type, ZIP-compressed OpenEXR via tinyexr's SaveEXRImageToMemory() — a container-equivalent sibling of gate_test_env.hdr, generated 2026-08-22 for issue #75. No license to track (generator-authored, same discipline as gate_test_env.hdr itself). assets/test/textures/exr_deep_rejected.exr / exr_tiled_rejected.exr / exr_dwaa_rejected.exr — the same generator, bit-patching the deep/tiled/compression-attribute bytes of an otherwise-valid encode to build rejection fixtures for decodeExrImage()'s unsupported-variant gate; test assets only, no rendering use.
++- glTF PBR conformance models (Phase 5 Stage 1 Task 11, #47), all via github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models, fetched via tools/fetch_assets.sh's own conformance section (mandatory tier, per-file sha256-checksummed) to assets/fetched/<Model>/glTF/, not committed: **MetalRoughSpheres** (CC-BY-4.0) and **MetalRoughSpheresNoTextures** (CC0-1.0 model content; metadata.json only is CC-BY-4.0) — the metallic/roughness grid, ± baked texture, this ticket's own headline conformance model; **EmissiveStrengthTest** (CC-BY-4.0) and **CompareEmissiveStrength** (CC0-1.0, model content ALSO carries a Khronos trademark/logo reference per its own LICENSE.md — `../../LICENSES/LicenseRef-LegalMark-Khronos.txt` — on `Compare_Emissive-Strength_img0.jpg`, a comparison-chart texture) — KHR_materials_emissive_strength; **TextureTransformTest** (CC0-1.0) — KHR_texture_transform; **AlphaBlendModeTest** (CC-BY-4.0) — core alphaMode (Opaque/Mask/Blend), substituted for the plan's own TextureTransformMultiTest pick (that model requires KHR_materials_clearcoat, unsupported by RendererX until Stage 3 — see tools/fetch_assets.sh's own comment for the verification). **EnvironmentTest** is the one OPTIONAL model (`--environment-test` flag only, never CI-fetched): its own LICENSE.md licenses the model content under a proprietary Adobe Stock commercial license (`../../LICENSES/LicenseRef-Adobe-Stock.txt`), not Creative Commons — local/manual conformance verification only, same disposition as Sponza's own CRYENGINE-licensed content above. Ground-truth references (tests/conformance/references/<Model>/reference.png + provenance.json, all CC-BY-4.0/CC0-1.0 models ARE committed there) generated by tools/gltf_conformance/generate_reference.mjs driving a pinned build of github.com/KhronosGroup/glTF-Sample-Renderer (commit 863b981fb755359063e370ff7b6e956bda0716e2, Apache-2.0) — see that script's own header comment and task-11-report.md for the full methodology.
+diff --git a/shaders/conformance/tonemap_linear.frag.slang b/shaders/conformance/tonemap_linear.frag.slang
+new file mode 100644
+index 0000000..7981274
+--- /dev/null
++++ b/shaders/conformance/tonemap_linear.frag.slang
+@@ -0,0 +1,47 @@
++// tests/conformance: linear-clamp "tonemap" fragment shader -- Phase 5
++// Stage 1 Task 11 (#47), gate ruling T11.
++//
++// NOT shaders/multipass/tonemap.frag.slang (Reinhard, `c/(1+c)`, this
++// project's own production default) -- a deliberately DIFFERENT, NEW file
++// (this project's own binding constraint on OTHER tasks not to touch
++// shaders/multipass/ does not even apply here, since this is a genuinely
++// separate concern, not a modification of that file). See
++// tools/gltf_conformance/harness.html's own header comment for the full
++// methodology: the Khronos Sample Viewer offers no Reinhard tonemap option
++// at all (its own choices are KHR_PBR_NEUTRAL/ACES-family/NONE --
++// verified directly against source/Renderer/shaders/tonemapping.glsl,
++// pinned commit), so comparing through either side's own preferred curve
++// would make this conformance gate measure "do the tonemap curves agree"
++// (an orthogonal, Phase-5-Task-32-owned question) instead of "do the
++// underlying BRDF/lighting/IBL linear-radiance values agree". This
++// shader instead replicates the Sample Viewer's `GltfState.ToneMaps.NONE`
++// path bit-for-bit: `tonemapping.glsl`'s own `toneMap()`, with every
++// `#ifdef TONEMAP_*` branch compiled out, reduces to exactly
++// `color *= u_Exposure; return linearTosRGB(color);` where
++// `linearTosRGB(c) = pow(c, 1/2.2)` (that file's own definition) and the
++// final hard clip to [0,1] happens implicitly at the 8-bit backbuffer
++// write, on BOTH sides (WebGL2's own default framebuffer there; this
++// engine's own SRGB-format swapchain attachment write here) -- so this
++// shader's own job is just `clamp(hdr, 0, 1)` PLUS `pow(x, 1/2.2)`: the
++// same "linear -> sRGB encoding... handled by the GPU's fixed-function
++// attachment write path" trick tonemap.frag.slang's own header comment
++// already documents does NOT apply to a plain `pow()` call this shader
++// makes explicit itself, since relying on hardware sRGB write here would
++// silently apply a SECOND, different (piecewise, not pure-gamma) curve on
++// top of this shader's own already-encoded output -- see this file's own
++// CMakeLists.txt caller for the backbuffer format this assumes (UNORM,
++// not _SRGB, specifically so this shader's own explicit pow() is the ONLY
++// encode step, matching the reference side's own single explicit
++// linearTosRGB() call exactly).
++//
++// Concatenated AFTER shaders/multipass/tonemap.vert.slang at compile time
++// (same idiom that file's own header comment documents) -- gPush/
++// gTextures/gSamplers are declared there.
++[shader("fragment")]
++float4 fsMain(VSOut input) : SV_Target
++{
++    float3 hdr = gTextures[gPush.hdrTextureIndex].Sample(gSamplers[gPush.hdrSamplerIndex], input.uv).rgb;
++    float3 clamped = clamp(hdr, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
++    float3 srgb = pow(clamped, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
++    return float4(srgb, 1.0);
++}
+diff --git a/tests/conformance/CMakeLists.txt b/tests/conformance/CMakeLists.txt
+new file mode 100644
+index 0000000..36c77d4
+--- /dev/null
++++ b/tests/conformance/CMakeLists.txt
+@@ -0,0 +1,94 @@
++# tests/conformance -- Phase 5 Stage 1 Task 11 (#47), gate ruling T11: the
++# glTF PBR conformance harness (rx_conformance_render). A NEW top-level
++# test-tree location (this ticket's own file-list literally names a bare
++# `tests/` directory, unlike every existing per-module `src/*/tests`
++# convention -- matrix-p5t11-conformance-harness.md's own "New gaps"
++# section flags this; adopted here as the genuinely new, cross-cutting
++# convention it called for: conformance spans asset/material/graph/ibl,
++# it does not belong to any one module's own tests/ tree).
++#
++# UNLIKE samples/08_gltf_viewer, this tool does NOT deploy shaders/
++# environment/reference assets next to its own binary via custom_command
++# stamp targets -- it reads them directly from the checked-out SOURCE tree
++# via the RX_REPO_ROOT_DIR compile definition (main.cpp's own
++# resolveXxxPath()-style logic), exactly like damaged_helmet_test.cpp's
++# own RX_ASSET_ROOT_DIR convention. This is a deliberate simplification
++# available BECAUSE this is a ctest-only gate tool, never a redistributed
++# sample (tools/package_samples.sh has no reason to know about it) -- see
++# main.cpp's own top comment.
++
++add_executable(rx_conformance_render
++    main.cpp
++    camera_fit.cpp
++)
++target_link_libraries(rx_conformance_render PRIVATE
++    rx_graph rx_rhi_vk rx_platform rx_material rx_asset rx_scene rx_task rx_shader rx_ibl sample_common
++)
++target_compile_definitions(rx_conformance_render PRIVATE
++    RX_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}"
++)
++# rx::shader::Compiler (this tool compiles standard_pbr.slang/unlit.slang/
++# the conformance tonemap pair/the rx_ibl bake kernels in-process, exactly
++# like every other Slang-compiling sample) needs the Slang runtime shared
++# libraries deployed next to the binary -- same call every other such
++# sample/tool already makes.
++rx_shader_deploy_runtime_libs(rx_conformance_render)
++
++# --- ctest registration ---------------------------------------------------
++# One gate per MANDATORY model (tests/conformance/models.h's own registry)
++# -- each skips gracefully (exit 0, logged) if its own asset/reference is
++# absent locally, matching damaged_helmet_test.cpp's own established
++# convention, though in practice tools/fetch_assets.sh fetches every
++# mandatory model's asset by default (CI included) and this ticket commits
++# every mandatory model's own reference.png/provenance.json, so these
++# never actually skip in CI.
++#
++# BOTH DRIVERS, UNCONDITIONALLY ENFORCED (ticket's own text: "gate our
++# renderer against them with tolerance comparisons on both drivers") --
++# UNLIKE D17's sample-08/09 gate (lavapipe-only hard-enforced, real-GPU
++# informational): a cross-renderer conformance tolerance is, by
++# construction, wide enough to absorb ordinary driver-to-driver
++# rasterization noise on TOP of the cross-renderer noise it already has to
++# absorb (models.h's own tolerance-derivation comment) -- there is no
++# principled reason to let a real GPU run silently diverge further than
++# lavapipe without failing.
++set(RX_CONFORMANCE_MODELS
++    MetalRoughSpheres
++    MetalRoughSpheresNoTextures
++    EmissiveStrengthTest
++    CompareEmissiveStrength
++    TextureTransformTest
++    AlphaBlendModeTest
++)
++foreach(_rx_conformance_model ${RX_CONFORMANCE_MODELS})
++    set(_rx_conformance_test_name "rx_conformance_${_rx_conformance_model}")
++    add_test(NAME ${_rx_conformance_test_name}
++             COMMAND rx_conformance_render --model ${_rx_conformance_model} --validate)
++    set_tests_properties(${_rx_conformance_test_name} PROPERTIES TIMEOUT 300)
++endforeach()
++
++# EnvironmentTest -- OPTIONAL (fetch-on-demand only, proprietary Adobe
++# Stock license on the model content -- tools/fetch_assets.sh's own
++# `--environment-test` section); CI never fetches it, so this test SKIPS
++# (exit 0) there. Local/manual verification only.
++add_test(NAME rx_conformance_EnvironmentTest
++         COMMAND rx_conformance_render --model EnvironmentTest --validate)
++set_tests_properties(rx_conformance_EnvironmentTest PROPERTIES TIMEOUT 300)
++
++# --- Discrimination proof [ticket's own acceptance line: "per-model
++# discrimination proof (perturb roughness constant -> gate fails)"] ------
++# A deliberately WRONG render (every StandardPBR material's own
++# roughnessFactor OVERRIDDEN to a fixed 0.02 -- see main.cpp's own
++# overrideFloatMaterialParamIfPresent()/kPerturbedRoughnessValue for why
++# an absolute override, not a relative scale/offset, is what this tool's
++# own --perturb-roughness flag applies) MUST fail the SAME gate the real
++# MetalRoughSpheres run above passes -- CTest's own WILL_FAIL property
++# inverts the pass/fail verdict this test itself expects (a real, standard
++# CTest mechanism for exactly this "this run must fail" shape, not a
++# hand-rolled shell inversion).
++add_test(NAME rx_conformance_MetalRoughSpheres_discrimination_proof
++         COMMAND rx_conformance_render --model MetalRoughSpheres --perturb-roughness --validate)
++set_tests_properties(rx_conformance_MetalRoughSpheres_discrimination_proof PROPERTIES
++    TIMEOUT 300
++    WILL_FAIL TRUE
++)
+diff --git a/tests/conformance/camera_fit.cpp b/tests/conformance/camera_fit.cpp
+new file mode 100644
+index 0000000..8166220
+--- /dev/null
++++ b/tests/conformance/camera_fit.cpp
+@@ -0,0 +1,82 @@
++#include "camera_fit.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace rx::conformance {
++
++// Port of user_camera.js's fitDistanceToExtents(min, max) [pinned commit,
++// source/gltf/user_camera.js] verbatim:
++//   const maxAxisLength = Math.max(max[0] - min[0], max[1] - min[1]);
++//   const yfov = this.perspective.yfov;
++//   const xfov = this.perspective.yfov * (this.perspective.aspectRatio ?? 1);
++//   const yZoom = maxAxisLength / 2 / Math.tan(yfov / 2);
++//   const xZoom = maxAxisLength / 2 / Math.tan(xfov / 2);
++//   this.distance = Math.max(xZoom, yZoom);
++// NOTE the original's own deliberate choice: only the X/Y extents feed
++// maxAxisLength -- Z (depth, toward/away from the fixed front-on camera
++// this algorithm always produces) is NEVER part of the fit. Reproduced
++// exactly, not "fixed" -- the whole point of this port is bit-for-bit
++// agreement with the actual reference renderer, including this quirk.
++namespace {
++float fitDistanceToExtents(const glm::vec3& min, const glm::vec3& max, float yfovRadians, float aspectRatio) {
++    const float maxAxisLength = std::max(max.x - min.x, max.y - min.y);
++    const float xfovRadians = yfovRadians * aspectRatio;
++    const float yZoom = maxAxisLength * 0.5F / std::tan(yfovRadians * 0.5F);
++    const float xZoom = maxAxisLength * 0.5F / std::tan(xfovRadians * 0.5F);
++    return std::max(xZoom, yZoom);
++}
++}  // namespace
++
++CameraFit fitCameraToScene(const rx::asset::AABB& worldBoundsAABB, float aspectRatio, float yfovRadians) {
++    CameraFit fit;
++    fit.yfovRadians = yfovRadians;
++
++    if (!worldBoundsAABB.isValid()) {
++        return fit;  // struct defaults -- see this function's own header comment.
++    }
++
++    const glm::vec3& min = worldBoundsAABB.min;
++    const glm::vec3& max = worldBoundsAABB.max;
++
++    const float distance = fitDistanceToExtents(min, max, yfovRadians, aspectRatio);
++
++    // Port of fitCameraTargetToExtents(min, max) [pinned commit]: target is
++    // the AABB's own center (ALL three axes, unlike the distance fit above,
++    // which only reads X/Y) --
++    //   let target = [0, 0, 0];
++    //   for (const i of [0, 1, 2]) { target[i] = (max[i] + min[i]) / 2; }
++    //   this.setRotation(this.rotAroundY, this.rotAroundX);  // (0, 0) -- identity, resetView()'s own reset.
++    //   this.setDistanceFromTarget(this.distance, target);
++    // setDistanceFromTarget(), for the IDENTITY transform resetView() always
++    // starts from (this.transform = mat4.create() -- resetView()'s own first
++    // statement), resolves to a fixed, closed-form position: getLookDirection()
++    // reads column 2 of the identity matrix, i.e. (0, 0, 1), negated -> (0, 0,
++    // -1); position = target - lookDirection * distance = target + (0, 0,
++    // distance). No trigonometry needed here BECAUSE resetView() always resets
++    // rotation to identity first (verified directly against user_camera.js's
++    // own resetView() body) -- this is not an approximation of the general
++    // orbit-camera case, it is the exact closed form for THIS specific,
++    // always-un-rotated call path.
++    const glm::vec3 target(0.5F * (max.x + min.x), 0.5F * (max.y + min.y), 0.5F * (max.z + min.z));
++    const glm::vec3 position = target + glm::vec3(0.0F, 0.0F, distance);
++
++    // Port of fitCameraPlanesToExtents(min, max) [pinned commit] verbatim:
++    //   const longestDistance = 10 * vec3.distance(min, max);
++    //   let zNear = this.distance - longestDistance * 0.6;
++    //   let zFar = this.distance + longestDistance * 0.6;
++    //   zNear = Math.max(zNear, zFar / MaxNearFarRatio);   // MaxNearFarRatio = 10000
++    const float longestDistance = 10.0F * glm::length(max - min);
++    float znear = distance - longestDistance * 0.6F;
++    const float zfar = distance + longestDistance * 0.6F;
++    constexpr float kMaxNearFarRatio = 10000.0F;
++    znear = std::max(znear, zfar / kMaxNearFarRatio);
++
++    fit.position = position;
++    fit.target = target;
++    fit.znear = znear;
++    fit.zfar = zfar;
++    return fit;
++}
++
++}  // namespace rx::conformance
+diff --git a/tests/conformance/camera_fit.h b/tests/conformance/camera_fit.h
+new file mode 100644
+index 0000000..7746971
+--- /dev/null
++++ b/tests/conformance/camera_fit.h
+@@ -0,0 +1,128 @@
++#pragma once
++// tests/conformance/camera_fit.h -- Phase 5 Stage 1 Task 11 (#47), gate
++// ruling T11: the "matched camera" half of the conformance harness's own
++// methodology.
++//
++// PORTED, not re-derived, from glTF-Sample-Renderer's own default "fit
++// camera to scene" algorithm (source/gltf/user_camera.js's
++// UserCamera::resetView() -> fitDistanceToExtents() /
++// fitCameraTargetToExtents() / fitCameraPlanesToExtents(), pinned commit
++// 863b981fb755359063e370ff7b6e956bda0716e2, see tools/
++// fetch_gltf_sample_renderer.sh's own header comment for the pin
++// rationale) -- function-by-function, line-by-line, cited by name in this
++// file's own implementation. tools/gltf_conformance/harness.html calls
++// the ACTUAL JS resetView() (not a reimplementation) when generating each
++// committed reference; THIS port is what RendererX's own conformance
++// render tool (main.cpp) uses to frame the identical camera against its
++// own imported scene. Both sides are therefore expected to converge on
++// NUMERICALLY IDENTICAL camera parameters from the same deterministic
++// closed-form formula over the same world-space scene AABB and the same
++// square (aspectRatio=1.0) render resolution -- not merely "close enough"
++// -- which is what makes "matched camera" a verifiable claim rather than
++// an eyeballed one.
++//
++// SCOPE: this is a mechanical, closed-form geometric port (bounding-box
++// fit distance/target/near-far-plane math) -- explicitly NOT a from-
++// scratch reimplementation of anything BRDF/lighting-related; the
++// "prefer ready-made or ported implementations" standing rule is
++// satisfied by porting the reference renderer's own actual algorithm
++// rather than inventing an independent "reasonable-looking" framing that
++// would not actually match.
++//
++// Thread-affinity: none (pure host-side math, no GPU/Vulkan object
++// touched).
++
++#include <rx_asset/mesh_asset.h>
++
++#include <glm/glm.hpp>
++
++#include <span>
++
++namespace rx::conformance {
++
++// Port of getExtentsFromAccessor()'s own SECOND step (source/gltf/
++// gltf_utils.js, pinned commit -- easy to miss on a first read, as this
++// task's own development did: the function does NOT return the tight
++// per-primitive AABB it just computed from the 8 transformed corners. It
++// goes one step further and REPLACES that box with the smallest CUBE
++// that inscribes the box's own bounding SPHERE:
++//   const center = 0.5*(boxMin+boxMax);
++//   const radius = length(boxMax - center);   // HALF THE BOX'S OWN DIAGONAL, not a per-axis half-extent.
++//   outMin = center - radius; outMax = center + radius;   // per axis -- always a CUBE.
++// getSceneExtents() then unions these per-PRIMITIVE cubes (not the tight
++// boxes) across the whole scene -- so the two orders genuinely differ
++// (union-of-cubes != cube-of-union) and only THIS order reproduces the
++// reference renderer's real numbers (verified directly this task: an
++// instrumented run of the actual reference renderer's own resetView()
++// output was cross-checked against a hand derivation of both orders --
++// only the per-primitive-then-union order matched, see task-11-report.md).
++[[nodiscard]] inline rx::asset::AABB sphereInscribingCubeOf(const rx::asset::AABB& box) {
++    if (!box.isValid()) {
++        return box;
++    }
++    const glm::vec3 center = 0.5F * (box.min + box.max);
++    const float radius = glm::length(box.max - center);
++    rx::asset::AABB cube;
++    cube.min = center - glm::vec3(radius);
++    cube.max = center + glm::vec3(radius);
++    return cube;
++}
++
++// Port of getSceneExtents()'s own accumulation loop: ONE
++// sphereInscribingCubeOf() call PER PRIMITIVE (RendererX's own Submesh
++// granularity -- verified load-bearing this task: MetalRoughSpheresNo
++// Textures' own "Metal"/"Non-metal"/"Smooth"/"Rough" text-label meshes
++// are each MULTIPLE primitives, one per glyph, so computing this at
++// per-INSTANCE/whole-mesh granularity instead would silently diverge from
++// the reference for exactly that model), unioned together via plain
++// AABB::unionOf(). `perPrimitiveWorldBounds`: each submesh's own LOCAL
++// `Submesh::bounds` transformed by its owning instance's world transform
++// (`AABB::transformed()`) -- the caller's own responsibility (this
++// function is a pure accumulator, no Registry/Scene dependency, matching
++// this codebase's own established "small composable free function" shape
++// for exactly this kind of derived-geometry helper).
++[[nodiscard]] inline rx::asset::AABB accumulateReferenceStyleSceneExtents(
++    std::span<const rx::asset::AABB> perPrimitiveWorldBounds) {
++    rx::asset::AABB result;
++    for (const rx::asset::AABB& box : perPrimitiveWorldBounds) {
++        result = rx::asset::AABB::unionOf(result, sphereInscribingCubeOf(box));
++    }
++    return result;
++}
++
++struct CameraFit {
++    glm::vec3 position{0.0F, 0.0F, 1.0F};
++    glm::vec3 target{0.0F, 0.0F, 0.0F};
++    float yfovRadians = glm::radians(45.0F);  // user_camera.js's own PerspectiveCamera default (source/gltf/camera.js).
++    float znear = 0.01F;
++    float zfar = 100.0F;
++};
++
++// `worldBoundsAABB`: MUST be `accumulateReferenceStyleSceneExtents()`'s
++// own output (this header's own function above), NOT a plain tight union
++// of instance/submesh world bounds (e.g. samples/08_gltf_viewer's own
++// App::sceneBoundsWorld / rx::asset::AABB::unionOf over InstanceRecord::
++// worldBounds) -- see that function's own header comment for why the
++// distinction is load-bearing, not stylistic: the reference renderer's
++// own resetView() ALWAYS fits against the sphere-inscribing-cube-unioned
++// extent, never the tight box. `aspectRatio`/`yfovRadians` default to
++// this harness's own fixed settings (512x512 square render, 45-degree
++// default yfov, matching user_camera.js's own PerspectiveCamera default
++// AND harness.html's own unmodified state.userCamera.perspective.yfov)
++// -- overridable only for device-free unit testing at other aspect
++// ratios.
++// settings (512x512 square render, 45-degree default yfov, matching
++// user_camera.js's own PerspectiveCamera default AND harness.html's own
++// unmodified state.userCamera.perspective.yfov) -- overridable only for
++// device-free unit testing at other aspect ratios.
++//
++// A degenerate (invalid, i.e. never-expanded) AABB returns CameraFit's
++// own struct defaults (a fixed unit-distance framing looking at the
++// origin) rather than dividing by zero or asserting -- mirrors this
++// codebase's own established "never crash on a real content edge case"
++// posture (e.g. rx::asset::AABB::isValid()'s own doc comment), even
++// though no committed conformance model actually produces this case.
++[[nodiscard]] CameraFit fitCameraToScene(const rx::asset::AABB& worldBoundsAABB, float aspectRatio = 1.0F,
++                                          float yfovRadians = glm::radians(45.0F));
++
++}  // namespace rx::conformance
+diff --git a/tests/conformance/main.cpp b/tests/conformance/main.cpp
+new file mode 100644
+index 0000000..184513c
+--- /dev/null
++++ b/tests/conformance/main.cpp
+@@ -0,0 +1,1707 @@
++// tests/conformance/main.cpp -- rx_conformance_render: Phase 5 Stage 1
++// Task 11 (#47), gate ruling T11's own glTF PBR conformance harness.
++//
++// Renders ONE named conformance model (--model <Name>, tests/conformance/
++// models.h's own registry) headlessly through RendererX's real
++// StandardPBR/Unlit forward path (identical MaterialSystem/GeometryPool/
++// TextureCache/rx::ibl bake-chain machinery samples/08_gltf_viewer
++// already exercises -- this file adapts that sample's own known-working
++// App/makeApp/setupMaterials/buildDrawList/recordSceneDraws shape rather
++// than re-deriving it, per this project's own "reuse over reinvention"
++// posture applied internally), frames the camera via camera_fit.h's
++// ported resetView() algorithm, and gates the captured RGBA8 image
++// against a committed Khronos Sample Viewer reference PNG
++// (tests/conformance/references/<Name>/reference.png, generated by
++// tools/gltf_conformance/generate_reference.mjs -- NEVER regenerated by
++// this binary) via samples/common/reference_gate.h's tolerance-gate
++// primitive with models.h's own per-model tolerance.
++//
++// DELIBERATE DIFFERENCES FROM sample08_gltf_viewer (every one load-
++// bearing for cross-renderer conformance, not stylistic):
++//  - Synchronous rx::asset::Registry::importGltf() (damaged_helmet_test.
++//    cpp's own convention) -- no async/loading-state UX needed here.
++//  - NO fake directional key light: sample08's own updateDrawDataPerPass
++//    Fields() bakes in an improvised `lightColor=(5,5,5)` FG2 stand-in
++//    (glTF punctual lights are not consumed until Stage 2/Task 13) --
++//    every conformance model this ticket gates is IBL-only content (no
++//    KHR_lights_punctual), so carrying that fake light into THIS capture
++//    would be a large, systematic, unaccounted divergence against a
++//    reference that has no such light at all. This file's own
++//    updateDrawDataPerPassFields() zeroes lightColor/lightDirWorld.
++//  - NO skybox pass / no visible environment background: the committed
++//    references are generated with `renderEnvironmentMap: false`
++//    (harness.html's own methodology comment) -- IBL diffuse/specular
++//    terms are still fully live (rx::ibl::bakeEnvironment() + Environment
++//    Desc, unchanged from sample08's own setupEnvironment()), only the
++//    visible cubemap background draw is skipped, matching the reference
++//    side exactly.
++//  - A NEW linear-clamp "tonemap" pass (shaders/conformance/
++//    tonemap_linear.frag.slang) instead of shaders/multipass/tonemap.
++//    frag.slang's own Reinhard curve -- see that new shader's own header
++//    comment for why: isolates BRDF/lighting/IBL conformance from the
++//    orthogonal tonemap-CURVE question (Phase 5 Task 32), which neither
++//    renderer would otherwise agree on by construction (Reinhard vs. the
++//    Sample Viewer's KHR_PBR_NEUTRAL/ACES/NONE options are different
++//    curves; NONE -- the reference side's own choice -- is the one this
++//    file's own new shader reproduces bit-for-bit).
++//  - Camera is ALWAYS the ported fitCameraToScene() result (camera_fit.h)
++//    -- no orbit-drag, no --exposure (pre-exposure stays neutral, 1.0,
++//    matching the reference side's own `exposure: 1.0`).
++//  - `--perturb-roughness`: this ticket's own required discrimination
++//    proof mechanism ("perturb roughness constant -> gate fails") --
++//    OVERRIDES every StandardPBR material's own roughnessFactor param to
++//    a fixed constant (kPerturbedRoughnessValue, 0.02) after
++//    setupMaterials(), before the real draw. Absolute override, not a
++//    relative scale/offset -- see overrideFloatMaterialParamIfPresent()'s
++//    own header comment for why two relative mechanisms were tried and
++//    rejected first (each has its own real "fixed point" content case).
++#include <rx_asset/geometry_pool.h>
++#include <rx_asset/registry.h>
++#include <rx_asset/texture_cache.h>
++#include <rx_asset/texture_decode.h>
++#include <rx_core/log.h>
++#include <rx_graph/executor.h>
++#include <rx_graph/render_graph.h>
++#include <rx_graph/scene_color.h>
++#include <rx_ibl/bake.h>
++#include <rx_material/draw_data.h>
++#include <rx_material/material_system.h>
++#include <rx_material/param_arena_factory.h>
++#include <rx_platform/window.h>
++#include <rx_rhi_vk/bindless.h>
++#include <rx_rhi_vk/buffer.h>
++#include <rx_rhi_vk/command.h>
++#include <rx_rhi_vk/context.h>
++#include <rx_rhi_vk/deletion_queue.h>
++#include <rx_rhi_vk/descriptor_arena.h>
++#include <rx_rhi_vk/device.h>
++#include <rx_rhi_vk/per_frame_storage_buffer.h>
++#include <rx_rhi_vk/pipeline_layout.h>
++#include <rx_rhi_vk/texture.h>
++#include <rx_rhi_vk/upload.h>
++#include <rx_scene/camera.h>
++#include <rx_scene/scene.h>
++#include <rx_shader/compiler.h>
++#include <rx_shader/reflection.h>
++#include <rx_task/scheduler.h>
++
++#include "camera_fit.h"
++#include "models.h"
++#include <reference_gate.h>
++
++#define GLM_FORCE_DEPTH_ZERO_TO_ONE
++#include <glm/glm.hpp>
++#include <glm/gtc/matrix_transform.hpp>
++
++#include <SDL3/SDL.h>
++#include <volk.h>
++
++#include <algorithm>
++#include <array>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++namespace {
++
++constexpr uint32_t kRenderWidth = 512;
++constexpr uint32_t kRenderHeight = 512;
++constexpr VkDeviceSize kRenderPixelBytes = static_cast<VkDeviceSize>(kRenderWidth) * kRenderHeight * 4;
++constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++// Explicit, NOT `device->swapchainFormat()` -- see tonemap_linear.frag.
++// slang's own header comment: this tool's own tonemap shader does its OWN
++// explicit `pow(x, 1/2.2)` sRGB encode, so the backbuffer attachment MUST
++// be a plain UNORM format (no hardware sRGB re-encode on write, which
++// would double-encode against an _SRGB attachment).
++constexpr VkFormat kBackbufferFormat = VK_FORMAT_R8G8B8A8_UNORM;
++
++// Matches harness.html's own `state.renderingParameters.clearColor =
++// [0.22, 0.25, 0.29, 1.0]` -- an SRGB-DOMAIN literal (what both sides'
++// own tonemap paths ultimately write to their 8-bit backbuffer for an
++// untouched background pixel). This tool's own forward pass clears its
++// LINEAR HDR target, so the literal must be converted back to linear
++// first (pow(c, 2.2)) -- the inverse of tonemap_linear.frag.slang's own
++// `pow(clamped, 1/2.2)` -- so that after THIS tool's own tonemap pass
++// re-applies that forward encode, the final 8-bit value matches the
++// reference's literal exactly (up to encode/decode rounding).
++float srgbLiteralToLinear(float c) { return std::pow(c, 2.2F); }
++const VkClearColorValue kConformanceClearColor{
++    {srgbLiteralToLinear(0.22F), srgbLiteralToLinear(0.25F), srgbLiteralToLinear(0.29F), 1.0F}};
++
++struct Args {
++    std::string model;
++    bool perturbRoughness = false;
++    bool validate = false;
++    std::string dumpPath;
++};
++
++// [Discrimination proof] The fixed override value --perturb-roughness
++// applies to every StandardPBR material's own roughnessFactor param --
++// see overrideFloatMaterialParamIfPresent()'s own header comment for why
++// this is a plain boolean flag with ONE hardcoded value, not a
++// user-supplied number: this tool needs exactly one canonical, always-
++// wrong render to prove the gate discriminates, not a general fuzzing
++// knob, and a fixed constant sidesteps any "0.0 the sentinel for no
++// perturbation" vs. "0.0 a legitimate override value" ambiguity a
++// float CLI argument would otherwise carry.
++constexpr float kPerturbedRoughnessValue = 0.02F;
++
++std::optional<Args> parseArgs(int argc, char** argv) {
++    Args args;
++    for (int i = 1; i < argc; ++i) {
++        const std::string_view arg = argv[i];
++        if (arg == "--model" && i + 1 < argc) {
++            args.model = argv[++i];
++        } else if (arg == "--validate") {
++            args.validate = true;
++        } else if (arg == "--perturb-roughness") {
++            args.perturbRoughness = true;
++        } else if (arg == "--dump" && i + 1 < argc) {
++            args.dumpPath = argv[++i];
++        } else {
++            RX_LOG_ERROR("rx_conformance_render: unrecognized argument '{}'", arg);
++            return std::nullopt;
++        }
++    }
++    if (args.model.empty()) {
++        RX_LOG_ERROR("rx_conformance_render: --model <Name> is required");
++        return std::nullopt;
++    }
++    return args;
++}
++
++// --- Shader compile plumbing [copied verbatim from samples/08_gltf_viewer/
++// main.cpp's own identically-named helpers -- see that file's own header
++// comment for the "per-sample/per-tool independence, copied not shared"
++// convention this project already established] --------------------------
++VkShaderModule createShaderModuleFromSpirv(VkDevice device, const std::vector<uint32_t>& code) {
++    if (code.empty()) {
++        return VK_NULL_HANDLE;
++    }
++    VkShaderModuleCreateInfo info{};
++    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++    info.codeSize = code.size() * sizeof(uint32_t);
++    info.pCode = code.data();
++    VkShaderModule module = VK_NULL_HANDLE;
++    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS) {
++        return VK_NULL_HANDLE;
++    }
++    return module;
++}
++
++std::optional<std::string> readAndConcatenate(const std::vector<std::string>& paths) {
++    std::string combined;
++    for (const auto& path : paths) {
++        std::ifstream file(path, std::ios::binary);
++        if (!file.is_open()) {
++            RX_LOG_ERROR("rx_conformance_render: failed to open shader file '{}'", path);
++            return std::nullopt;
++        }
++        std::ostringstream contents;
++        contents << file.rdbuf();
++        combined += contents.str();
++        combined += "\n";
++    }
++    return combined;
++}
++
++struct ReflectedModule {
++    rx::shader::CompileResult compileResult;
++    rx::shader::ShaderLayoutInfo layoutInfo;
++};
++
++std::optional<ReflectedModule> compileAndReflect(rx::shader::Compiler& compiler, const std::string& moduleName,
++                                                  const std::vector<std::string>& paths,
++                                                  const std::vector<std::string>& entryPoints) {
++    auto source = readAndConcatenate(paths);
++    if (!source.has_value()) {
++        return std::nullopt;
++    }
++    rx::shader::CompileResult compileResult = compiler.compileFromSource(moduleName, *source, entryPoints);
++    if (!compileResult.ok) {
++        RX_LOG_ERROR("rx_conformance_render: shader compile failed for module '{}':\n{}", moduleName,
++                     compileResult.diagnostics);
++        return std::nullopt;
++    }
++    auto layoutInfo = rx::shader::reflect(compileResult);
++    if (!layoutInfo.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: reflect() failed for module '{}'", moduleName);
++        return std::nullopt;
++    }
++    return ReflectedModule{std::move(compileResult), std::move(*layoutInfo)};
++}
++
++struct CompiledPass {
++    VkShaderModule vertModule = VK_NULL_HANDLE;
++    VkShaderModule fragModule = VK_NULL_HANDLE;
++    rx::rhi::PipelineLayoutBundle layoutBundle;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    uint32_t pushConstantOffset = 0;
++    uint32_t pushConstantSize = 0;
++    VkShaderStageFlags pushConstantStages = 0;
++};
++
++void destroyCompiledPass(VkDevice device, CompiledPass& pass) {
++    if (pass.pipeline != VK_NULL_HANDLE) {
++        vkDestroyPipeline(device, pass.pipeline, nullptr);
++        pass.pipeline = VK_NULL_HANDLE;
++    }
++    if (pass.fragModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, pass.fragModule, nullptr);
++        pass.fragModule = VK_NULL_HANDLE;
++    }
++    if (pass.vertModule != VK_NULL_HANDLE) {
++        vkDestroyShaderModule(device, pass.vertModule, nullptr);
++        pass.vertModule = VK_NULL_HANDLE;
++    }
++    pass.layoutBundle = rx::rhi::PipelineLayoutBundle{};
++    pass.pushConstantOffset = 0;
++    pass.pushConstantSize = 0;
++    pass.pushConstantStages = 0;
++}
++
++bool assignShaderModules(VkDevice device, const rx::shader::CompileResult& compileResult, const char* vertEntryName,
++                          const char* fragEntryName, CompiledPass& pass) {
++    for (const auto& blob : compileResult.entryPointCode) {
++        VkShaderModule module = createShaderModuleFromSpirv(device, blob.code);
++        if (module == VK_NULL_HANDLE) {
++            RX_LOG_ERROR("rx_conformance_render: vkCreateShaderModule failed for entry point '{}'",
++                         blob.entryPointName);
++            return false;
++        }
++        if (blob.entryPointName == vertEntryName) {
++            pass.vertModule = module;
++        } else if (fragEntryName != nullptr && blob.entryPointName == fragEntryName) {
++            pass.fragModule = module;
++        } else {
++            RX_LOG_ERROR("rx_conformance_render: unexpected entry point '{}'", blob.entryPointName);
++            vkDestroyShaderModule(device, module, nullptr);
++            return false;
++        }
++    }
++    if (pass.vertModule == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("rx_conformance_render: missing vertex entry point '{}'", vertEntryName);
++        return false;
++    }
++    if (fragEntryName != nullptr && pass.fragModule == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("rx_conformance_render: missing fragment entry point '{}'", fragEntryName);
++        return false;
++    }
++    return true;
++}
++
++struct TonemapPushConstants {
++    uint32_t hdrTextureIndex;
++    uint32_t hdrSamplerIndex;
++};
++
++// Builds the LINEAR-CLAMP tonemap pipeline (shaders/multipass/tonemap.
++// vert.slang + shaders/conformance/tonemap_linear.frag.slang -- see this
++// file's own top comment for why NOT shaders/multipass/tonemap.frag.
++// slang). Structurally identical to sample08_gltf_viewer's own
++// buildTonemapPipeline() (copied, not shared) except for the two shader
++// paths and `kBackbufferFormat` above.
++bool buildTonemapPipeline(VkDevice device, rx::shader::Compiler& compiler, VkDescriptorSetLayout bindlessSetLayout,
++                          const std::filesystem::path& tonemapVertPath, const std::filesystem::path& tonemapFragPath,
++                          CompiledPass& tonemapPass) {
++    destroyCompiledPass(device, tonemapPass);
++
++    auto reflected = compileAndReflect(compiler, "ConformanceTonemapModule",
++                                        {tonemapVertPath.string(), tonemapFragPath.string()}, {"vsMain", "fsMain"});
++    if (!reflected.has_value()) {
++        return false;
++    }
++    if (reflected->layoutInfo.pushRanges.size() != 1 ||
++        reflected->layoutInfo.pushRanges[0].size != sizeof(TonemapPushConstants)) {
++        RX_LOG_ERROR("rx_conformance_render: tonemap shader reflects an unexpected push-constant shape");
++        return false;
++    }
++
++    auto layoutBundle = rx::rhi::PipelineLayoutBuilder::build(device, reflected->layoutInfo, bindlessSetLayout);
++    if (!layoutBundle.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: PipelineLayoutBuilder::build failed for the tonemap pass");
++        return false;
++    }
++    tonemapPass.layoutBundle = std::move(*layoutBundle);
++    tonemapPass.pushConstantOffset = reflected->layoutInfo.pushRanges[0].offset;
++    tonemapPass.pushConstantSize = reflected->layoutInfo.pushRanges[0].size;
++    tonemapPass.pushConstantStages = reflected->layoutInfo.pushRanges[0].stages;
++
++    if (!assignShaderModules(device, reflected->compileResult, "vsMain", "fsMain", tonemapPass)) {
++        destroyCompiledPass(device, tonemapPass);
++        return false;
++    }
++
++    VkPipelineVertexInputStateCreateInfo vertexInputState{};
++    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++
++    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
++    inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    VkPipelineViewportStateCreateInfo viewportState{};
++    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewportState.viewportCount = 1;
++    viewportState.scissorCount = 1;
++
++    VkPipelineRasterizationStateCreateInfo rasterizationState{};
++    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterizationState.cullMode = VK_CULL_MODE_NONE;
++    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterizationState.lineWidth = 1.0F;
++
++    VkPipelineMultisampleStateCreateInfo multisampleState{};
++    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineColorBlendAttachmentState blendAttachment{};
++    blendAttachment.blendEnable = VK_FALSE;
++    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
++                                      VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo colorBlendState{};
++    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    colorBlendState.attachmentCount = 1;
++    colorBlendState.pAttachments = &blendAttachment;
++
++    std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++    VkPipelineDynamicStateCreateInfo dynamicState{};
++    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
++    dynamicState.pDynamicStates = dynamicStates.data();
++
++    VkPipelineRenderingCreateInfo renderingCreateInfo{};
++    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    renderingCreateInfo.colorAttachmentCount = 1;
++    renderingCreateInfo.pColorAttachmentFormats = &kBackbufferFormat;
++
++    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
++    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[0].module = tonemapPass.vertModule;
++    stages[0].pName = "main";
++    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++    stages[1].module = tonemapPass.fragModule;
++    stages[1].pName = "main";
++
++    VkGraphicsPipelineCreateInfo pipelineInfo{};
++    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++    pipelineInfo.pNext = &renderingCreateInfo;
++    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
++    pipelineInfo.pStages = stages.data();
++    pipelineInfo.pVertexInputState = &vertexInputState;
++    pipelineInfo.pInputAssemblyState = &inputAssemblyState;
++    pipelineInfo.pViewportState = &viewportState;
++    pipelineInfo.pRasterizationState = &rasterizationState;
++    pipelineInfo.pMultisampleState = &multisampleState;
++    pipelineInfo.pColorBlendState = &colorBlendState;
++    pipelineInfo.pDynamicState = &dynamicState;
++    pipelineInfo.layout = tonemapPass.layoutBundle.layout;
++    pipelineInfo.renderPass = VK_NULL_HANDLE;
++    pipelineInfo.basePipelineIndex = -1;
++
++    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &tonemapPass.pipeline) !=
++        VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateGraphicsPipelines failed for the tonemap pass");
++        destroyCompiledPass(device, tonemapPass);
++        return false;
++    }
++    return true;
++}
++
++// --- Material setup helpers [copied from samples/08_gltf_viewer/main.cpp] --
++rx::material::PassSignature forwardPassSignature() {
++    rx::material::PassSignature sig;
++    sig.colorFormats[0] = rx::graph::kHdrFormat;
++    sig.colorCount = 1;
++    sig.depthFormat = kDepthFormat;
++    sig.samples = VK_SAMPLE_COUNT_1_BIT;
++    return sig;
++}
++
++struct DrawItem {
++    uint32_t blockId = 0;
++    uint32_t firstIndex = 0;
++    uint32_t indexCount = 0;
++    int32_t vertexOffset = 0;
++    uint32_t drawDataRow = 0;
++    size_t materialBindingIndex = 0;
++};
++
++struct MaterialGpuBinding {
++    rx::material::MaterialHandle handle;
++    std::vector<uint8_t> paramBlob;
++    std::optional<rx::rhi::Buffer> paramBuffer;
++    VkDescriptorSet paramSet = VK_NULL_HANDLE;
++    uint32_t pushOffset = 0;
++    uint32_t pushSize = 0;
++    VkShaderStageFlags pushStages = 0;
++};
++
++template <typename T>
++bool setMaterialParam(std::vector<uint8_t>& blob, const std::vector<rx::material::MaterialParamInfo>& params,
++                      const char* name, const T& value) {
++    for (const auto& p : params) {
++        if (p.name == name) {
++            if (p.size != sizeof(T)) {
++                RX_LOG_ERROR("rx_conformance_render: material param '{}' reflected size {} != sizeof(T) {}", name,
++                             p.size, sizeof(T));
++                return false;
++            }
++            std::memcpy(blob.data() + p.offset, &value, sizeof(T));
++            return true;
++        }
++    }
++    RX_LOG_ERROR("rx_conformance_render: material param '{}' not found in reflection", name);
++    return false;
++}
++
++// [Discrimination proof, --perturb-roughness-value] Unlike
++// setMaterialParam() above, ABSENCE is not an error here -- Unlit
++// materials have no `roughnessFactor` param at all, and that is a
++// legitimate, expected case this function must silently no-op for
++// (returns false, no log) rather than treating as a setup bug.
++//
++// ABSOLUTE OVERRIDE (blob := value), NOT relative to whatever the
++// material already had -- TWO relative mechanisms were tried first and
++// both found INSUFFICIENT, for complementary "fixed point" reasons this
++// header comment records rather than silently discarding the finding:
++//  (1) MULTIPLICATIVE (current *= factor): MetalRoughSpheres' own
++//      roughness=0.0 column (the grid's own mirror-smooth, most-
++//      visually-distinctive spheres) is a fixed point under
++//      multiplication (`0 * anyFactor == 0`) -- that whole column stayed
++//      bit-identical regardless of factor magnitude.
++//  (2) ADDITIVE, clamped (current = clamp(current + delta, 0, 1)):
++//      MetalRoughSpheres' own single shared material's own
++//      `roughnessFactor` is ALREADY at glTF's neutral default (1.0 --
++//      the model's real per-sphere roughness VARIATION is baked into
++//      `Spheres_MetalRough.png`'s own texture data, `roughnessFactor`
++//      is just the spec's multiplier on top of it); clamping at the
++//      SAME boundary (1.0) the value already sits AT is *itself* the new
++//      fixed point -- reproduced directly this task (0.3/0.5/0.6/0.8
++//      delta all produced the IDENTICAL, unperturbed render).
++// An absolute override has no such fixed point for any starting value
++// materially different from the chosen override (0.02 -- see this
++// function's own caller).
++bool overrideFloatMaterialParamIfPresent(std::vector<uint8_t>& blob,
++                                          const std::vector<rx::material::MaterialParamInfo>& params,
++                                          const char* name, float value) {
++    for (const auto& p : params) {
++        if (p.name == name && p.size == sizeof(float)) {
++            std::memcpy(blob.data() + p.offset, &value, sizeof(float));
++            return true;
++        }
++    }
++    return false;
++}
++
++rx::material::AlphaMode toMaterialAlphaMode(rx::asset::AlphaMode mode) {
++    switch (mode) {
++        case rx::asset::AlphaMode::Opaque:
++            return rx::material::AlphaMode::Opaque;
++        case rx::asset::AlphaMode::Mask:
++            return rx::material::AlphaMode::Mask;
++        case rx::asset::AlphaMode::Blend:
++            return rx::material::AlphaMode::Blend;
++    }
++    return rx::material::AlphaMode::Opaque;
++}
++
++uint32_t resolveTextureIndex(rx::asset::TextureCache& textures, const rx::asset::TextureRef& ref,
++                              rx::asset::TextureRole role) {
++    if (!ref.present) {
++        return textures.resolve(textures.fallbackHandle(role)).bindlessIndex;
++    }
++    return textures.resolve(ref.handle).bindlessIndex;
++}
++
++uint32_t resolveSamplerIndex(rx::asset::TextureCache& textures, const rx::asset::TextureRef& ref,
++                              uint32_t fallbackIndex) {
++    std::optional<uint32_t> index = textures.getOrCreateSamplerBindlessIndex(ref.sampler);
++    return index.value_or(fallbackIndex);
++}
++
++std::array<float, 4> uvTransformParam(const rx::asset::TextureRef& ref) {
++    return {ref.uvOffset.x, ref.uvOffset.y, ref.uvScale.x, ref.uvScale.y};
++}
++
++// --- App state [trimmed from samples/08_gltf_viewer's own App -- no
++// present/orbit-camera/async-import/skybox fields; see this file's own
++// top comment for the full list of deliberate omissions] -----------------
++struct App {
++    std::optional<rx::platform::Window> window;
++    std::optional<rx::rhi::Context> context;
++    VkSurfaceKHR surface = VK_NULL_HANDLE;
++    std::optional<rx::rhi::Device> device;
++    std::optional<rx::rhi::Allocator> allocator;
++    std::optional<rx::rhi::Uploader> uploader;
++    std::optional<rx::rhi::BindlessTable> bindless;
++    std::optional<rx::rhi::DeletionQueue> deletionQueue;
++    std::unique_ptr<rx::material::MaterialSystem> materialSystem;
++    std::unique_ptr<rx::asset::GeometryPool> geometryPool;
++    std::unique_ptr<rx::asset::TextureCache> textureCache;
++    std::unique_ptr<rx::asset::Registry> registry;
++    std::unique_ptr<rx::task::Scheduler> scheduler;
++    std::unique_ptr<rx::graph::Executor> executor;
++
++    CompiledPass tonemapPass;
++    VkSampler defaultSampler = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle defaultSamplerHandle;
++    VkImageView lastHdrView = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle hdrHandle;
++
++    std::optional<rx::material::DemandSizedMaterialParamArena> materialParamArena;
++    std::vector<MaterialGpuBinding> materialBindings;
++    std::unordered_map<uint32_t, size_t> materialHandleToBinding;
++    std::vector<DrawItem> draws;
++    std::optional<rx::rhi::PerFrameStorageBuffer> drawDataBuffer;
++    uint32_t currentFrameSlot = 0;
++    std::vector<rx::material::DrawDataGpu> drawDataRows;
++
++    // --- Environment / IBL (no skybox -- see this file's own top comment) --
++    std::optional<rx::scene::Scene> scene;
++    std::optional<rx::ibl::BakeResult> environment;
++    VkSampler envCubeSampler = VK_NULL_HANDLE;
++    VkSampler envDfgSampler = VK_NULL_HANDLE;
++    rx::rhi::BindlessHandle envBaseCubeHandle;
++    rx::rhi::BindlessHandle envIrradianceHandle;
++    rx::rhi::BindlessHandle envPrefilteredHandle;
++    rx::rhi::BindlessHandle envDfgLutHandle;
++    rx::rhi::BindlessHandle envCubeSamplerHandle;
++    rx::rhi::BindlessHandle envDfgSamplerHandle;
++    float envIntensityPhysical = 1.0F;
++};
++
++// [Copied from samples/08_gltf_viewer's own basePathDirectory() idiom]
++// The directory the running binary itself lives in (SDL_GetBasePath()) --
++// used ONLY for this process's own pipeline-cache file (a build-tree-
++// relative, preset-agnostic location); every glTF/shader/reference asset
++// this tool reads is resolved via RX_REPO_ROOT_DIR instead (this file's
++// own top comment / CMakeLists.txt's own header comment explain why this
++// tool, unlike a redistributed sample, reads straight from the source
++// tree).
++std::filesystem::path basePathDirectory() {
++    const char* basePath = SDL_GetBasePath();
++    if (basePath == nullptr) {
++        RX_LOG_WARN("rx_conformance_render: SDL_GetBasePath failed ({}); using the current directory instead",
++                    SDL_GetError());
++        return ".";
++    }
++    return std::filesystem::path(basePath);
++}
++
++std::unique_ptr<App> makeApp(bool validate) {
++    auto app = std::make_unique<App>();
++
++    auto window = rx::platform::Window::create("rx_conformance_render", static_cast<int>(kRenderWidth),
++                                                 static_cast<int>(kRenderHeight), /*visible=*/false);
++    if (!window.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Window::create failed: no display backend available");
++        return nullptr;
++    }
++    auto extensions = window->requiredVulkanInstanceExtensions();
++    if (extensions.empty()) {
++        RX_LOG_ERROR("rx_conformance_render: video driver reports no Vulkan surface extensions");
++        return nullptr;
++    }
++    auto context = rx::rhi::Context::create(extensions, validate);
++    if (!context.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Context::create failed");
++        return nullptr;
++    }
++    app->window.emplace(std::move(*window));
++    app->context.emplace(std::move(*context));
++
++    app->surface = app->window->createVulkanSurface(app->context->instance());
++    if (app->surface == VK_NULL_HANDLE) {
++        RX_LOG_ERROR("rx_conformance_render: createVulkanSurface failed");
++        return nullptr;
++    }
++
++    auto device = rx::rhi::Device::create(*app->context, app->surface);
++    if (!device.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Device::create failed");
++        return nullptr;
++    }
++    app->device.emplace(std::move(*device));
++
++    auto allocator = rx::rhi::Allocator::create(*app->context, *app->device);
++    if (!allocator.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Allocator::create failed");
++        return nullptr;
++    }
++    app->allocator.emplace(std::move(*allocator));
++
++    auto uploader = rx::rhi::Uploader::create(*app->allocator, *app->device);
++    if (!uploader.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Uploader::create failed");
++        return nullptr;
++    }
++    app->uploader.emplace(std::move(*uploader));
++
++    rx::rhi::BindlessTable::Capacities capacities{/*sampledImages=*/256, /*samplers=*/16, /*storageBuffers=*/8};
++    capacities.comparisonSamplers = 1;
++    capacities.cubeImages = 4;
++    auto bindless =
++        rx::rhi::BindlessTable::create(app->device->physicalDevice(), app->device->device(), capacities);
++    if (!bindless.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: BindlessTable::create failed");
++        return nullptr;
++    }
++    app->bindless.emplace(std::move(*bindless));
++    app->deletionQueue.emplace();
++
++    const std::filesystem::path sharedShaderDir = std::filesystem::path(RX_REPO_ROOT_DIR) / "shaders" / "material";
++    // Pipeline cache lives next to the BINARY (SDL_GetBasePath(), matching
++    // samples/08_gltf_viewer's own `basePath / "gltf_viewer_pipeline.cache"`
++    // convention) -- NOT under a hardcoded "<repo>/build/" path (which
++    // assumed a single, specific preset's own build directory name/layout
++    // and would be wrong for any other preset).
++    app->materialSystem = rx::material::MaterialSystem::create(
++        *app->device, *app->bindless, basePathDirectory() / "rx_conformance_render_pipeline.cache", sharedShaderDir);
++    if (app->materialSystem == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: MaterialSystem::create failed");
++        return nullptr;
++    }
++
++    app->geometryPool = rx::asset::GeometryPool::create(*app->allocator, *app->device, *app->uploader);
++    if (app->geometryPool == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: GeometryPool::create failed");
++        return nullptr;
++    }
++
++    app->textureCache = rx::asset::TextureCache::create(*app->allocator, *app->device, *app->uploader,
++                                                          *app->bindless, *app->deletionQueue);
++    if (app->textureCache == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: TextureCache::create failed");
++        return nullptr;
++    }
++
++    app->registry = std::make_unique<rx::asset::Registry>();
++    app->scheduler = rx::task::Scheduler::create();
++    if (app->scheduler == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: Scheduler::create failed");
++        return nullptr;
++    }
++    app->executor = rx::graph::Executor::create(*app->device, *app->scheduler);
++    if (app->executor == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: Executor::create failed");
++        return nullptr;
++    }
++
++    VkSamplerCreateInfo samplerInfo{};
++    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    samplerInfo.magFilter = VK_FILTER_LINEAR;
++    samplerInfo.minFilter = VK_FILTER_LINEAR;
++    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
++    if (vkCreateSampler(app->device->device(), &samplerInfo, nullptr, &app->defaultSampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateSampler (default sampler) failed");
++        return nullptr;
++    }
++    app->defaultSamplerHandle = app->bindless->registerSampler(app->defaultSampler);
++    if (!app->defaultSamplerHandle.isValid()) {
++        RX_LOG_ERROR("rx_conformance_render: BindlessTable::registerSampler (default sampler) failed");
++        return nullptr;
++    }
++
++    auto compiler = rx::shader::Compiler::create();
++    if (!compiler.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: rx::shader::Compiler::create failed");
++        return nullptr;
++    }
++    const std::filesystem::path repoRoot(RX_REPO_ROOT_DIR);
++    if (!buildTonemapPipeline(app->device->device(), *compiler, app->bindless->descriptorSetLayout(),
++                              repoRoot / "shaders" / "multipass" / "tonemap.vert.slang",
++                              repoRoot / "shaders" / "conformance" / "tonemap_linear.frag.slang", app->tonemapPass)) {
++        return nullptr;
++    }
++
++    app->scene.emplace([](rx::asset::MeshHandle) { return rx::asset::AABB{}; });
++
++    return app;
++}
++
++uint32_t materialSpecializationBits(const App& app) {
++    return app.scene->hasEnvironment() ? rx::material::kSpecializationEnergyCompensation : 0U;
++}
++
++// [Copied from samples/08_gltf_viewer's own loadEquirectHdr()] Loads an
++// equirect HDR directly (bypassing TextureCache -- temporary bake input).
++std::optional<rx::rhi::Texture2D> loadEquirectHdr(rx::rhi::Device& device, rx::rhi::Allocator& allocator,
++                                                    rx::rhi::Uploader& uploader, const std::filesystem::path& path) {
++    std::ifstream file(path, std::ios::binary | std::ios::ate);
++    if (!file.is_open()) {
++        RX_LOG_ERROR("rx_conformance_render: failed to open environment file '{}'", path.string());
++        return std::nullopt;
++    }
++    const std::streamsize fileSize = file.tellg();
++    if (fileSize <= 0) {
++        RX_LOG_ERROR("rx_conformance_render: environment file '{}' is empty or unreadable", path.string());
++        return std::nullopt;
++    }
++    file.seekg(0, std::ios::beg);
++    std::vector<std::byte> bytes(static_cast<size_t>(fileSize));
++    if (!file.read(reinterpret_cast<char*>(bytes.data()), fileSize)) {
++        RX_LOG_ERROR("rx_conformance_render: failed to read environment file '{}'", path.string());
++        return std::nullopt;
++    }
++
++    VkPhysicalDeviceProperties props{};
++    vkGetPhysicalDeviceProperties(device.physicalDevice(), &props);
++    auto isFormatSupported = [&](VkFormat format) {
++        VkFormatProperties2 formatProps{};
++        formatProps.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++        vkGetPhysicalDeviceFormatProperties2(device.physicalDevice(), format, &formatProps);
++        constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++        return (formatProps.formatProperties.optimalTilingFeatures & kNeeded) == kNeeded;
++    };
++    rx::asset::TextureDecodeResult decoded = rx::asset::decodeTextureForUpload(
++        bytes, rx::asset::TextureRole::Environment, props.limits.maxImageDimension2D, isFormatSupported);
++    if (decoded.outcome != rx::asset::TextureDecodeResult::Outcome::Ready) {
++        RX_LOG_ERROR("rx_conformance_render: failed to decode environment '{}': {}", path.string(),
++                     decoded.failureReason);
++        return std::nullopt;
++    }
++    if (decoded.isCube) {
++        RX_LOG_ERROR("rx_conformance_render: environment '{}' decoded as a CUBE container -- unsupported here",
++                     path.string());
++        return std::nullopt;
++    }
++
++    auto texture = rx::rhi::Texture2D::createForPresuppliedMips(
++        device.physicalDevice(), device.device(), allocator, VkExtent2D{decoded.width, decoded.height},
++        decoded.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++        static_cast<uint32_t>(decoded.levels.size()));
++    if (!texture.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: Texture2D::createForPresuppliedMips failed for environment '{}'",
++                     path.string());
++        return std::nullopt;
++    }
++
++    std::vector<rx::rhi::Uploader::ImageMipLevel> uploadLevels;
++    uploadLevels.reserve(decoded.levels.size());
++    for (const rx::asset::DecodedTextureLevel& level : decoded.levels) {
++        rx::rhi::Uploader::ImageMipLevel entry;
++        entry.data = level.bytes.data();
++        entry.size = static_cast<VkDeviceSize>(level.bytes.size());
++        entry.mipLevel = level.level;
++        entry.extent = {level.width, level.height};
++        uploadLevels.push_back(entry);
++    }
++    if (!uploader.uploadImageMips(*texture, uploadLevels)) {
++        RX_LOG_ERROR("rx_conformance_render: Uploader::uploadImageMips failed for environment '{}'", path.string());
++        return std::nullopt;
++    }
++    rx::rhi::UploadTicket ticket = uploader.flush();
++    uploader.wait(ticket);
++    return texture;
++}
++
++// [Adapted from samples/08_gltf_viewer's own setupEnvironment() -- the
++// skybox-pipeline half is DELETED (this tool never draws a visible
++// environment background, see this file's own top comment); everything
++// else (bake + bindless registration + EnvironmentDesc) is unchanged.]
++bool setupEnvironment(App& app, const std::filesystem::path& hdrPath, const std::filesystem::path& iblShaderDir,
++                      float intensity) {
++    auto equirect = loadEquirectHdr(*app.device, *app.allocator, *app.uploader, hdrPath);
++    if (!equirect.has_value()) {
++        return false;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(app.device->device(), app.device->graphicsQueue(), app.device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: CommandContext::create failed for the IBL bake");
++        return false;
++    }
++
++    rx::ibl::BakeParams params;
++    rx::ibl::BakeTimings timings;
++    auto bakeResult = rx::ibl::bakeEnvironment(*app.device, *app.allocator, *cmdCtx, *app.scheduler, *equirect,
++                                                /*sourceIsCube=*/false, iblShaderDir, params, &timings,
++                                                "rx_conformance_render");
++    if (!bakeResult.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: rx::ibl::bakeEnvironment failed for '{}'", hdrPath.string());
++        return false;
++    }
++    app.environment = std::move(*bakeResult);
++
++    VkSamplerCreateInfo cubeSamplerInfo{};
++    cubeSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    cubeSamplerInfo.magFilter = VK_FILTER_LINEAR;
++    cubeSamplerInfo.minFilter = VK_FILTER_LINEAR;
++    cubeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++    cubeSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    cubeSamplerInfo.minLod = 0.0F;
++    cubeSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
++    if (vkCreateSampler(app.device->device(), &cubeSamplerInfo, nullptr, &app.envCubeSampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateSampler (environment cube sampler) failed");
++        return false;
++    }
++    VkSamplerCreateInfo dfgSamplerInfo = cubeSamplerInfo;
++    dfgSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    if (vkCreateSampler(app.device->device(), &dfgSamplerInfo, nullptr, &app.envDfgSampler) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateSampler (environment DFG sampler) failed");
++        return false;
++    }
++
++    app.envBaseCubeHandle =
++        app.bindless->registerCubeSampledImage(app.environment->baseCubemap.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envIrradianceHandle = app.bindless->registerCubeSampledImage(app.environment->irradianceCubemap.view(),
++                                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envPrefilteredHandle = app.bindless->registerCubeSampledImage(app.environment->prefilteredCubemap.view(),
++                                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envDfgLutHandle =
++        app.bindless->registerSampledImage(app.environment->dfgLut.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    app.envCubeSamplerHandle = app.bindless->registerSampler(app.envCubeSampler);
++    app.envDfgSamplerHandle = app.bindless->registerSampler(app.envDfgSampler);
++    if (!app.envBaseCubeHandle.isValid() || !app.envIrradianceHandle.isValid() ||
++        !app.envPrefilteredHandle.isValid() || !app.envDfgLutHandle.isValid() ||
++        !app.envCubeSamplerHandle.isValid() || !app.envDfgSamplerHandle.isValid()) {
++        RX_LOG_ERROR("rx_conformance_render: bindless registration failed for the baked environment");
++        return false;
++    }
++
++    rx::scene::EnvironmentDesc envDesc;
++    envDesc.baseCubemapIndex = app.envBaseCubeHandle.index();
++    envDesc.irradianceCubemapIndex = app.envIrradianceHandle.index();
++    envDesc.prefilteredCubemapIndex = app.envPrefilteredHandle.index();
++    envDesc.dfgLutIndex = app.envDfgLutHandle.index();
++    envDesc.cubeSamplerIndex = app.envCubeSamplerHandle.index();
++    envDesc.dfgSamplerIndex = app.envDfgSamplerHandle.index();
++    envDesc.maxPrefilteredLod = static_cast<float>(app.environment->prefilteredMipCount) - 1.0F;
++    envDesc.intensity = intensity;
++    app.scene->setEnvironment(envDesc);
++    app.envIntensityPhysical = intensity;
++    return true;
++}
++
++bool createMaterialParamArena(App& app, uint32_t materialCount) {
++    auto arena = rx::material::createDemandSizedMaterialParamArena(app.device->device(), materialCount);
++    if (!arena.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: createDemandSizedMaterialParamArena failed for {} material(s)",
++                     materialCount);
++        return false;
++    }
++    app.materialParamArena = std::move(*arena);
++    return true;
++}
++
++void destroyApp(App& app) {
++    if (app.device.has_value() && app.device->device() != VK_NULL_HANDLE) {
++        vkDeviceWaitIdle(app.device->device());
++    }
++    for (MaterialGpuBinding& binding : app.materialBindings) {
++        binding.paramBuffer.reset();
++    }
++    if (app.materialParamArena.has_value()) {
++        vkDestroyDescriptorSetLayout(app.device->device(), app.materialParamArena->setLayout, nullptr);
++    }
++    app.materialParamArena.reset();
++    if (app.drawDataBuffer.has_value() && app.bindless.has_value()) {
++        app.drawDataBuffer->release(*app.bindless);
++    }
++    app.drawDataBuffer.reset();
++    if (app.bindless.has_value()) {
++        app.bindless->release(app.envBaseCubeHandle);
++        app.bindless->release(app.envIrradianceHandle);
++        app.bindless->release(app.envPrefilteredHandle);
++        app.bindless->release(app.envDfgLutHandle);
++        app.bindless->release(app.envCubeSamplerHandle);
++        app.bindless->release(app.envDfgSamplerHandle);
++    }
++    if (app.envCubeSampler != VK_NULL_HANDLE) {
++        vkDestroySampler(app.device->device(), app.envCubeSampler, nullptr);
++        app.envCubeSampler = VK_NULL_HANDLE;
++    }
++    if (app.envDfgSampler != VK_NULL_HANDLE) {
++        vkDestroySampler(app.device->device(), app.envDfgSampler, nullptr);
++        app.envDfgSampler = VK_NULL_HANDLE;
++    }
++    app.environment.reset();
++    destroyCompiledPass(app.device->device(), app.tonemapPass);
++    if (app.defaultSamplerHandle.isValid() && app.bindless.has_value()) {
++        app.bindless->release(app.defaultSamplerHandle);
++    }
++    if (app.defaultSampler != VK_NULL_HANDLE) {
++        vkDestroySampler(app.device->device(), app.defaultSampler, nullptr);
++        app.defaultSampler = VK_NULL_HANDLE;
++    }
++    app.registry.reset();
++    app.textureCache.reset();
++    app.geometryPool.reset();
++    app.materialSystem.reset();
++    app.executor.reset();
++    app.scheduler.reset();
++    app.deletionQueue.reset();
++    app.bindless.reset();
++    app.uploader.reset();
++    app.allocator.reset();
++    app.device.reset();
++}
++
++// [Adapted from samples/08_gltf_viewer's own setupMaterials() -- unchanged
++// except for the log-message prefix.] `perturbRoughness` (default false)
++// is applied HERE, once, right after each StandardPBR binding's own
++// roughnessFactor is written -- see overrideFloatMaterialParamIfPresent()'s
++// own header comment for why an ABSENT param (Unlit materials) is not an
++// error, and for why this is an absolute override, not a relative
++// scale/offset.
++bool setupMaterials(App& app, const rx::asset::Registry& registry,
++                     const std::vector<rx::asset::MaterialHandle>& materialHandles, bool perturbRoughness) {
++    const std::filesystem::path repoRoot(RX_REPO_ROOT_DIR);
++    const std::filesystem::path standardPbrPath = repoRoot / "shaders" / "material" / "standard_pbr.slang";
++    const std::filesystem::path unlitPath = repoRoot / "shaders" / "material" / "unlit.slang";
++    const rx::material::PassSignature passSig = forwardPassSignature();
++
++    for (rx::asset::MaterialHandle assetHandle : materialHandles) {
++        const rx::asset::MaterialAsset& asset = registry.material(assetHandle);
++        const bool isUnlit = asset.disposition == rx::asset::MaterialDisposition::Unlit;
++
++        rx::material::MaterialFixedFunctionState fixedFunctionState;
++        fixedFunctionState.alphaMode = toMaterialAlphaMode(asset.alphaMode);
++        fixedFunctionState.doubleSided = asset.doubleSided;
++
++        const std::filesystem::path& modulePath = isUnlit ? unlitPath : standardPbrPath;
++
++        MaterialGpuBinding binding;
++        try {
++            binding.handle = app.materialSystem->loadMaterial(modulePath, fixedFunctionState);
++        } catch (const std::exception& ex) {
++            RX_LOG_ERROR("rx_conformance_render: loadMaterial('{}') failed for material '{}': {}",
++                         modulePath.string(), asset.name, ex.what());
++            return false;
++        }
++
++        const uint32_t blockSize = app.materialSystem->paramBlockSize(binding.handle);
++        binding.paramBlob.assign(blockSize, uint8_t{0});
++        const std::vector<rx::material::MaterialParamInfo> params = app.materialSystem->materialParams(binding.handle);
++
++        const float appliedAlphaCutoff = asset.alphaMode == rx::asset::AlphaMode::Mask ? asset.alphaCutoff : 0.0F;
++        const std::array<float, 4> baseColorFactor{asset.baseColorFactor.x, asset.baseColorFactor.y,
++                                                     asset.baseColorFactor.z, asset.baseColorFactor.w};
++
++        bool ok = true;
++        if (isUnlit) {
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorFactor", baseColorFactor);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
++                                                              rx::asset::TextureRole::BaseColor));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
++                                        uvTransformParam(asset.baseColorTexture));
++        } else {
++            const std::array<float, 4> emissiveFactorAndPad{asset.emissiveFactor.x * asset.emissiveStrength,
++                                                               asset.emissiveFactor.y * asset.emissiveStrength,
++                                                               asset.emissiveFactor.z * asset.emissiveStrength, 0.0F};
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorFactor", baseColorFactor);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicFactor", asset.metallicFactor);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "roughnessFactor", asset.roughnessFactor);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "normalScale", asset.normalScale);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionStrength", asset.occlusionStrength);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "alphaCutoff", appliedAlphaCutoff);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "ior", 1.5F);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "specularFactor", 1.0F);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "specularColorFactorAndPad",
++                                        std::array<float, 4>{1.0F, 1.0F, 1.0F, 0.0F});
++            ok = ok && setMaterialParam(binding.paramBlob, params, "dfgY", 1.0F);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveFactorAndPad", emissiveFactorAndPad);
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.baseColorTexture,
++                                                              rx::asset::TextureRole::BaseColor));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.metallicRoughnessTexture,
++                                                              rx::asset::TextureRole::MetallicRoughness));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "normalTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.normalTexture,
++                                                              rx::asset::TextureRole::Normal));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.occlusionTexture,
++                                                              rx::asset::TextureRole::Occlusion));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveTexture",
++                                        resolveTextureIndex(*app.textureCache, asset.emissiveTexture,
++                                                              rx::asset::TextureRole::Emissive));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.baseColorTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.metallicRoughnessTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "normalSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.normalTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.occlusionTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveSampler",
++                                        resolveSamplerIndex(*app.textureCache, asset.emissiveTexture,
++                                                              app.defaultSamplerHandle.index()));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "baseColorUvOffsetScale",
++                                        uvTransformParam(asset.baseColorTexture));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "metallicRoughnessUvOffsetScale",
++                                        uvTransformParam(asset.metallicRoughnessTexture));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "normalUvOffsetScale",
++                                        uvTransformParam(asset.normalTexture));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "occlusionUvOffsetScale",
++                                        uvTransformParam(asset.occlusionTexture));
++            ok = ok && setMaterialParam(binding.paramBlob, params, "emissiveUvOffsetScale",
++                                        uvTransformParam(asset.emissiveTexture));
++
++            if (perturbRoughness) {
++                overrideFloatMaterialParamIfPresent(binding.paramBlob, params, "roughnessFactor",
++                                                     kPerturbedRoughnessValue);
++            }
++        }
++        if (!ok) {
++            RX_LOG_ERROR("rx_conformance_render: material param setup failed for material '{}'", asset.name);
++            return false;
++        }
++
++        const rx::shader::ShaderLayoutInfo& layout = app.materialSystem->layoutInfo(binding.handle);
++        if (layout.pushRanges.empty()) {
++            RX_LOG_ERROR("rx_conformance_render: material '{}' reflects no RxMaterialGlobals push-constant range",
++                         asset.name);
++            return false;
++        }
++        binding.pushOffset = layout.pushRanges[0].offset;
++        binding.pushSize = layout.pushRanges[0].size;
++        binding.pushStages = layout.pushRanges[0].stages;
++
++        auto paramBuffer = app.allocator->createHostVisibleBuffer(blockSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
++                                                                     rx::rhi::MemoryCategory::Internal);
++        if (!paramBuffer.has_value()) {
++            RX_LOG_ERROR("rx_conformance_render: createHostVisibleBuffer (material params) failed for material '{}'",
++                         asset.name);
++            return false;
++        }
++        std::memcpy(paramBuffer->mappedData(), binding.paramBlob.data(), blockSize);
++        paramBuffer->flush();
++
++        VkDescriptorSet paramSet =
++            app.materialParamArena->arena.allocate(app.materialParamArena->setLayout, /*uniformBufferDescriptorCount=*/1);
++        if (paramSet == VK_NULL_HANDLE) {
++            RX_LOG_ERROR("rx_conformance_render: material-params descriptor arena allocation failed for material '{}'",
++                         asset.name);
++            return false;
++        }
++        VkDescriptorBufferInfo bufferInfo{paramBuffer->handle(), 0, blockSize};
++        VkWriteDescriptorSet write{};
++        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        write.dstSet = paramSet;
++        write.dstBinding = 0;
++        write.descriptorCount = 1;
++        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++        write.pBufferInfo = &bufferInfo;
++        vkUpdateDescriptorSets(app.device->device(), 1, &write, 0, nullptr);
++
++        binding.paramBuffer = std::move(paramBuffer);
++        binding.paramSet = paramSet;
++
++        try {
++            app.materialSystem->getPipeline({binding.handle, passSig, materialSpecializationBits(app)});
++        } catch (const std::exception& ex) {
++            RX_LOG_ERROR("rx_conformance_render: D27 pipeline pre-resolution failed for material '{}': {}",
++                         asset.name, ex.what());
++            return false;
++        }
++
++        app.materialHandleToBinding[assetHandle.index()] = app.materialBindings.size();
++        app.materialBindings.push_back(std::move(binding));
++    }
++    return true;
++}
++
++// [Adapted from samples/08_gltf_viewer's own buildDrawList() -- the
++// TIGHT world-bounds accumulation that sample's own frameCameraToScene()
++// used to consume is DELETED here: this tool's own camera fit reads
++// accumulateReferenceStyleSceneExtents()'s sphere-cube-unioned output
++// instead (main()'s own comment, right before its fitCameraToScene()
++// call) -- a plain tight union would NOT match the reference renderer's
++// own camera, see camera_fit.h's own header comment.]
++bool buildDrawList(App& app, const rx::asset::Registry& registry, const rx::asset::ImportedScene& scene) {
++    app.draws.clear();
++    app.drawDataRows.clear();
++
++    for (const rx::asset::InstanceRecord& instance : scene.instances) {
++        const rx::asset::MeshAsset& mesh = registry.mesh(instance.mesh);
++        const glm::mat3 normalMat3 = glm::transpose(glm::inverse(glm::mat3(instance.worldTransform)));
++        const glm::mat4 modelTransposed = glm::transpose(instance.worldTransform);
++        const glm::mat4 normalMatrixTransposed = glm::transpose(glm::mat4(normalMat3));
++
++        for (const rx::asset::Submesh& submesh : mesh.submeshes) {
++            auto it = app.materialHandleToBinding.find(submesh.material.index());
++            if (it == app.materialHandleToBinding.end()) {
++                // [glTF spec, Mesh Primitive: "material" is OPTIONAL --
++                // "When not defined, the primitive uses the DEFAULT
++                // material"] Reproduced directly this task:
++                // MetalRoughSpheresNoTextures' own "Metal"/"Non-metal"/
++                // "Smooth"/"Rough" text-LABEL primitives carry no
++                // `material` index at all (verified against the raw glTF
++                // JSON) -- import_gltf.cpp's own fillRef()-style
++                // resolution gives such a submesh the Registry's own D24/
++                // D11 residency-tolerant FALLBACK MaterialHandle, which
++                // was never one of `result.materials` (setupMaterials()'s
++                // own caller only iterates THAT list), so it never got a
++                // binding up front. Lazily bind it here, on first
++                // encounter, via the SAME setupMaterials() -- a single-
++                // element call is exactly what that function already
++                // supports (it operates on any MaterialHandle vector, not
++                // specifically `result.materials`); `registry.material()`
++                // resolves the fallback handle to a real, valid (if
++                // visually neutral) MaterialAsset (D24's own contract),
++                // never null. Memoized: only the FIRST submesh referencing
++                // this exact fallback handle pays the loadMaterial() cost.
++                if (!setupMaterials(app, registry, {submesh.material}, /*perturbRoughness=*/false)) {
++                    RX_LOG_ERROR(
++                        "rx_conformance_render: on-demand fallback-material binding failed for a submesh with no "
++                        "glTF-declared material");
++                    return false;
++                }
++                it = app.materialHandleToBinding.find(submesh.material.index());
++                if (it == app.materialHandleToBinding.end()) {
++                    RX_LOG_ERROR("rx_conformance_render: submesh references a material with no MaterialGpuBinding");
++                    return false;
++                }
++            }
++
++            DrawItem draw;
++            draw.blockId = submesh.range.blockId;
++            draw.firstIndex = submesh.range.firstIndex;
++            draw.indexCount = submesh.range.indexCount;
++            draw.vertexOffset = submesh.range.vertexOffset;
++            draw.drawDataRow = static_cast<uint32_t>(app.drawDataRows.size());
++            draw.materialBindingIndex = it->second;
++
++            rx::material::DrawDataGpu row;
++            row.model = modelTransposed;
++            row.normalMatrix = normalMatrixTransposed;
++            row.materialIndex = static_cast<uint32_t>(it->second);
++            app.drawDataRows.push_back(row);
++            app.draws.push_back(draw);
++        }
++    }
++
++    if (app.draws.empty()) {
++        RX_LOG_ERROR("rx_conformance_render: imported scene produced zero draws");
++        return false;
++    }
++
++    const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
++    auto drawDataBuffer =
++        rx::rhi::PerFrameStorageBuffer::create(*app.allocator, *app.bindless, bytes, app.drawDataRows.data());
++    if (!drawDataBuffer.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: PerFrameStorageBuffer::create (draw data, {} rows) failed",
++                     app.drawDataRows.size());
++        return false;
++    }
++    app.drawDataBuffer = std::move(*drawDataBuffer);
++    return true;
++}
++
++// [OWN, NOT copied from sample08 -- see this file's own top comment: NO
++// fake key light, no skybox row.] IBL environment fields are still fully
++// populated exactly like sample08's own equivalent.
++void updateDrawDataPerPassFields(App& app, const glm::mat4& viewProj, const glm::vec3& cameraPosWorld) {
++    const bool hasEnvironment = app.scene->hasEnvironment();
++    rx::scene::EnvironmentDesc envDesc;
++    if (hasEnvironment) {
++        envDesc = app.scene->environment();
++    }
++
++    const glm::mat4 viewProjTransposed = glm::transpose(viewProj);
++    for (rx::material::DrawDataGpu& row : app.drawDataRows) {
++        row.viewProj = viewProjTransposed;
++        row.lightDirWorld = glm::vec4(0.0F, 1.0F, 0.0F, 0.0F);
++        row.lightColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);  // NO fake key light -- see this file's own top comment.
++        row.ambientColor = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
++        row.cameraPosWorld = glm::vec4(cameraPosWorld, 0.0F);
++        if (hasEnvironment) {
++            row.envIrradianceCubeIndex = envDesc.irradianceCubemapIndex;
++            row.envPrefilteredCubeIndex = envDesc.prefilteredCubemapIndex;
++            row.envDfgLutIndex = envDesc.dfgLutIndex;
++            row.envCubeSamplerIndex = envDesc.cubeSamplerIndex;
++            row.envDfgSamplerIndex = envDesc.dfgSamplerIndex;
++            row.envMaxPrefilteredLod = envDesc.maxPrefilteredLod;
++            row.envIntensity = app.envIntensityPhysical;  // exposure stays neutral (1.0) -- see this file's own top comment.
++        } else {
++            row.envIrradianceCubeIndex = 0xFFFFFFFFu;
++            row.envPrefilteredCubeIndex = 0xFFFFFFFFu;
++            row.envDfgLutIndex = 0xFFFFFFFFu;
++        }
++    }
++    const VkDeviceSize bytes = static_cast<VkDeviceSize>(app.drawDataRows.size()) * sizeof(rx::material::DrawDataGpu);
++    app.drawDataBuffer->write(app.currentFrameSlot, app.drawDataRows.data(), bytes);
++}
++
++void recordSceneDraws(VkCommandBuffer cmd, App& app) {
++    VkDescriptorSet bindlessSet = app.bindless->descriptorSet();
++    VkPipelineLayout anyLayout = app.materialSystem->pipelineLayout(app.materialBindings.front().handle);
++    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, anyLayout, /*firstSet=*/0, 1, &bindlessSet, 0,
++                             nullptr);
++
++    const rx::material::PassSignature passSig = forwardPassSignature();
++    rx::material::MaterialHandle lastPipelineMaterial;
++    uint32_t lastBoundBlock = UINT32_MAX;
++
++    for (const DrawItem& draw : app.draws) {
++        MaterialGpuBinding& material = app.materialBindings[draw.materialBindingIndex];
++
++        if (!(material.handle == lastPipelineMaterial)) {
++            VkPipeline pipeline =
++                app.materialSystem->getPipeline({material.handle, passSig, materialSpecializationBits(app)});
++            VkPipelineLayout layout = app.materialSystem->pipelineLayout(material.handle);
++            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++
++            rx::material::MaterialGlobalsPush push;
++            push.defaultSamplerIndex = app.defaultSamplerHandle.index();
++            push.drawDataBufferIndex = app.drawDataBuffer->bindlessIndex(app.currentFrameSlot);
++            vkCmdPushConstants(cmd, layout, material.pushStages, material.pushOffset, material.pushSize, &push);
++
++            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, /*firstSet=*/1, 1,
++                                     &material.paramSet, 0, nullptr);
++
++            lastPipelineMaterial = material.handle;
++        }
++
++        if (draw.blockId != lastBoundBlock) {
++            app.geometryPool->bind(cmd, draw.blockId);
++            lastBoundBlock = draw.blockId;
++        }
++
++        vkCmdDrawIndexed(cmd, draw.indexCount, /*instanceCount=*/1, draw.firstIndex, draw.vertexOffset,
++                         /*firstInstance=*/draw.drawDataRow);
++    }
++}
++
++// [OWN -- no sceneReady/loading-state branch (always ready by the time
++// this runs) and no skybox call.] Clears to the SAME matched literal
++// harness.html's own state.renderingParameters.clearColor uses (see
++// kConformanceClearColor's own comment) before drawing.
++void recordForward(rx::graph::PassContext& ctx, App& app) {
++    VkClearAttachment clearAttachment{};
++    clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    clearAttachment.colorAttachment = 0;
++    clearAttachment.clearValue.color = kConformanceClearColor;
++    VkClearRect clearRect{};
++    clearRect.rect = VkRect2D{{0, 0}, ctx.renderArea};
++    clearRect.layerCount = 1;
++    vkCmdClearAttachments(ctx.cmd, 1, &clearAttachment, 1, &clearRect);
++
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                        static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    recordSceneDraws(ctx.cmd, app);
++}
++
++void recordTonemapDraw(rx::graph::PassContext& ctx, App& app) {
++    VkImageView hdrView = ctx.imageView("hdr");
++    if (hdrView != app.lastHdrView) {
++        if (app.hdrHandle.isValid()) {
++            app.bindless->release(app.hdrHandle);
++        }
++        app.hdrHandle = app.bindless->registerSampledImage(hdrView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        app.lastHdrView = hdrView;
++    }
++
++    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.tonemapPass.pipeline);
++    VkDescriptorSet set = app.bindless->descriptorSet();
++    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.tonemapPass.layoutBundle.layout, 0, 1,
++                             &set, 0, nullptr);
++
++    VkViewport viewport{0.0F, 0.0F, static_cast<float>(ctx.renderArea.width),
++                        static_cast<float>(ctx.renderArea.height), 0.0F, 1.0F};
++    VkRect2D scissor{{0, 0}, ctx.renderArea};
++    vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
++    vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
++
++    TonemapPushConstants push{};
++    push.hdrTextureIndex = app.hdrHandle.index();
++    push.hdrSamplerIndex = app.defaultSamplerHandle.index();
++    vkCmdPushConstants(ctx.cmd, app.tonemapPass.layoutBundle.layout, app.tonemapPass.pushConstantStages,
++                       app.tonemapPass.pushConstantOffset, app.tonemapPass.pushConstantSize, &push);
++
++    vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
++}
++
++rx::graph::AttachmentDesc swapchainRelativeDesc(VkFormat format) {
++    rx::graph::AttachmentDesc desc;
++    desc.format = format;
++    desc.sizeClass = rx::graph::SizeClass::SwapchainRelative;
++    desc.width = 1.0F;
++    desc.height = 1.0F;
++    return desc;
++}
++
++rx::graph::AttachmentDesc swapchainRelativeReversedDepthDesc(VkFormat format) {
++    rx::graph::AttachmentDesc desc = swapchainRelativeDesc(format);
++    desc.depthConvention = rx::graph::DepthConvention::Reversed;
++    return desc;
++}
++
++void declareGraph(rx::graph::RenderGraph& graph, App& app) {
++    graph.addPass("forward")
++        .addColorOutput("hdr", swapchainRelativeDesc(rx::graph::kHdrFormat))
++        .setDepthStencilOutput("depth", swapchainRelativeReversedDepthDesc(kDepthFormat))
++        .setExecute([&app](rx::graph::PassContext& ctx) { recordForward(ctx, app); });
++
++    graph.addPass("tonemap")
++        .addTextureInput("hdr")
++        .addColorOutput("backbuffer", swapchainRelativeDesc(kBackbufferFormat))
++        .setExecute([&app](rx::graph::PassContext& ctx) { recordTonemapDraw(ctx, app); });
++
++    graph.setBackbufferSource("backbuffer");
++}
++
++struct ChannelIndices {
++    int r;
++    int g;
++    int b;
++};
++
++std::optional<ChannelIndices> channelIndicesForFormat(VkFormat format) {
++    switch (format) {
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++            return ChannelIndices{0, 1, 2};
++        case VK_FORMAT_B8G8R8A8_UNORM:
++        case VK_FORMAT_B8G8R8A8_SRGB:
++            return ChannelIndices{2, 1, 0};
++        default:
++            return std::nullopt;
++    }
++}
++
++bool canonicalizeToRgba8(std::vector<uint8_t>& pixels, VkFormat format) {
++    const auto channels = channelIndicesForFormat(format);
++    if (!channels.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: backbuffer format {} is not R8G8B8A8/B8G8R8A8", static_cast<int>(format));
++        return false;
++    }
++    if (channels->r == 0 && channels->b == 2) {
++        return true;
++    }
++    for (size_t offset = 0; offset + 4 <= pixels.size(); offset += 4) {
++        std::swap(pixels[offset + 0], pixels[offset + 2]);
++    }
++    return true;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    auto args = parseArgs(argc, argv);
++    if (!args.has_value()) {
++        return 1;
++    }
++
++    const rx::conformance::ConformanceModel* model = rx::conformance::findConformanceModel(args->model);
++    if (model == nullptr) {
++        RX_LOG_ERROR("rx_conformance_render: unknown --model '{}' (see tests/conformance/models.h)", args->model);
++        return 1;
++    }
++
++    const std::filesystem::path repoRoot(RX_REPO_ROOT_DIR);
++    const std::filesystem::path scenePath =
++        repoRoot / "assets" / "fetched" / model->name / "glTF" / (model->name + ".gltf");
++    const std::filesystem::path referencePath = repoRoot / "tests" / "conformance" / "references" / model->name / "reference.png";
++    const std::filesystem::path envPath = repoRoot / "samples" / "08_gltf_viewer" / "environments" / "gate_test_env.hdr";
++
++    if (!std::filesystem::exists(scenePath) || !std::filesystem::exists(referencePath)) {
++        if (model->optional) {
++            RX_LOG_INFO(
++                "rx_conformance_render: '{}' not fetched/referenced locally (optional model -- run "
++                "tools/fetch_assets.sh --environment-test and tools/gltf_conformance/generate_reference.mjs "
++                "{} to exercise it) -- skipping",
++                model->name, model->name);
++            return 0;
++        }
++        RX_LOG_ERROR("rx_conformance_render: '{}' or '{}' not found -- run tools/fetch_assets.sh first",
++                     scenePath.string(), referencePath.string());
++        return 1;
++    }
++
++    auto app = makeApp(args->validate);
++    if (app == nullptr) {
++        return 1;
++    }
++
++    const std::filesystem::path iblShaderDir = repoRoot / "shaders" / "ibl";
++    if (!setupEnvironment(*app, envPath, iblShaderDir, /*intensity=*/1.0F)) {
++        RX_LOG_ERROR("rx_conformance_render: setupEnvironment failed");
++        destroyApp(*app);
++        return 1;
++    }
++
++    rx::task::Scheduler& scheduler = *app->scheduler;
++    rx::asset::ImportResult result =
++        app->registry->importGltf(scenePath, *app->geometryPool, scheduler, app->textureCache.get());
++    if (!result.ok()) {
++        RX_LOG_ERROR("rx_conformance_render: import of '{}' failed: {}", scenePath.string(),
++                     rx::asset::importErrorName(result.error));
++        destroyApp(*app);
++        return 1;
++    }
++
++    // +1: headroom for the on-demand D11/D24 FALLBACK material binding
++    // buildDrawList() below may need (glTF's own "primitive.material is
++    // OPTIONAL -- use the default material when absent" rule -- see that
++    // function's own comment). At most ONE extra binding is ever needed
++    // regardless of how many material-less submeshes exist: every such
++    // submesh resolves to the SAME fallback MaterialHandle, and
++    // buildDrawList()'s own materialHandleToBinding lookup memoizes it
++    // after the first bind.
++    if (!createMaterialParamArena(*app, static_cast<uint32_t>(result.materials.size()) + 1)) {
++        destroyApp(*app);
++        return 1;
++    }
++    if (!setupMaterials(*app, *app->registry, result.materials, args->perturbRoughness)) {
++        destroyApp(*app);
++        return 1;
++    }
++    if (!buildDrawList(*app, *app->registry, result.scene)) {
++        destroyApp(*app);
++        return 1;
++    }
++    // [camera_fit.h's own accumulateReferenceStyleSceneExtents() header
++    // comment -- load-bearing, not a plain tight union] PER-PRIMITIVE
++    // (submesh) world bounds, exactly the granularity the reference
++    // renderer's own getSceneExtents() operates at.
++    std::vector<rx::asset::AABB> perPrimitiveWorldBounds;
++    for (const rx::asset::InstanceRecord& instance : result.scene.instances) {
++        const rx::asset::MeshAsset& mesh = app->registry->mesh(instance.mesh);
++        for (const rx::asset::Submesh& submesh : mesh.submeshes) {
++            perPrimitiveWorldBounds.push_back(submesh.bounds.transformed(instance.worldTransform));
++        }
++    }
++    const rx::asset::AABB referenceStyleExtents =
++        rx::conformance::accumulateReferenceStyleSceneExtents(perPrimitiveWorldBounds);
++
++    const float aspect = static_cast<float>(kRenderWidth) / static_cast<float>(kRenderHeight);
++    const rx::conformance::CameraFit fit = rx::conformance::fitCameraToScene(referenceStyleExtents, aspect);
++
++    rx::scene::Camera reversedZCamera;
++    reversedZCamera.verticalFovRadians = fit.yfovRadians;
++    reversedZCamera.aspectRatio = aspect;
++    reversedZCamera.nearPlane = fit.znear;
++    reversedZCamera.cullingFarPlane = fit.zfar;
++    const glm::mat4 proj = reversedZCamera.cullingProj();
++    const glm::mat4 view = glm::lookAt(fit.position, fit.target, glm::vec3(0.0F, 1.0F, 0.0F));
++    const glm::mat4 viewProj = proj * view;
++    updateDrawDataPerPassFields(*app, viewProj, fit.position);
++
++    VkPhysicalDeviceProperties deviceProps{};
++    vkGetPhysicalDeviceProperties(app->device->physicalDevice(), &deviceProps);
++    RX_LOG_INFO(
++        "rx_conformance_render: model='{}' driver='{}' camera(pos=({:.3f},{:.3f},{:.3f}) "
++        "target=({:.3f},{:.3f},{:.3f}) yfov={:.4f} near={:.4f} far={:.4f})",
++        model->name, deviceProps.deviceName, fit.position.x, fit.position.y, fit.position.z, fit.target.x,
++        fit.target.y, fit.target.z, fit.yfovRadians, fit.znear, fit.zfar);
++
++    rx::graph::RenderGraph graph;
++    declareGraph(graph, *app);
++    rx::graph::CompileInfo compileInfo;
++    compileInfo.swapchainWidth = kRenderWidth;
++    compileInfo.swapchainHeight = kRenderHeight;
++    compileInfo.swapchainFormat = kBackbufferFormat;
++    compileInfo.backbufferFinalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    graph.compile(compileInfo);
++    app->executor->realize(graph);
++
++    const VkDevice vkDevice = app->device->device();
++    VkImage offscreenImage = VK_NULL_HANDLE;
++    VkDeviceMemory offscreenMemory = VK_NULL_HANDLE;
++    VkImageView offscreenView = VK_NULL_HANDLE;
++    auto destroyRawResources = [&]() {
++        if (offscreenView != VK_NULL_HANDLE) {
++            vkDestroyImageView(vkDevice, offscreenView, nullptr);
++        }
++        if (offscreenImage != VK_NULL_HANDLE) {
++            vkDestroyImage(vkDevice, offscreenImage, nullptr);
++        }
++        if (offscreenMemory != VK_NULL_HANDLE) {
++            vkFreeMemory(vkDevice, offscreenMemory, nullptr);
++        }
++    };
++
++    VkImageCreateInfo imageInfo{};
++    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    imageInfo.imageType = VK_IMAGE_TYPE_2D;
++    imageInfo.format = kBackbufferFormat;
++    imageInfo.extent = {kRenderWidth, kRenderHeight, 1};
++    imageInfo.mipLevels = 1;
++    imageInfo.arrayLayers = 1;
++    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage(vkDevice, &imageInfo, nullptr, &offscreenImage) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateImage(offscreen target) failed");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++    VkMemoryRequirements memReq{};
++    vkGetImageMemoryRequirements(vkDevice, offscreenImage, &memReq);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    vkGetPhysicalDeviceMemoryProperties(app->device->physicalDevice(), &memProps);
++    uint32_t memoryTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1U << i)) != 0U &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0U) {
++            memoryTypeIndex = i;
++            break;
++        }
++    }
++    if (memoryTypeIndex == UINT32_MAX) {
++        RX_LOG_ERROR("rx_conformance_render: no device-local memory type found for the offscreen target");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++    VkMemoryAllocateInfo memAllocInfo{};
++    memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    memAllocInfo.allocationSize = memReq.size;
++    memAllocInfo.memoryTypeIndex = memoryTypeIndex;
++    if (vkAllocateMemory(vkDevice, &memAllocInfo, nullptr, &offscreenMemory) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkAllocateMemory(offscreen target) failed");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++    if (vkBindImageMemory(vkDevice, offscreenImage, offscreenMemory, 0) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkBindImageMemory(offscreen target) failed");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++    VkImageViewCreateInfo viewInfo{};
++    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    viewInfo.image = offscreenImage;
++    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.format = kBackbufferFormat;
++    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.subresourceRange.levelCount = 1;
++    viewInfo.subresourceRange.layerCount = 1;
++    if (vkCreateImageView(vkDevice, &viewInfo, nullptr, &offscreenView) != VK_SUCCESS) {
++        RX_LOG_ERROR("rx_conformance_render: vkCreateImageView(offscreen target) failed");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++
++    auto cmdCtx =
++        rx::rhi::CommandContext::create(vkDevice, app->device->graphicsQueue(), app->device->graphicsQueueFamily());
++    if (!cmdCtx.has_value()) {
++        RX_LOG_ERROR("rx_conformance_render: CommandContext::create failed");
++        destroyRawResources();
++        destroyApp(*app);
++        return 1;
++    }
++
++    const VkExtent2D extent{kRenderWidth, kRenderHeight};
++    cmdCtx->runOnce(
++        [&](VkCommandBuffer cmd) { app->executor->execute(graph, cmd, offscreenImage, offscreenView, extent); });
++
++    auto readback = app->allocator->createHostVisibleBuffer(kRenderPixelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    bool gateOk = readback.has_value();
++    std::vector<uint8_t> pixels;
++    if (readback.has_value()) {
++        cmdCtx->runOnce([&](VkCommandBuffer cmd) {
++            VkBufferImageCopy region{};
++            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            region.imageSubresource.layerCount = 1;
++            region.imageExtent = {kRenderWidth, kRenderHeight, 1};
++            vkCmdCopyImageToBuffer(cmd, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle(), 1,
++                                    &region);
++        });
++        readback->invalidate();
++        pixels.resize(static_cast<size_t>(kRenderPixelBytes));
++        std::memcpy(pixels.data(), readback->mappedData(), pixels.size());
++        gateOk = canonicalizeToRgba8(pixels, kBackbufferFormat);
++    } else {
++        RX_LOG_ERROR("rx_conformance_render: createHostVisibleBuffer(readback) failed");
++    }
++    // MUST be destroyed before destroyApp() below tears down the Allocator/
++    // Device it was created from -- unlike sample08_gltf_viewer's own
++    // captureFrame() lambda (where the equivalent local goes out of scope
++    // at the end of EACH lambda call, always before that same sample's own
++    // later destroyApp()), this tool renders only once and had no such
++    // lambda scope to rely on -- reproduced directly this task as a real
++    // "Allocator::destroyAll: torn down with outstanding... allocations"
++    // error immediately followed by a segfault at process exit (the same
++    // class of teardown-ordering bug this stage's own review history keeps
++    // finding -- see sample_08_gltf_viewer's own --quit-during-load comment
++    // for the analogous CommandContext-vs-Device lesson).
++    readback.reset();
++
++    if (!args->dumpPath.empty() && !pixels.empty()) {
++        if (!rx::samples::writeRgba8Png(args->dumpPath, kRenderWidth, kRenderHeight, pixels.data())) {
++            RX_LOG_ERROR("rx_conformance_render: --dump '{}' failed to write", args->dumpPath);
++        }
++    }
++
++    if (gateOk) {
++        auto reference = rx::samples::loadRgba8Png(referencePath);
++        if (!reference.has_value()) {
++            RX_LOG_ERROR("rx_conformance_render: failed to load committed reference '{}'", referencePath.string());
++            gateOk = false;
++        } else {
++            rx::samples::GateResult gate = rx::samples::compareToReference(
++                pixels.data(), kRenderWidth, kRenderHeight, reference->rgba8.data(), reference->width,
++                reference->height, model->perChannelToleranceOutOf255, model->failingPixelBudgetFraction);
++            RX_LOG_INFO(
++                "rx_conformance_render: {} gate: driver='{}' failingPixels={}/{} ({:.4f}%) tolerance=+-{}/255 "
++                "budget<{:.2f}% pass={}",
++                model->name, deviceProps.deviceName, gate.failingPixelCount, gate.totalPixelCount,
++                gate.failingPixelFraction * 100.0, model->perChannelToleranceOutOf255,
++                model->failingPixelBudgetFraction * 100.0, gate.passed);
++            if (!gate.passed) {
++                RX_LOG_ERROR(
++                    "rx_conformance_render: {} gate FAILED (first mismatch at ({},{}), delta rgba=({},{},{},{}))",
++                    model->name, gate.firstMismatchX, gate.firstMismatchY, gate.firstMismatchDelta[0],
++                    gate.firstMismatchDelta[1], gate.firstMismatchDelta[2], gate.firstMismatchDelta[3]);
++                gateOk = false;
++            }
++        }
++    }
++
++    vkDeviceWaitIdle(vkDevice);
++    cmdCtx.reset();
++    destroyRawResources();
++    destroyApp(*app);
++
++    if (args->validate && app->context->hasValidationErrors()) {
++        RX_LOG_ERROR("rx_conformance_render: Vulkan validation layer reported errors during this run");
++        gateOk = false;
++    }
++
++    if (gateOk) {
++        RX_LOG_INFO("rx_conformance_render: {} conformance gate PASSED", model->name);
++        return 0;
++    }
++    RX_LOG_ERROR("rx_conformance_render: {} conformance gate FAILED", model->name);
++    return 1;
++}
+diff --git a/tests/conformance/models.h b/tests/conformance/models.h
+new file mode 100644
+index 0000000..ca1a3bd
+--- /dev/null
++++ b/tests/conformance/models.h
+@@ -0,0 +1,112 @@
++#pragma once
++// tests/conformance/models.h -- Phase 5 Stage 1 Task 11 (#47) conformance
++// model registry. Mirrors tools/gltf_conformance/generate_reference.mjs's
++// own MODELS table -- intentionally duplicated, not shared (two
++// independent language runtimes; a JSON/text registry file neither side
++// needed its own parser for was not worth adding as a THIRD source of
++// truth just to avoid seven lines of duplication -- see task-11-report.md
++// for the full "why not shared" note). Keep the two lists in sync by
++// hand; this is a small, rarely-changed table (the ticket's own "≥6 at
++// Stage 1 close, growing in Stages 2-4" — additions are infrequent,
++// deliberate events, not a churny generated artifact).
++//
++// TOLERANCE [ticket's own "MetalRoughSpheres within ruled tolerance"
++// text; this ticket's own binding rulings named NO specific number --
++// task-11-report.md records the pilot measurement this value is derived
++// from]: `perChannelToleranceOutOf255`/`failingPixelBudgetFraction` feed
++// samples/common/reference_gate.h's own compareToReference() (D17's
++// established tolerance-gate PRIMITIVE, reused algorithm -- see that
++// header's own doc comment) with WIDER values than D17's same-renderer
++// byte-identical-regression defaults (+-4/255, <0.5%): this gate compares
++// TWO INDEPENDENTLY WRITTEN renderers (RendererX's own Slang/Vulkan PBR
++// path vs. the Khronos Sample Viewer's own WebGL2/GLSL path), which is a
++// materially different, structurally noisier comparison than one
++// renderer's own commit-to-commit regression check -- see
++// task-11-report.md's own "tolerance derivation" section for the actual
++// measured MetalRoughSpheres divergence distribution this number is set
++// above.
++//
++// EXTENSION SCOPE: only models whose glTF content stays entirely within
++// material/texture features RendererX ALREADY consumes are gated here --
++// see fetch_assets.sh's own AlphaBlendModeTest-not-TextureTransform
++// MultiTest comment for a concrete example of a model excluded for this
++// reason (KHR_materials_clearcoat, Stage 3).
++
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace rx::conformance {
++
++struct ConformanceModel {
++    // Directory name under assets/fetched/<name>/glTF/<name>.gltf and
++    // tests/conformance/references/<name>/{reference.png,provenance.json}.
++    std::string name;
++    // CI-fetched by default (tools/fetch_assets.sh, no flag needed) vs.
++    // fetch-on-demand-only (currently only EnvironmentTest -- proprietary
++    // Adobe Stock license on the model content, gate ruling T11; see
++    // fetch_assets.sh's own --environment-test section). An optional
++    // model's own ctest registration SKIPS (not fails) when its asset or
++    // reference is absent, mirroring damaged_helmet_test.cpp's own
++    // established "not fetched -> MESSAGE + early return" convention.
++    bool optional = false;
++    // Per-channel absolute tolerance (out of 255) and failing-pixel-count
++    // budget fraction -- see this header's own top comment for the
++    // derivation. Every MANDATORY model currently shares ONE pilot-derived
++    // value (measured against MetalRoughSpheres, the ticket's own named
++    // headline model, then applied uniformly rather than hand-tuned
++    // per-model, which would risk quietly widening tolerance exactly
++    // where a real bug hides) -- EnvironmentTest is not part of that
++    // pilot (local-only, never CI-gated) and reuses the same constants
++    // for its own local run's informational report.
++    int perChannelToleranceOutOf255 = 0;
++    double failingPixelBudgetFraction = 0.0;
++};
++
++[[nodiscard]] inline const std::vector<ConformanceModel>& conformanceModels() {
++    // Pilot-derived tolerance (task-11-report.md has the full derivation
++    // + per-model measured numbers): +-32/255 per channel, <2.5% failing-
++    // pixel budget. Wide relative to D17's same-renderer +-4/255 / <0.5%
++    // by design (see this header's own top comment) -- still tight enough
++    // that the discrimination proof (overriding every StandardPBR
++    // material's own roughnessFactor to a fixed 0.02 -- see main.cpp's own
++    // kPerturbedRoughnessValue) fails it with a real margin. Measured
++    // lavapipe divergence against the committed references, all six
++    // mandatory models: MetalRoughSpheres 0.43%, MetalRoughSpheresNo
++    // Textures 0.58%, EmissiveStrengthTest 0.03%, CompareEmissiveStrength
++    // 0.30%, TextureTransformTest 1.62% (the worst real-content case --
++    // thin UV-transform edge antialiasing, expected), AlphaBlendModeTest
++    // 0.47% -- every measured value is under 1.7%. The discrimination
++    // proof measures 3.87% -- 2.5% sits with real margin on both sides
++    // (>45% headroom over the worst real case, >35% below the
++    // discrimination value) without being so wide it stops
++    // discriminating. A multiplicative (roughness=0.0 is a fixed point)
++    // and an additive-clamped (this model's own roughnessFactor already
++    // sits at glTF's neutral 1.0 default, itself a clamp fixed point)
++    // perturbation were tried FIRST and rejected -- both left the render
++    // bit-identical to the unperturbed baseline regardless of magnitude;
++    // see main.cpp's own overrideFloatMaterialParamIfPresent() header
++    // comment for the full account of why only an absolute override
++    // actually moves every case.
++    static const std::vector<ConformanceModel> kModels = {
++        {"MetalRoughSpheres", /*optional=*/false, 32, 0.025},
++        {"MetalRoughSpheresNoTextures", /*optional=*/false, 32, 0.025},
++        {"EmissiveStrengthTest", /*optional=*/false, 32, 0.025},
++        {"CompareEmissiveStrength", /*optional=*/false, 32, 0.025},
++        {"TextureTransformTest", /*optional=*/false, 32, 0.025},
++        {"AlphaBlendModeTest", /*optional=*/false, 32, 0.025},
++        {"EnvironmentTest", /*optional=*/true, 32, 0.025},
++    };
++    return kModels;
++}
++
++[[nodiscard]] inline const ConformanceModel* findConformanceModel(const std::string& name) {
++    for (const ConformanceModel& model : conformanceModels()) {
++        if (model.name == name) {
++            return &model;
++        }
++    }
++    return nullptr;
++}
++
++}  // namespace rx::conformance
+diff --git a/tests/conformance/references/AlphaBlendModeTest/provenance.json b/tests/conformance/references/AlphaBlendModeTest/provenance.json
+new file mode 100644
+index 0000000..4fac9fd
+--- /dev/null
++++ b/tests/conformance/references/AlphaBlendModeTest/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "AlphaBlendModeTest",
++  "sourceGltf": "assets/fetched/AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:17:43.749Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      0,
++      1.0997666120529175,
++      10.791272163391113
++    ],
++    "target": [
++      0,
++      1.0997666120529175,
++      -0.09999991208314896
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.010465714208716705,
++    "zfar": 104.65714208716705,
++    "distance": 10.891272072561982
++  },
++  "sceneExtents": {
++    "min": [
++      -4.511312484741211,
++      -3.411545991897583,
++      -4.611312389373779
++    ],
++    "max": [
++      4.511312484741211,
++      5.611079216003418,
++      4.411312580108643
++    ]
++  }
++}
+diff --git a/tests/conformance/references/AlphaBlendModeTest/reference.png b/tests/conformance/references/AlphaBlendModeTest/reference.png
+new file mode 100644
+index 0000000..3319cf9
+Binary files /dev/null and b/tests/conformance/references/AlphaBlendModeTest/reference.png differ
+diff --git a/tests/conformance/references/CompareEmissiveStrength/provenance.json b/tests/conformance/references/CompareEmissiveStrength/provenance.json
+new file mode 100644
+index 0000000..1876e44
+--- /dev/null
++++ b/tests/conformance/references/CompareEmissiveStrength/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "CompareEmissiveStrength",
++  "sourceGltf": "assets/fetched/CompareEmissiveStrength/glTF/CompareEmissiveStrength.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:16:28.719Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      -5.960464477539063e-8,
++      0,
++      4.0269904136657715
++    ],
++    "target": [
++      -5.960464477539063e-8,
++      0,
++      -2.2067968075134559e-7
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.0031606996835185706,
++    "zfar": 31.606996835185704,
++    "distance": 4.0269906343454505
++  },
++  "sceneExtents": {
++    "min": [
++      -1.6680341958999634,
++      -1.1180341243743896,
++      -1.1180341243743896
++    ],
++    "max": [
++      1.6680340766906738,
++      1.1180341243743896,
++      1.1180341243743896
++    ]
++  }
++}
+diff --git a/tests/conformance/references/CompareEmissiveStrength/reference.png b/tests/conformance/references/CompareEmissiveStrength/reference.png
+new file mode 100644
+index 0000000..b8e7f26
+Binary files /dev/null and b/tests/conformance/references/CompareEmissiveStrength/reference.png differ
+diff --git a/tests/conformance/references/EmissiveStrengthTest/provenance.json b/tests/conformance/references/EmissiveStrengthTest/provenance.json
+new file mode 100644
+index 0000000..2824570
+--- /dev/null
++++ b/tests/conformance/references/EmissiveStrengthTest/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "EmissiveStrengthTest",
++  "sourceGltf": "assets/fetched/EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:15:51.088Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      -0.0007495880126953125,
++      -0.9958338737487793,
++      23.29131507873535
++    ],
++    "target": [
++      -0.0007495880126953125,
++      -0.9958338737487793,
++      -0.0005344527889974415
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.022381760295292343,
++    "zfar": 223.81760295292344,
++    "distance": 23.291849531545296
++  },
++  "sceneExtents": {
++    "min": [
++      -9.64854907989502,
++      -10.643633842468262,
++      -9.648333549499512
++    ],
++    "max": [
++      9.647049903869629,
++      8.651966094970703,
++      9.647266387939453
++    ]
++  }
++}
+diff --git a/tests/conformance/references/EmissiveStrengthTest/reference.png b/tests/conformance/references/EmissiveStrengthTest/reference.png
+new file mode 100644
+index 0000000..9e40588
+Binary files /dev/null and b/tests/conformance/references/EmissiveStrengthTest/reference.png differ
+diff --git a/tests/conformance/references/MetalRoughSpheres/provenance.json b/tests/conformance/references/MetalRoughSpheres/provenance.json
+new file mode 100644
+index 0000000..3e12bb9
+--- /dev/null
++++ b/tests/conformance/references/MetalRoughSpheres/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "MetalRoughSpheres",
++  "sourceGltf": "assets/fetched/MetalRoughSpheres/glTF/MetalRoughSpheres.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:14:35.698Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      -0.24772381782531738,
++      -0.27790188789367676,
++      16.065093994140625
++    ],
++    "target": [
++      -0.24772381782531738,
++      -0.27790188789367676,
++      -1.6000005006790161
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.016531722286261315,
++    "zfar": 165.31722286261316,
++    "distance": 17.665094552276212
++  },
++  "sceneExtents": {
++    "min": [
++      -7.564845561981201,
++      -7.2727789878845215,
++      -8.594877243041992
++    ],
++    "max": [
++      7.069397926330566,
++      6.716975212097168,
++      5.394876956939697
++    ]
++  }
++}
+diff --git a/tests/conformance/references/MetalRoughSpheres/reference.png b/tests/conformance/references/MetalRoughSpheres/reference.png
+new file mode 100644
+index 0000000..44b9607
+Binary files /dev/null and b/tests/conformance/references/MetalRoughSpheres/reference.png differ
+diff --git a/tests/conformance/references/MetalRoughSpheresNoTextures/provenance.json b/tests/conformance/references/MetalRoughSpheresNoTextures/provenance.json
+new file mode 100644
+index 0000000..7155aa3
+--- /dev/null
++++ b/tests/conformance/references/MetalRoughSpheresNoTextures/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "MetalRoughSpheresNoTextures",
++  "sourceGltf": "assets/fetched/MetalRoughSpheresNoTextures/glTF/MetalRoughSpheresNoTextures.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:15:13.399Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      0.0028085585217922926,
++      0.002775889588519931,
++      0.007747060619294643
++    ],
++    "target": [
++      0.0028085585217922926,
++      0.002775889588519931,
++      -0.0015000001294538379
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.000007873217110153214,
++    "zfar": 0.07873217110153213,
++    "distance": 0.009247060757452035
++  },
++  "sceneExtents": {
++    "min": [
++      -0.0009891114896163344,
++      -0.0010543683310970664,
++      -0.003606147598475218
++    ],
++    "max": [
++      0.0066062286496162415,
++      0.00660614762455225,
++      0.0006061475141905248
++    ]
++  }
++}
+diff --git a/tests/conformance/references/MetalRoughSpheresNoTextures/reference.png b/tests/conformance/references/MetalRoughSpheresNoTextures/reference.png
+new file mode 100644
+index 0000000..72a57a4
+Binary files /dev/null and b/tests/conformance/references/MetalRoughSpheresNoTextures/reference.png differ
+diff --git a/tests/conformance/references/TextureTransformTest/provenance.json b/tests/conformance/references/TextureTransformTest/provenance.json
+new file mode 100644
+index 0000000..6ac8e11
+--- /dev/null
++++ b/tests/conformance/references/TextureTransformTest/provenance.json
+@@ -0,0 +1,57 @@
++{
++  "model": "TextureTransformTest",
++  "sourceGltf": "assets/fetched/TextureTransformTest/glTF/TextureTransformTest.gltf",
++  "generator": "tools/gltf_conformance/generate_reference.mjs",
++  "rendererRepo": "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++  "rendererCommit": "863b981fb755359063e370ff7b6e956bda0716e2",
++  "rendererLicense": "Apache-2.0",
++  "generatedAt": "2026-08-21T23:17:05.892Z",
++  "renderWidth": 512,
++  "renderHeight": 512,
++  "environment": {
++    "path": "samples/08_gltf_viewer/environments/gate_test_env.hdr",
++    "intensity": 1,
++    "rotationDegrees": 0
++  },
++  "renderingParameters": {
++    "toneMap": "None (Linear mapping, clamped at 1.0)",
++    "exposure": 1,
++    "useIBL": true,
++    "usePunctual": true,
++    "renderEnvironmentMap": false,
++    "clearColor": [
++      0.22,
++      0.25,
++      0.29,
++      1
++    ]
++  },
++  "camera": {
++    "position": [
++      0,
++      5.960464477539063e-8,
++      4.362741947174072
++    ],
++    "target": [
++      0,
++      5.960464477539063e-8,
++      7.513533262226701e-8
++    ],
++    "yfov": 0.7853981633974483,
++    "znear": 0.003210832089720097,
++    "zfar": 32.10832089720097,
++    "distance": 4.362741872038742
++  },
++  "sceneExtents": {
++    "min": [
++      -1.807106852531433,
++      -1.2571066617965698,
++      -0.7071067690849304
++    ],
++    "max": [
++      1.807106852531433,
++      1.2571067810058594,
++      0.7071067690849304
++    ]
++  }
++}
+diff --git a/tests/conformance/references/TextureTransformTest/reference.png b/tests/conformance/references/TextureTransformTest/reference.png
+new file mode 100644
+index 0000000..1447d95
+Binary files /dev/null and b/tests/conformance/references/TextureTransformTest/reference.png differ
+diff --git a/tools/fetch_assets.sh b/tools/fetch_assets.sh
+index ad94938..bf1b509 100755
+--- a/tools/fetch_assets.sh
++++ b/tools/fetch_assets.sh
+@@ -4,20 +4,27 @@ set -euo pipefail
+ # tools/fetch_assets.sh -- fetches Khronos glTF-Sample-Assets test content
+ # [Phase 4 Stage 1 Task 13, spec D16; extended round-11/issue-31]:
+ # DamagedHelmet is MANDATORY (small, the standard PBR-correctness asset,
+ # gate-tested by damaged_helmet_test.cpp) and fetched by default; BoomBox
+ # (glTF-Draco variant) is also MANDATORY (small, the real-world
+ # KHR_draco_mesh_compression compatibility asset, gate-tested by
+ # draco_compression_test.cpp -- see that file's own header comment for
+ # why this specific model was chosen over an ad hoc Sketchfab download);
+ # Sponza is OPTIONAL (large, local/present-mode "wow" content only -- CI
+ # NEVER downloads it) and fetched only when --sponza is passed.
++# [Phase 5 Stage 1 Task 11, ticket #47] Six glTF PBR conformance models
++# (MetalRoughSpheres, MetalRoughSpheresNoTextures, EmissiveStrengthTest,
++# CompareEmissiveStrength, TextureTransformTest, AlphaBlendModeTest) are
++# MANDATORY (small, CC-BY-4.0/CC0-1.0, gated by tests/conformance/ against
++# committed Khronos Sample Viewer references); EnvironmentTest is OPTIONAL
++# (--environment-test only, proprietary Adobe Stock license -- see that
++# section's own comment below).
+ # Checksummed, cached with a versioned marker file exactly like
+ # tools/fetch_slang.cmake's own pattern (a version/checksum-set bump
+ # self-invalidates a stale cache; re-running this script when everything
+ # is already fetched and verified is a fast no-op).
+ #
+ # LICENSE CORRECTION (this task, verified directly against
+ # glTF-Sample-Assets' own per-model LICENSE.md files -- flagged
+ # prominently, since the binding matrix/plan text this task's brief
+ # points to states both assets are plain "CC BY 4.0", which is WRONG for
+ # both, not just imprecise):
+@@ -36,25 +43,27 @@ set -euo pipefail
+ # script prints the accurate attribution below rather than the
+ # unqualified "CC BY 4.0" the planning documents assumed.
+ 
+ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ DEST_ROOT="${REPO_ROOT}/assets/fetched"
+ DAMAGED_HELMET_DIR="${DEST_ROOT}/DamagedHelmet/glTF"
+ SPONZA_DIR="${DEST_ROOT}/Sponza/glTF"
+ BOOMBOX_DRACO_DIR="${DEST_ROOT}/BoomBox/glTF-Draco"
+ 
+ FETCH_SPONZA=0
++FETCH_ENVIRONMENT_TEST=0
+ for arg in "$@"; do
+   case "$arg" in
+     --sponza) FETCH_SPONZA=1 ;;
++    --environment-test) FETCH_ENVIRONMENT_TEST=1 ;;
+     *)
+-      echo "usage: $0 [--sponza]" >&2
++      echo "usage: $0 [--sponza] [--environment-test]" >&2
+       exit 1
+       ;;
+   esac
+ done
+ 
+ # ---------------------------------------------------------------------
+ # DamagedHelmet (mandatory) -- pinned sha256 checksums, computed directly
+ # against github.com/KhronosGroup/glTF-Sample-Assets main branch this
+ # task (2026-08-18), the same "hardcode + verify" pattern this project's
+ # own CI already uses for the zig toolchain download
+@@ -185,17 +194,192 @@ fetch_boombox_draco() {
+     echo "[fetch_assets] downloading ${name}"
+     curl -fsSL -o "${local_path}" "${BOOMBOX_DRACO_BASE_URL}/${name}"
+     echo "${checksum}  ${local_path}" | sha256sum -c -
+   done
+ 
+   mkdir -p "${DEST_ROOT}"
+   echo "${BOOMBOX_DRACO_VERSION}" >"${BOOMBOX_DRACO_MARKER}"
+   echo "[fetch_assets] BoomBox (glTF-Draco) fetched and verified -> ${BOOMBOX_DRACO_DIR}"
+ }
+ 
++# ---------------------------------------------------------------------
++# glTF PBR conformance models [Phase 5 Stage 1 Task 11, ticket #47, gate
++# ruling T11] -- ≥6 conformance models gated against Khronos Sample
++# Viewer references (tests/conformance/). Six MANDATORY, CC-BY-4.0/CC0-1.0
++# models (safe to commit references for -- matrix-p5t11-conformance-
++# harness.md's own per-model LICENSE.md verification, this task):
++# MetalRoughSpheres/MetalRoughSpheresNoTextures (the metallic/roughness
++# grid, ± textures -- the charter's own headline conformance model, plus
++# an isolation case for a texture-sampling-vs-core-BRDF bug split),
++# EmissiveStrengthTest/CompareEmissiveStrength (KHR_materials_
++# emissive_strength -- consume-ready per gate ruling RC3), TextureTransformTest/
++# TextureTransformMultiTest (KHR_texture_transform, already consumed per
++# Phase 4 gate ruling C4). All seven files' sha256 pinned below, computed
++# directly against glTF-Sample-Assets main branch this task (2026-08-22),
++# same "hardcode + verify" pattern as DamagedHelmet/BoomBox above.
++#
++# EnvironmentTest is the SEVENTH, --environment-test-only model: its own
++# model content is under a proprietary Adobe Stock commercial license
++# (LICENSE.md's own "LicenseRef-Adobe-Stock" pointer, NOT Creative
++# Commons -- verified this task, matrix-p5t11-conformance-harness.md),
++# so it follows Sponza's own established disposition exactly: fetched on
++# demand ONLY (never by CI, never committed to this public repository),
++# for LOCAL conformance-harness testing only -- neither its glTF source
++# NOR any reference render generated from it may ever be committed.
++# ---------------------------------------------------------------------
++CONFORMANCE_VERSION="2026-08-22b"
++CONFORMANCE_MARKER="${DEST_ROOT}/.rx-fetched-conformance-${CONFORMANCE_VERSION}"
++
++fetch_conformance_model() {
++  local model_name="$1" base_url="$2" dest_subdir="$3" files="$4"
++  local dest_dir="${DEST_ROOT}/${model_name}/${dest_subdir}"
++  mkdir -p "${dest_dir}"
++  echo "${files}" | while read -r name checksum; do
++    [[ -z "${name}" ]] && continue
++    local_path="${dest_dir}/${name}"
++    echo "[fetch_assets] downloading ${model_name}/${name}"
++    curl -fsSL -o "${local_path}" "${base_url}/${name}"
++    echo "${checksum}  ${local_path}" | sha256sum -c -
++  done
++}
++
++fetch_conformance_models() {
++  if [[ -f "${CONFORMANCE_MARKER}" ]]; then
++    echo "[fetch_assets] conformance models already fetched and verified (marker ${CONFORMANCE_MARKER}) -- skipping"
++    return
++  fi
++
++  echo "[fetch_assets] glTF conformance models -- CC-BY-4.0 / CC0-1.0 (see this script's own header comment)."
++  echo "[fetch_assets]   Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models"
++
++  fetch_conformance_model "MetalRoughSpheres" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MetalRoughSpheres/glTF" \
++    "glTF" '
++MetalRoughSpheres.gltf a24fd6fd24b2baef80a5d56b465a55635f7ec79039414e25c341d1402cc28048
++MetalRoughSpheres0.bin f35a1caf37837b2987e24859d812a23e40ca37e1f741782e2a754961250e8c36
++Spheres_BaseColor.png 7327b8de2ce91d0ca4fdefcf28fdc58cb555e885a8e5f3b3cfab867c3f349efc
++Spheres_MetalRough.png 7b352787106705789df0e025a8ea2209074569cd87029369bc66080dfca78e5a
++'
++
++  # CC0-1.0 (model content); the model's own metadata.json is separately
++  # CC-BY-4.0 -- metadata.json itself is not fetched (not consumed by this
++  # gate), so only the CC0-1.0 disposition applies to what this script
++  # downloads.
++  fetch_conformance_model "MetalRoughSpheresNoTextures" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MetalRoughSpheresNoTextures/glTF" \
++    "glTF" '
++MetalRoughSpheresNoTextures.bin 1ce2d45aa5e99ec1a9d0018aa6cbd9cb3156f4fa9452c668525ddc63e9b31a66
++MetalRoughSpheresNoTextures.gltf fc5d59f4dcd674ef3de98bbe8d3f8cad569394aa07481c803c4449f8834bcada
++'
++
++  fetch_conformance_model "EmissiveStrengthTest" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/EmissiveStrengthTest/glTF" \
++    "glTF" '
++EmissiveStrengthTest.bin 54ba759d776228b52a256bb7b739581ad3081ac77677ee905b4920e869ceccf5
++EmissiveStrengthTest.gltf 84264f4300d2618aa2be39e90448f1716df8f1946d0d172476773bc9a4a99f65
++PlainGrid.png c67b0411f4f8d2c940c7e4583ce6c7607cc6c45779c88c3c16f2d2892fb9c411
++'
++
++  # CC0-1.0, PLUS a Khronos trademark/logo reference in its own LICENSE.md
++  # (../../LICENSES/LicenseRef-LegalMark-Khronos.txt) -- Compare_Emissive-
++  # Strength_img0.jpg is an embedded comparison-chart texture that may
++  # itself carry the Khronos logo; recorded here rather than silently
++  # dropped, matching this script's own DamagedHelmet/Sponza precedent of
++  # naming a non-obvious license nuance instead of rounding it off to a
++  # plain "CC0".
++  fetch_conformance_model "CompareEmissiveStrength" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CompareEmissiveStrength/glTF" \
++    "glTF" '
++CompareEmissiveStrength.bin 44c23126516708d693283143a15adf32cfc7399eaf2766f477d3c27aaa152622
++CompareEmissiveStrength.gltf c9d8f7b9cbaf6b54961b86b23c34a1dee23b99f22220507340e330db61287970
++Compare_Emissive-Strength_img0.jpg 7900f41ce34ee5a0922b4b03983875154e13ec165b17df05e4559d843a184d87
++'
++
++  fetch_conformance_model "TextureTransformTest" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/TextureTransformTest/glTF" \
++    "glTF" '
++Arrow.png 5df5b251fed0ac306cf859a30b59a4953d152483a4bed2b84e5bba1c667a1e64
++Correct.png 3a14b12635ebbcee3ea427fbdb4d20da73e4740ec7a51683d700a2d6b4b7861a
++Error.png 8d1032ef535a5c379bf78f9f565d3180ee3fc2d1cfef6892dee6e567728b619c
++NotSupported.png 1fbdeca7e5c105d677a39578e4bab82b89c8aa9f406ee681ede05635ea0f8c74
++TextureTransformTest.bin d0cdd23f2fa0996a0db99d4932fb9912a51a34e27c8bf832d072dc856ee9a7af
++TextureTransformTest.gltf c22c8c6c96c0ea4bcbb9b47ea245a093c5ef59acc5fd425effa4c00da4cdf164
++UV.png ac37ff52fe06a4c8c35ad4e1e7e8da039dfa8afc9b629d40a44ca8b8cfe9d03d
++'
++
++  # [Stage-1-scope correction, this task] NOT TextureTransformMultiTest --
++  # verified directly against its own glTF JSON
++  # (extensionsUsed includes KHR_materials_clearcoat, 9 of its 29 materials
++  # actually use it) that model ALSO exercises KHR_materials_clearcoat,
++  # which RendererX does not implement until Stage 3 (Task 21) -- gating
++  # the WHOLE image against it now would fail on clearcoat rows for a
++  # reason that has nothing to do with this ticket's own texture-transform
++  # scope, and "failures are findings to fix, never tolerance widenings"
++  # (this ticket's own binding text) forbids papering over that with a
++  # wider tolerance. AlphaBlendModeTest is the clean substitute: zero
++  # extensionsUsed (verified), pure core-PBR alphaMode content (Opaque/
++  # Mask/Blend), already consume-ready since Phase 4's D28.
++  fetch_conformance_model "AlphaBlendModeTest" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/AlphaBlendModeTest/glTF" \
++    "glTF" '
++AlphaBlendLabels.png 19c705f7e207384ca1ab01e0665601c051ca33c5848c03ce4fffad625b416b53
++AlphaBlendModeTest.bin bb89ab8d9ac0cfbc168e5d552e3ec2fe1285fd01bacb65c863d838b3db025c85
++AlphaBlendModeTest.gltf 49e06672900df95593040d35bbc7a2ee5921ae8d46edc44b64ccf2df65e64849
++MatBed_baseColor.jpg 71571cce0d86c7c5ed4ac73d852ec34e72e7234a2f905f2758e118519c950bcf
++MatBed_normal.jpg d8891a9c08e375507ac8f1fb260577bda5e90506e79db92ebbfb5caa9216be49
++MatBed_occlusionRoughnessMetallic.jpg e1472454ad6be574c3a418985f06a8ba36877108a94f61590f01e118804379b4
++'
++
++  mkdir -p "${DEST_ROOT}"
++  echo "${CONFORMANCE_VERSION}" >"${CONFORMANCE_MARKER}"
++  echo "[fetch_assets] conformance models fetched and verified -> ${DEST_ROOT}/{MetalRoughSpheres,MetalRoughSpheresNoTextures,EmissiveStrengthTest,CompareEmissiveStrength,TextureTransformTest,AlphaBlendModeTest}"
++}
++
++# EnvironmentTest -- OPTIONAL, --environment-test only; CI never passes
++# this flag. Adobe Stock proprietary license (see this section's own
++# header comment above) -- neither this glTF source nor any reference
++# render generated from it is ever committed to this public repository.
++ENVIRONMENT_TEST_VERSION="2026-08-22"
++ENVIRONMENT_TEST_MARKER="${DEST_ROOT}/.rx-fetched-environmenttest-${ENVIRONMENT_TEST_VERSION}"
++
++fetch_environment_test() {
++  if [[ -f "${ENVIRONMENT_TEST_MARKER}" ]]; then
++    echo "[fetch_assets] EnvironmentTest already fetched and verified (marker ${ENVIRONMENT_TEST_MARKER}) -- skipping"
++    return
++  fi
++
++  echo "[fetch_assets] EnvironmentTest -- Adobe Stock License (proprietary; NOT Creative Commons -- see"
++  echo "[fetch_assets]   ../../LICENSES/LicenseRef-Adobe-Stock.txt and this script's own header comment)."
++  echo "[fetch_assets]   Source: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/EnvironmentTest"
++  echo "[fetch_assets]   LOCAL/CI-on-demand testing only -- never committed (glTF source or generated references)."
++
++  fetch_conformance_model "EnvironmentTest" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/EnvironmentTest/glTF" \
++    "glTF" '
++EnvironmentTest.gltf c38d83e48ce1714e0dc9683ffbd8928da6bf2f11a7adeea50be5702bf055bfdb
++EnvironmentTest_binary.bin bc6f6118c3052384623b59c74488c5786975a2723eae3ef7136dffd7b6c42cc4
++'
++  fetch_conformance_model "EnvironmentTest" \
++    "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/EnvironmentTest/glTF/EnvironmentTest_images" \
++    "glTF/EnvironmentTest_images" '
++roughness_metallic_0.png 0e07400f4b9a0cb0cd625a65018fac96516a1e98be4a6c85fe618076a0c620df
++roughness_metallic_1.png 2709360619580ae8aace9fc7afb94a80ba6b987297948829f4093026e80426d3
++'
++
++  mkdir -p "${DEST_ROOT}"
++  echo "${ENVIRONMENT_TEST_VERSION}" >"${ENVIRONMENT_TEST_MARKER}"
++  echo "[fetch_assets] EnvironmentTest fetched and verified -> ${DEST_ROOT}/EnvironmentTest/glTF"
++}
++
+ fetch_damaged_helmet
+ fetch_boombox_draco
++fetch_conformance_models
+ if [[ "${FETCH_SPONZA}" -eq 1 ]]; then
+   fetch_sponza
+ else
+   echo "[fetch_assets] Sponza skipped (pass --sponza to fetch; CI never does)"
+ fi
++if [[ "${FETCH_ENVIRONMENT_TEST}" -eq 1 ]]; then
++  fetch_environment_test
++else
++  echo "[fetch_assets] EnvironmentTest skipped (pass --environment-test to fetch; CI never does)"
++fi
+diff --git a/tools/fetch_gltf_sample_renderer.sh b/tools/fetch_gltf_sample_renderer.sh
+new file mode 100755
+index 0000000..dd1491f
+--- /dev/null
++++ b/tools/fetch_gltf_sample_renderer.sh
+@@ -0,0 +1,75 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# tools/fetch_gltf_sample_renderer.sh -- Phase 5 Stage 1 Task 11 (#47),
++# gate ruling T11: "conformance ground truth via headless-browser
++# automation of the Khronos Sample Viewer's GltfView/GltfState API".
++#
++# WHAT THIS FETCHES: NOT the glTF-Sample-Viewer Vue.js UI application
++# (its own package.json has zero CLI/headless/screenshot capability --
++# `"test": "echo \"Error: no test specified\" && exit 1"`, verified
++# directly this task) -- the SEPARATE `glTF-Sample-Renderer` repository,
++# the actual WebGL2 rendering LIBRARY the Viewer's UI wraps
++# (`GltfView`/`GltfState`/`ResourceLoader`, `source/gltf-sample-
++# renderer.js`'s own public export list). tools/gltf_conformance/harness.html
++# drives this library directly, bypassing the Vue UI entirely -- the
++# matrix's own recommended approach (matrix-p5t11-conformance-harness.md's
++# Open Questions section), since the UI layer has nothing this task needs
++# and driving it via DOM automation would be strictly more fragile than
++# calling the library's own clean, documented JS API.
++#
++# PIN: commit 863b981fb755359063e370ff7b6e956bda0716e2 (2026-08-06,
++# "Merge pull request #49 from KhronosGroup/fix/tanget-hashing") -- the
++# exact commit glTF-Sample-Viewer's own git submodule pointer resolved to
++# when this task fetched it (2026-08-21/22), i.e. "whatever the Viewer
++# project itself currently treats as its own renderer" at pin time, not
++# an arbitrarily chosen commit. Apache-2.0 (github.com/KhronosGroup/
++# glTF-Sample-Renderer, verified via `gh api repos/...` this task).
++#
++# NOT committed to this repository -- a toolchain fetch, mirroring
++# tools/fetch_slang.cmake / toolchain/zig's own on-demand pattern
++# (.gitignore already excludes toolchain/ entirely). Only
++# tools/gltf_conformance/generate_reference.mjs (the driver script) and
++# its own committed output (tests/conformance/references/**) are checked
++# in; this script's own output (the built ESM renderer bundle) is
++# reproducible from this pin at any time and never needs to be.
++#
++# USAGE: tools/fetch_gltf_sample_renderer.sh
++#   Idempotent: a versioned marker file (mirroring tools/fetch_assets.sh's
++#   own convention) makes a re-run with an unchanged pin a fast no-op.
++#   Requires `git`, `node`/`npm` (any reasonably current LTS -- built and
++#   verified against Node 24 this task), and network access.
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++DEST_DIR="${REPO_ROOT}/toolchain/gltf-sample-renderer"
++PIN_COMMIT="863b981fb755359063e370ff7b6e956bda0716e2"
++MARKER="${DEST_DIR}/.rx-fetched-${PIN_COMMIT}"
++
++if [[ -f "${MARKER}" ]]; then
++  echo "[fetch_gltf_sample_renderer] already fetched+built at ${PIN_COMMIT} (marker ${MARKER}) -- skipping"
++  exit 0
++fi
++
++echo "[fetch_gltf_sample_renderer] glTF-Sample-Renderer @ ${PIN_COMMIT} -- Apache-2.0, Khronos Group Inc."
++echo "[fetch_gltf_sample_renderer]   Source: https://github.com/KhronosGroup/glTF-Sample-Renderer"
++
++rm -rf "${DEST_DIR}"
++mkdir -p "${DEST_DIR}"
++git init -q "${DEST_DIR}"
++git -C "${DEST_DIR}" remote add origin https://github.com/KhronosGroup/glTF-Sample-Renderer.git
++git -C "${DEST_DIR}" fetch -q --depth 1 origin "${PIN_COMMIT}"
++git -C "${DEST_DIR}" checkout -q FETCH_HEAD
++
++echo "[fetch_gltf_sample_renderer] npm ci"
++( cd "${DEST_DIR}" && npm ci --no-audit --no-fund )
++
++echo "[fetch_gltf_sample_renderer] npm run build (rollup -> dist/gltf-viewer.module.js)"
++( cd "${DEST_DIR}" && npm run build )
++
++if [[ ! -f "${DEST_DIR}/dist/gltf-viewer.module.js" ]]; then
++  echo "[fetch_gltf_sample_renderer] build did not produce dist/gltf-viewer.module.js" >&2
++  exit 1
++fi
++
++echo "${PIN_COMMIT}" >"${MARKER}"
++echo "[fetch_gltf_sample_renderer] built -> ${DEST_DIR}/dist/gltf-viewer.module.js"
+diff --git a/tools/gltf_conformance/generate_reference.mjs b/tools/gltf_conformance/generate_reference.mjs
+new file mode 100644
+index 0000000..8cdb476
+--- /dev/null
++++ b/tools/gltf_conformance/generate_reference.mjs
+@@ -0,0 +1,307 @@
++#!/usr/bin/env node
++// tools/gltf_conformance/generate_reference.mjs -- Phase 5 Task 11 (#47),
++// gate ruling T11: the ONE reference-render generation mechanism this
++// ticket's own text calls for ("generation procedure scripted/documented +
++// committed"). Drives a LOCALLY BUILT, pinned glTF-Sample-Renderer (see
++// tools/fetch_gltf_sample_renderer.sh) through tools/gltf_conformance/
++// harness.html's own window.rxCapture() via Playwright, at matched camera/
++// environment/tonemap settings -- see that file's own header comment for
++// the full methodology.
++//
++// NEVER AUTO-RUN: no CI workflow or ctest target invokes this script,
++// mirroring tools/regen_references.sh's own "documented, deliberate,
++// human-invoked maintenance step" convention exactly. The COMMITTED
++// artifacts this script produces (tests/conformance/references/<Model>/
++// reference.png + provenance.json) are what every real ctest run compares
++// against; nothing regenerates them silently.
++//
++// PREREQUISITES:
++//   tools/fetch_gltf_sample_renderer.sh   (builds toolchain/gltf-sample-renderer/dist/)
++//   tools/fetch_assets.sh --conformance   (fetches the glTF conformance models)
++//   npm ci    (in this directory -- installs the pinned Playwright)
++//   npx playwright install chromium   (downloads the headless Chromium build)
++//
++// USAGE: node generate_reference.mjs [modelName ...]
++//   With no arguments, regenerates every model in MODELS below. Pass one or
++//   more model names to regenerate a subset (e.g. after a single asset's
++//   own version bump).
++
++import { chromium } from "playwright";
++import { createServer } from "node:http";
++import { readFile, writeFile, mkdir } from "node:fs/promises";
++import { existsSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const REPO_ROOT = path.resolve(__dirname, "..", "..");
++
++const RENDER_WIDTH = 512;
++const RENDER_HEIGHT = 512;
++
++// Mirrors tests/conformance/models.h's own MODEL REGISTRY table --
++// intentionally duplicated rather than shared (this script and the C++
++// harness are two independent language runtimes; see that header's own
++// comment for the cross-reference note keeping the two lists in sync).
++// `env: true` models are lit by the shared gate_test_env.hdr fixture
++// (every model here -- IBL-only content, no KHR_lights_punctual, matching
++// harness.html's own "no punctual lights" methodology note).
++const MODELS = [
++  {
++    name: "MetalRoughSpheres",
++    gltf: "assets/fetched/MetalRoughSpheres/glTF/MetalRoughSpheres.gltf",
++  },
++  {
++    name: "MetalRoughSpheresNoTextures",
++    gltf: "assets/fetched/MetalRoughSpheresNoTextures/glTF/MetalRoughSpheresNoTextures.gltf",
++  },
++  {
++    name: "EmissiveStrengthTest",
++    gltf: "assets/fetched/EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf",
++  },
++  {
++    name: "CompareEmissiveStrength",
++    gltf: "assets/fetched/CompareEmissiveStrength/glTF/CompareEmissiveStrength.gltf",
++  },
++  {
++    name: "TextureTransformTest",
++    gltf: "assets/fetched/TextureTransformTest/glTF/TextureTransformTest.gltf",
++  },
++  // AlphaBlendModeTest, not TextureTransformMultiTest -- see
++  // tools/fetch_assets.sh's own comment for why: TextureTransformMultiTest
++  // requires KHR_materials_clearcoat, unsupported by RendererX until
++  // Stage 3, so its own reference render's clearcoat rows would fail this
++  // gate for a reason outside this ticket's own scope.
++  {
++    name: "AlphaBlendModeTest",
++    gltf: "assets/fetched/AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf",
++  },
++  // EnvironmentTest: fetch-on-demand ONLY, never committed (proprietary
++  // Adobe Stock license on the model content itself -- gate ruling T11,
++  // matrix-p5t11-conformance-harness.md's own per-model license-
++  // verification finding). This script CAN still generate a reference for
++  // it (local use only -- proves the harness end-to-end on a real
++  // multi-environment IBL asset); tests/conformance never commits its
++  // output, and the ctest gate skips gracefully when it is absent (same
++  // shape as DamagedHelmet's own "not fetched -> skip" convention).
++  {
++    name: "EnvironmentTest",
++    gltf: "assets/fetched/EnvironmentTest/glTF/EnvironmentTest.gltf",
++    optional: true,
++  },
++];
++
++const ENV_HDR = "samples/08_gltf_viewer/environments/gate_test_env.hdr";
++const OUTPUT_ROOT = "tests/conformance/references";
++
++function contentTypeFor(filePath) {
++  const ext = path.extname(filePath).toLowerCase();
++  switch (ext) {
++    case ".html":
++      return "text/html; charset=utf-8";
++    case ".js":
++    case ".mjs":
++      return "text/javascript; charset=utf-8";
++    case ".json":
++      return "application/json; charset=utf-8";
++    case ".wasm":
++      return "application/wasm";
++    case ".png":
++      return "image/png";
++    case ".jpg":
++    case ".jpeg":
++      return "image/jpeg";
++    case ".gltf":
++      return "model/gltf+json";
++    case ".bin":
++      return "application/octet-stream";
++    case ".hdr":
++      return "application/octet-stream";
++    default:
++      return "application/octet-stream";
++  }
++}
++
++// The built glTF-Sample-Renderer module resolves its own OWN worker/wasm
++// sibling files (mikktspace_bg.wasm, libktx.wasm, draco_decoder.wasm, ...)
++// relative to the HTML PAGE's own URL (document-base-relative), not
++// relative to the ESM module's own import.meta.url -- reproduced directly
++// this task (a 404 for "tools/gltf_conformance/libs/mikktspace_bg.wasm",
++// requested from harness.html's own directory even though the actual file
++// lives under toolchain/gltf-sample-renderer/dist/libs/). Rather than
++// physically copying the whole dist/ tree next to harness.html (duplicate,
++// staleness-prone), the static server below transparently redirects any
++// request under tools/gltf_conformance/{libs,assets}/ to the real
++// toolchain/gltf-sample-renderer/dist/{libs,assets}/ location.
++// Order matters: "assets/images/" (the LUT PNGs' own pre-flattening
++// source-relative path, still what the built module's own runtime code
++// requests -- e.g. "assets/images/lut_sheen_E.png") must be tried BEFORE
++// the plain "assets/" rule, since rollup-plugin-copy's own `dest: "dist/
++// assets"` flattens that `images/` segment away when it copies them
++// (rollup.config.js's own copy target list, pinned commit) -- the file
++// physically lands at dist/assets/lut_sheen_E.png, not dist/assets/images/
++// lut_sheen_E.png.
++const RENDERER_DIST_REDIRECTS = ["libs", "assets/images", "assets"];
++
++// A deliberately tiny static file server (repo root as document root) --
++// Node's own built-in http/fs modules are already "a well-established
++// library" for exactly this (CLAUDE.md's own "ready-made over hand-rolled"
++// rule is about NOT reimplementing parsers/allocators/protocol handling;
++// a ~25-line directory-relative static GET handler is not that class of
++// problem, and pulling in a whole extra npm dependency for it would not
++// be a meaningfully more "ready-made" solution). Serves ONLY what this
++// script itself requests (localhost, ephemeral port, torn down at the end
++// of main()) -- never a general-purpose or long-lived server.
++function startStaticServer(documentRoot) {
++  const server = createServer(async (req, res) => {
++    try {
++      const url = new URL(req.url, "http://localhost");
++      let relPath = decodeURIComponent(url.pathname).replace(/^\/+/, "");
++      for (const sub of RENDERER_DIST_REDIRECTS) {
++        const prefix = `tools/gltf_conformance/${sub}/`;
++        if (relPath.startsWith(prefix)) {
++          // "assets/images" redirects into the SAME dist/assets/ directory
++          // "assets" does (see RENDERER_DIST_REDIRECTS' own comment) --
++          // only the "libs"/"assets" leaf segment (not "assets/images")
++          // is a real directory name under dist/.
++          const destSub = sub === "assets/images" ? "assets" : sub;
++          relPath = `toolchain/gltf-sample-renderer/dist/${destSub}/${relPath.slice(prefix.length)}`;
++          break;
++        }
++      }
++      const filePath = path.join(documentRoot, relPath);
++      if (!filePath.startsWith(documentRoot)) {
++        res.writeHead(403);
++        res.end("forbidden");
++        return;
++      }
++      const data = await readFile(filePath);
++      res.writeHead(200, { "Content-Type": contentTypeFor(filePath) });
++      res.end(data);
++    } catch (err) {
++      res.writeHead(404);
++      res.end(`not found: ${err.message}`);
++    }
++  });
++  return new Promise((resolve) => {
++    server.listen(0, "127.0.0.1", () => resolve(server));
++  });
++}
++
++async function main() {
++  const requested = process.argv.slice(2);
++  const models = requested.length > 0 ? MODELS.filter((m) => requested.includes(m.name)) : MODELS;
++  if (models.length === 0) {
++    console.error(`no matching model(s) in: ${requested.join(", ")}`);
++    process.exit(1);
++  }
++
++  const rendererDist = path.join(REPO_ROOT, "toolchain/gltf-sample-renderer/dist/gltf-viewer.module.js");
++  if (!existsSync(rendererDist)) {
++    console.error(
++      `${rendererDist} not found -- run tools/fetch_gltf_sample_renderer.sh first`
++    );
++    process.exit(1);
++  }
++
++  const server = await startStaticServer(REPO_ROOT);
++  const port = server.address().port;
++  console.log(`[generate_reference] static server on http://127.0.0.1:${port} (document root: ${REPO_ROOT})`);
++
++  const browser = await chromium.launch();
++  try {
++    for (const model of models) {
++      const gltfAbsPath = path.join(REPO_ROOT, model.gltf);
++      if (!existsSync(gltfAbsPath)) {
++        if (model.optional) {
++          console.log(`[generate_reference] ${model.name}: not fetched locally (optional) -- skipping`);
++          continue;
++        }
++        console.error(`[generate_reference] ${model.name}: ${model.gltf} not found -- run tools/fetch_assets.sh first`);
++        process.exitCode = 1;
++        continue;
++      }
++
++      // A FRESH page (and its own WebGL2 context) per model -- reusing one
++      // page/GltfView across every model in sequence was observed this task
++      // to eventually wedge the headless Chromium GPU process indefinitely
++      // (reproduced directly: the 6th sequential capture on a shared page
++      // hung >15 minutes with 100% CPU in the gpu-process, never observed
++      // when each model instead got its own page). Not investigated further
++      // (a SwiftShader/software-WebGL resource-accumulation issue across
++      // many createState()/loadGltf() calls on one context is the likely
++      // cause) since a fresh page per model is both the robust fix AND
++      // already this script's own natural unit of isolation (one glTF
++      // conformance model's own capture has no reason to share GPU state
++      // with another's).
++      const page = await browser.newPage({ viewport: { width: RENDER_WIDTH, height: RENDER_HEIGHT } });
++      page.on("console", (msg) => console.log(`[page:${msg.type()}] ${msg.text()}`));
++      page.on("pageerror", (err) => console.error(`[page:error] ${err}`));
++      page.on("requestfailed", (req) => console.error(`[page:requestfailed] ${req.url()} -- ${req.failure()?.errorText}`));
++      page.on("response", (res) => {
++        if (!res.ok()) {
++          console.error(`[page:response] ${res.status()} ${res.url()}`);
++        }
++      });
++
++      await page.goto(`http://127.0.0.1:${port}/tools/gltf_conformance/harness.html`, {
++        waitUntil: "load",
++      });
++      await page.waitForFunction("window.rxHarnessReady === true", { timeout: 15000 });
++
++      const modelUrl = `http://127.0.0.1:${port}/${model.gltf}`;
++      const envUrl = `http://127.0.0.1:${port}/${ENV_HDR}`;
++      console.log(`[generate_reference] ${model.name}: capturing (model=${modelUrl} env=${envUrl})`);
++
++      const result = await page.evaluate(
++        async ({ modelUrl, envUrl, width, height }) => window.rxCapture(modelUrl, envUrl, width, height),
++        { modelUrl, envUrl, width: RENDER_WIDTH, height: RENDER_HEIGHT }
++      );
++
++      const base64 = result.dataUrl.replace(/^data:image\/png;base64,/, "");
++      const pngBytes = Buffer.from(base64, "base64");
++
++      const outDir = path.join(REPO_ROOT, OUTPUT_ROOT, model.name);
++      await mkdir(outDir, { recursive: true });
++      await writeFile(path.join(outDir, "reference.png"), pngBytes);
++
++      const provenance = {
++        model: model.name,
++        sourceGltf: model.gltf,
++        generator: "tools/gltf_conformance/generate_reference.mjs",
++        rendererRepo: "https://github.com/KhronosGroup/glTF-Sample-Renderer",
++        rendererCommit: "863b981fb755359063e370ff7b6e956bda0716e2",
++        rendererLicense: "Apache-2.0",
++        generatedAt: new Date().toISOString(),
++        renderWidth: RENDER_WIDTH,
++        renderHeight: RENDER_HEIGHT,
++        environment: {
++          path: ENV_HDR,
++          intensity: 1.0,
++          rotationDegrees: 0.0,
++        },
++        renderingParameters: {
++          toneMap: "None (Linear mapping, clamped at 1.0)",
++          exposure: 1.0,
++          useIBL: true,
++          usePunctual: true,
++          renderEnvironmentMap: false,
++          clearColor: [0.22, 0.25, 0.29, 1.0],
++        },
++        camera: result.camera,
++        sceneExtents: result.sceneExtents,
++      };
++      await writeFile(path.join(outDir, "provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`);
++      console.log(`[generate_reference] ${model.name}: wrote ${outDir}/reference.png + provenance.json`);
++      await page.close();
++    }
++  } finally {
++    await browser.close();
++    server.close();
++  }
++}
++
++main().catch((err) => {
++  console.error(err);
++  process.exit(1);
++});
+diff --git a/tools/gltf_conformance/harness.html b/tools/gltf_conformance/harness.html
+new file mode 100644
+index 0000000..869fe04
+--- /dev/null
++++ b/tools/gltf_conformance/harness.html
+@@ -0,0 +1,232 @@
++<!doctype html>
++<!--
++  tools/gltf_conformance/harness.html -- Phase 5 Task 11 (#47), gate ruling
++  T11. A minimal, non-Vue page that drives the Khronos glTF-Sample-Renderer's
++  own GltfView/GltfState/ResourceLoader API DIRECTLY (bypassing the
++  glTF-Sample-Viewer Vue.js UI shell entirely -- see
++  tools/fetch_gltf_sample_renderer.sh's own header comment for why that
++  shell is not fetched at all). Loaded by generate_reference.mjs inside a
++  headless Chromium page; window.rxCapture() below is the ONE function that
++  script calls via page.evaluate().
++
++  METHODOLOGY (recorded here + task-11-report.md; see that report for the
++  full derivation):
++   - Camera: state.userCamera.resetView(gltf, sceneIndex) -- the Renderer's
++     OWN default "fit to scene" algorithm (source/gltf/user_camera.js,
++     pinned commit), used VERBATIM here (not re-derived) so the reference
++     render's camera is the actual reference renderer's actual default
++     framing. RendererX's own conformance harness (tests/conformance/
++     camera_fit.cpp/camera_fit.h) ports this EXACT algorithm
++     (fitDistanceToExtents/fitCameraTargetToExtents/
++     fitCameraPlanesToExtents, cited by function name) against its own
++     imported scene's world bounds, using the SAME 45-degree default yfov
++     and the SAME square 512x512 (aspect=1) render resolution -- both
++     sides are therefore expected to converge on numerically identical
++     camera parameters from the same deterministic formula over the same
++     input, not merely "close". TWO non-obvious findings this task's own
++     development had to reverse-engineer (both now cited in camera_fit.h,
++     not re-derived a second time here): (1) resetView()'s own
++     getSceneExtents() reads world transforms that are only valid AFTER
++     scene.applyTransformHierarchy(gltf) has run at least once -- this
++     harness calls it explicitly, once, right before resetView() (see the
++     inline comment at that call site below); (2) getSceneExtents() does
++     NOT union tight per-primitive AABBs -- source/gltf/gltf_utils.js's
++     own getExtentsFromAccessor() replaces EACH primitive's tight AABB
++     with the smallest CUBE inscribing that AABB's own bounding SPHERE
++     (center +/- half-the-AABB's-own-diagonal, not half its per-axis
++     extent) BEFORE the union -- camera_fit.h's own
++     accumulateReferenceStyleSceneExtents()/sphereInscribingCubeOf()
++     reproduce this exactly, including the per-PRIMITIVE (not per-mesh)
++     granularity, which is load-bearing for at least one gated model
++     (MetalRoughSpheresNoTextures' own multi-primitive text-label meshes).
++   - Tonemap: GltfState.ToneMaps.NONE ("Linear mapping, clamped at 1.0 per
++     channel" -- source/Renderer/shaders/tonemapping.glsl's own toneMap(),
++     verified by reading that file directly: NONE selects none of the
++     `#ifdef TONEMAP_*` branches, leaving `color *= u_Exposure;
++     return linearTosRGB(color);` i.e. exposure multiply, hard clip at
++     write time, sRGB encode). This is DELIBERATE, not a default left
++     unconsidered: RendererX's own tonemap.frag.slang (shaders/multipass/)
++     is a plain Reinhard curve (Phase 4 decision), a materially DIFFERENT
++     curve from every option this renderer offers (KHR_PBR_NEUTRAL/ACES/
++     NONE) -- comparing through either side's own "nice" tonemap would
++     make this conformance gate measure "do the two tonemap curves agree"
++     (an orthogonal, Phase-5-Task-32-owned question) rather than "do the
++     BRDF/lighting/IBL values agree". NONE is the one option with a
++     TRIVIAL, exactly-reproducible curve (clamp+sRGB, no compression) that
++     RendererX's own conformance render tool (tests/conformance/main.cpp)
++     replicates bit-for-bit on its own linear HDR capture instead of
++     running its production Reinhard pass -- see that tool's own
++     applyLinearClampTonemap() for the identical formula.
++   - Environment: the SAME committed equirect HDR fixture RendererX's own
++     samples/08_gltf_viewer already uses for its own IBL gate
++     (samples/08_gltf_viewer/environments/gate_test_env.hdr, procedurally
++     generated for this project, Task 10) -- loaded via ResourceLoader.
++     loadEnvironment() on this side, and via rx::ibl::bakeEnvironment() on
++     RendererX's own side: two INDEPENDENT IBL implementations baking the
++     SAME input texture, which is the actual point of this conformance
++     check for T9/T10. environmentRotation is left at 0 (this renderer's
++     own zero-rotation reading of the raw equirect mapping) since
++     RendererX's own EnvironmentDesc has no rotation concept at all to
++     match against (rx_scene/scene.h, verified) -- recorded as an accepted
++     residual-divergence source the pilot-derived tolerance (task-11-
++     report.md) absorbs, not something either side "gets wrong".
++   - Background: renderEnvironmentMap=false (flat clearColor background,
++     matched literally byte-for-byte against RendererX's own capture) for
++     the material/emissive/texture-transform conformance set -- isolates
++     "does the shaded PBR geometry match" from "does the visible skybox's
++     own orientation/sampling match" (a second, independent divergence
++     axis this ticket's core 6-model set does not need to also absorb).
++   - No punctual lights: every core conformance model (MetalRoughSpheres[
++     NoTextures]/EmissiveStrengthTest/TextureTransformTest[Multi]/
++     CompareEmissiveStrength) is IBL-only by design (no KHR_lights_punctual
++     -- KHR_lights_punctual is Stage 2/Task 13, not yet landed in
++     RendererX at this ticket's base commit); usePunctual stays at this
++     renderer's own default (true) but is a no-op for content with no
++     punctual lights, matching RendererX's own zero-fake-light capture
++     (tests/conformance/main.cpp deliberately zeroes its inherited-from-
++     sample08 fake directional key light -- see that file's own comment).
++-->
++<html>
++  <head>
++    <meta charset="utf-8" />
++    <title>rx-gltf-conformance-harness</title>
++  </head>
++  <body style="margin:0;background:#000;">
++    <canvas id="rxCanvas" width="512" height="512"></canvas>
++    <!-- Classic (non-module) script -- defines the global `createKtxModule`
++         KtxDecoder's constructor reads unconditionally (source/ResourceLoader/
++         ktx.js, pinned commit) whenever ResourceLoader.initKtxLib() is not
++         given an explicit external lib. None of this ticket's conformance
++         models use KTX2 textures (plain PNG/JPG only, verified against each
++         model's own glTF `images` array) -- this script only needs to exist
++         so that bare identifier reference does not throw a ReferenceError
++         before window.rxCapture is ever defined; its own async WASM init
++         (fired, never awaited, by KtxDecoder's constructor) completing or
++         not is irrelevant to this harness. -->
++    <script src="../../toolchain/gltf-sample-renderer/dist/libs/libktx.js"></script>
++    <script type="module">
++      import { GltfView, GltfState } from "../../toolchain/gltf-sample-renderer/dist/gltf-viewer.module.js";
++
++      const canvas = document.getElementById("rxCanvas");
++      const context = canvas.getContext("webgl2", {
++        antialias: false,
++        preserveDrawingBuffer: true,
++        alpha: true,
++      });
++      if (context === null) {
++        window.rxInitError = "webgl2 context creation failed";
++      }
++
++      const view = context !== null ? new GltfView(context) : null;
++      const resourceLoader = view !== null ? view.createResourceLoader() : null;
++
++      // window.rxCapture(modelUrl, envUrlOrNull, width, height) -> {
++      //   dataUrl: "data:image/png;base64,...",
++      //   camera: { position, target, yfov, znear, zfar, distance },
++      //   sceneExtents: { min, max },
++      // }
++      // Thrown errors propagate to Playwright's own page.evaluate() caller
++      // as a rejected promise -- generate_reference.mjs surfaces them
++      // directly rather than swallowing them into a null return.
++      window.rxCapture = async function rxCapture(modelUrl, envUrl, width, height) {
++        if (view === null || resourceLoader === null) {
++          throw new Error(window.rxInitError ?? "GltfView/ResourceLoader not initialized");
++        }
++        canvas.width = width;
++        canvas.height = height;
++
++        const state = view.createState();
++        const gltf = await resourceLoader.loadGltf(modelUrl);
++        state.gltf = gltf;
++        state.sceneIndex = gltf.scene ?? 0;
++        state.cameraNodeIndex = undefined; // force the user (fit-to-scene) camera.
++
++        if (envUrl) {
++          state.environment = await resourceLoader.loadEnvironment(envUrl);
++        }
++
++        // BUG FOUND THIS TASK, FIXED HERE (#1 of 2 camera-fit findings --
++        // see this file's own top comment for #2, the sphere-inscribing-
++        // cube step): UserCamera::resetView()'s own getSceneExtents() reads
++        // each node's getRenderedWorldTransform() (source/gltf/gltf_utils.
++        // js), which is simply `this.worldTransform` (source/gltf/node.js)
++        // -- a field ONLY populated by scene.applyTransformHierarchy(gltf)
++        // (source/gltf/scene.js), which this renderer's OWN GltfView.
++        // renderFrame() calls internally, AFTER its own camera/animation
++        // setup, every frame. Calling resetView() before the FIRST
++        // renderFrame() (this harness's original, naive call order) reads
++        // every node's `worldTransform` still at its own post-construction
++        // default (identity for every node, real hierarchy never yet
++        // applied) -- reproduced directly this task against MetalRough
++        // Spheres' own real (0.4x scale + axis-swap rotation) root
++        // transform. FIX: apply the transform hierarchy once
++        // (scene.applyTransformHierarchy(gltf), the SAME call renderFrame()
++        // itself makes) before resetView() ever reads it -- matches the
++        // deployed Sample Viewer app's own effective behavior (its
++        // continuous render loop has always already applied the hierarchy
++        // at least once before any user-triggered "reset view" UI action
++        // could run).
++        gltf.scenes[state.sceneIndex].applyTransformHierarchy(gltf);
++
++        // Fit-to-scene camera -- ported verbatim in tests/conformance/
++        // camera_fit.cpp (including finding #2, the sphere-inscribing-cube
++        // step camera_fit.h's own accumulateReferenceStyleSceneExtents()
++        // documents in full); see this file's own top comment.
++        state.userCamera.resetView(gltf, state.sceneIndex);
++        // Opt-in diagnostic (harness.html?debug=1) -- prints the resolved
++        // camera-fit extents to the page console; useful for re-deriving/
++        // cross-checking camera_fit.cpp's own numbers by hand against a
++        // fresh model without instrumenting this file again. Never
++        // enabled by generate_reference.mjs's own normal invocation.
++        if (window.location.search.includes('debug')) {
++          console.log(`DEBUG cam.sceneExtents min=${JSON.stringify(Array.from(state.userCamera.sceneExtents.min))} max=${JSON.stringify(Array.from(state.userCamera.sceneExtents.max))}`);
++        }
++
++        state.renderingParameters.toneMap = GltfState.ToneMaps.NONE;
++        state.renderingParameters.exposure = 1.0;
++        state.renderingParameters.useIBL = true;
++        state.renderingParameters.usePunctual = true;
++        state.renderingParameters.renderEnvironmentMap = false;
++        state.renderingParameters.blurEnvironmentMap = true;
++        state.renderingParameters.iblIntensity = 1.0;
++        state.renderingParameters.environmentRotation = 0.0;
++        // RendererX's own linear-clamp capture clears to the SAME literal
++        // sRGB-domain color both sides then encode identically -- see
++        // tests/conformance/main.cpp's own kConformanceClearColorSrgb.
++        state.renderingParameters.clearColor = [0.22, 0.25, 0.29, 1.0];
++
++        // Two renders: WebGL/driver state (shader/program binds, IBL
++        // texture completeness) can have a benign first-frame warm-up
++        // difference on some backends -- the SECOND frame is what is
++        // actually captured, matching this project's own "never trust an
++        // uninitialized first frame" headless-capture convention
++        // (RendererX's own samples capture only after their own
++        // known-ready state, never frame 0 blind).
++        view.renderFrame(state, width, height);
++        view.renderFrame(state, width, height);
++
++        const dataUrl = canvas.toDataURL("image/png");
++
++        const cam = state.userCamera;
++        const position = cam.getPosition();
++        const target = cam.getTarget();
++        return {
++          dataUrl,
++          camera: {
++            position: [position[0], position[1], position[2]],
++            target: [target[0], target[1], target[2]],
++            yfov: cam.perspective.yfov,
++            znear: cam.perspective.znear,
++            zfar: cam.perspective.zfar,
++            distance: cam.distance,
++          },
++          sceneExtents: {
++            min: [cam.sceneExtents.min[0], cam.sceneExtents.min[1], cam.sceneExtents.min[2]],
++            max: [cam.sceneExtents.max[0], cam.sceneExtents.max[1], cam.sceneExtents.max[2]],
++          },
++        };
++      };
++      window.rxHarnessReady = true;
++    </script>
++  </body>
++</html>
+diff --git a/tools/gltf_conformance/package-lock.json b/tools/gltf_conformance/package-lock.json
+new file mode 100644
+index 0000000..25fafa1
+--- /dev/null
++++ b/tools/gltf_conformance/package-lock.json
+@@ -0,0 +1,59 @@
++{
++  "name": "rx-gltf-conformance-reference-generator",
++  "version": "1.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "rx-gltf-conformance-reference-generator",
++      "version": "1.0.0",
++      "dependencies": {
++        "playwright": "1.62.1"
++      }
++    },
++    "node_modules/fsevents": {
++      "version": "2.3.2",
++      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
++      "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
++      "hasInstallScript": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
++      }
++    },
++    "node_modules/playwright": {
++      "version": "1.62.1",
++      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.62.1.tgz",
++      "integrity": "sha512-0M+L3LAD8/nm554LOla9Ayx0j0tmFZ0FBcoQ7F1VuVHpM/XpiC8RcDzBQB8W5+hA8L22THxELzeF+2WcUzvcLg==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "playwright-core": "1.62.1"
++      },
++      "bin": {
++        "playwright": "cli.js"
++      },
++      "engines": {
++        "node": ">=20"
++      },
++      "optionalDependencies": {
++        "fsevents": "2.3.2"
++      }
++    },
++    "node_modules/playwright-core": {
++      "version": "1.62.1",
++      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.62.1.tgz",
++      "integrity": "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==",
++      "license": "Apache-2.0",
++      "bin": {
++        "playwright-core": "cli.js"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    }
++  }
++}
+diff --git a/tools/gltf_conformance/package.json b/tools/gltf_conformance/package.json
+new file mode 100644
+index 0000000..3dd7f62
+--- /dev/null
++++ b/tools/gltf_conformance/package.json
+@@ -0,0 +1,13 @@
++{
++  "name": "rx-gltf-conformance-reference-generator",
++  "private": true,
++  "version": "1.0.0",
++  "description": "Phase 5 Task 11 (#47): generates ground-truth reference PNGs for RendererX's glTF PBR conformance gate by driving the Khronos glTF-Sample-Renderer (GltfView/GltfState) headlessly via Playwright. Offline/occasional maintenance tooling only -- never run by CI (see generate_reference.mjs's own header comment).",
++  "type": "module",
++  "scripts": {
++    "generate": "node generate_reference.mjs"
++  },
++  "dependencies": {
++    "playwright": "1.62.1"
++  }
++}
