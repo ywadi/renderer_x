@@ -40,10 +40,43 @@ std::pair<uint32_t, uint32_t> computeFroxelGridXY(uint32_t viewportWidth, uint32
 
     // solving: froxelCountX * froxelCountY == froxelPlaneCount
     //          froxelCountX / froxelCountY == width / height
-    auto froxelCountX =
-        static_cast<uint32_t>(std::sqrt(static_cast<double>(froxelPlaneCount) * width / height));
-    auto froxelCountY =
-        static_cast<uint32_t>(std::sqrt(static_cast<double>(froxelPlaneCount) * height / width));
+    //
+    // [Fix round 1, review Finding 1] Filament's own `computeFroxelLayout()`
+    // [Froxelizer.cpp:299-300, v1.75.0]:
+    //   `size_t froxelCountX = size_t(std::sqrt(froxelPlaneCount * width / height));`
+    //   `size_t froxelCountY = size_t(std::sqrt(froxelPlaneCount * height / width));`
+    // `froxelPlaneCount`/`width`/`height` are all unsigned-integer-typed
+    // there (Froxelizer.cpp:289-295: `froxelPlaneCount` is `size_t`, `width`/
+    // `height` are `const uint32_t`), so `froxelPlaneCount * width / height`
+    // TRUNCATES in integer arithmetic BEFORE `std::sqrt()` ever sees it --
+    // not the double-precision `floor(sqrt(exact real quotient))` an earlier
+    // revision of this function computed. Reproduced here with the SAME
+    // truncation order (64-bit intermediate to match `size_t` on every
+    // platform this port targets, avoiding a 32-bit overflow for large
+    // `froxelPlaneCount * width` products).
+    //
+    // NOTE on why this was, in practice, never actually observable: floor(
+    // sqrt(x)) == floor(sqrt(floor(x))) is a general mathematical identity
+    // for any real x >= 0 (proof: let n = floor(x), m = floor(sqrt(x)); m^2
+    // <= x and m^2 is an integer, so m^2 <= n; also x < n+1 (n=floor(x)) and
+    // n <= x < (m+1)^2 forces n < (m+1)^2 since both are integers -- so m^2
+    // <= n < (m+1)^2, i.e. floor(sqrt(n)) == m too) -- so the double-path
+    // this function used before this fix was ALREADY mathematically
+    // equivalent to Filament's integer-truncating path under EXACT
+    // arithmetic; the only residual divergence risk was IEEE-754 rounding
+    // error in the intermediate double division landing a computed quotient
+    // on the wrong side of a perfect-square boundary, negligible but
+    // nonzero for the integer magnitudes this function's own callers use
+    // (verified: an exhaustive brute-force sweep, width/height in
+    // [16,4000], found ZERO divergent cases against the old double-path
+    // formula). This fix removes that residual risk entirely (integer
+    // division has no rounding ambiguity) and matches the cited source's
+    // own arithmetic order exactly, which is what a "port" should do
+    // regardless of whether the two paths are provably equivalent.
+    const auto productX = static_cast<uint64_t>(froxelPlaneCount) * width;
+    const auto productY = static_cast<uint64_t>(froxelPlaneCount) * height;
+    auto froxelCountX = static_cast<uint32_t>(std::sqrt(static_cast<double>(productX / height)));
+    auto froxelCountY = static_cast<uint32_t>(std::sqrt(static_cast<double>(productY / width)));
     froxelCountX = std::max(1U, froxelCountX);
     froxelCountY = std::max(1U, froxelCountY);
 

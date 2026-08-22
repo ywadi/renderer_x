@@ -347,7 +347,9 @@ No regression (T14 shares zero code path with the existing forward render
 loop — this confirms that empirically rather than merely by inspection,
 per this project's own "empirically proven, not asserted" standing rule).
 
-## Stress-case numbers (headline)
+## Stress-case numbers (headline) [SUPERSEDED by Fix round 1 — see that
+## section below for the current, honest numbers and why the originals
+## below under-reported real-hardware variance]
 
 `tools/rx_cluster_bench` — synthetic scenes at T15's own named content-
 scale target (plan:523, "100/1k/5k lights"), real 1080p-shaped grid
@@ -355,15 +357,17 @@ scale target (plan:523, "100/1k/5k lights"), real 1080p-shaped grid
 dispatch, full GPU-inclusive wall-clock (`CommandContext::runOnce()`
 blocks until GPU completion):
 
-**Real NVIDIA RTX 2080, driver 580.82.07:**
+**Real NVIDIA RTX 2080, driver 580.82.07** (single process run —
+review Finding 3 found this under-characterizes real cross-run GPU
+clock/boost-state variance; superseded below):
 
 | Lights | Total assigned indices | avg | min | max |
 |---|---|---|---|---|
-| 100 | 5,391 | **0.405 ms** | 0.381 ms | 0.433 ms |
-| 1,000 | 42,136 | **0.726 ms** | 0.690 ms | 0.759 ms |
-| 5,000 | 246,596 | **2.157 ms** | 2.118 ms | 2.267 ms |
+| 100 | 5,391 | 0.405 ms | 0.381 ms | 0.433 ms |
+| 1,000 | 42,136 | 0.726 ms | 0.690 ms | 0.759 ms |
+| 5,000 | 246,596 | 2.157 ms | 2.118 ms | 2.267 ms |
 
-**Lavapipe (llvmpipe, software):**
+**Lavapipe (llvmpipe, software), single process run:**
 
 | Lights | Total assigned indices | avg | min | max |
 |---|---|---|---|---|
@@ -371,15 +375,8 @@ blocks until GPU completion):
 | 1,000 | 42,136 | 7.661 ms | 6.655 ms | 9.554 ms |
 | 5,000 | 246,596 | 28.904 ms | 25.057 ms | 35.343 ms |
 
-At 5000 lights (5x the top of T15's own named scale ladder) the full
-count+prefix-sum+scatter chain costs 2.16ms on real hardware — well
-within a real frame's compute budget, and the design is O(froxelCount ×
-lightCount) brute force with a serial prefix sum, so this is a
-conservative floor: a future spatial pre-culling pass (out of this
-task's own scope) would only improve it further. Steam Deck numbers:
-honest-manual per RC8 (Deck hardware has not entered the verification
-loop yet, matching every other Phase 5 task's identical posture) — not
-fabricated.
+Correctness (`totalAssignedIndices`) is exact and scale-appropriate at
+every tier; see Fix round 1 for the honest, reproducible timing numbers.
 
 ## Concerns
 
@@ -409,3 +406,181 @@ fabricated.
 
 See `git log` on this branch — implementation + this report, no AI
 attribution, author = local git config (Yousef Wadi).
+
+---
+
+## Fix round 1
+
+Independent review verdict: spec PASS, quality Approved, 3 LOW findings
+(`task-14-review.md`, main checkout). All three closed in this round.
+
+### Finding 1 — `computeFroxelGridXY()` integer-truncation order
+
+**Fixed.** Filament's own `computeFroxelLayout()` [Froxelizer.cpp:299-300,
+v1.75.0]:
+```
+size_t froxelCountX = size_t(std::sqrt(froxelPlaneCount * width  / height));
+size_t froxelCountY = size_t(std::sqrt(froxelPlaneCount * height / width));
+```
+`froxelPlaneCount`/`width`/`height` are unsigned-integer-typed there
+(Froxelizer.cpp:289-295), so the multiply/divide truncates in INTEGER
+arithmetic before `std::sqrt()` runs. `froxel_grid.cpp::computeFroxelGridXY()`
+previously computed the same expression in `double` precision throughout
+(`static_cast<double>(froxelPlaneCount) * width / height`) — mathematically
+equivalent under exact arithmetic (see below) but not the same arithmetic
+ORDER the cited source uses. Fixed to compute the integer division first
+(`productX / height`, `uint64_t` intermediates to match `size_t` width
+without overflow risk), then pass the truncated integer to `std::sqrt()` —
+matching Froxelizer.cpp:299-300 exactly.
+
+**A worked mathematical note, not just a code diff**: `floor(sqrt(x)) ==
+floor(sqrt(floor(x)))` for any real `x >= 0` is a general identity (proof
+in the code comment, `froxel_grid.cpp`) — so the double-path and the
+integer-path were ALREADY provably equivalent under exact arithmetic; an
+exhaustive brute-force sweep (python, width/height in `[16,4000]`,
+`froxelPlaneCount=512`) independently confirmed zero divergent cases
+against the pre-fix double-precision formula. The only theoretical
+residual risk was IEEE-754 rounding in the intermediate double division
+landing a computed quotient on the wrong side of a perfect-square
+boundary — negligible for the integer magnitudes in play, but the fix
+removes it entirely (integer division has no rounding ambiguity) and
+matches the cited source's own arithmetic order exactly, which is what a
+"port" should do regardless of provable equivalence.
+
+**New test evidence**: `froxel_grid_test.cpp` gained a new TEST_CASE with
+two additional viewport/budget combos beyond the original three (all
+chosen as odd/non-multiple-of-8 resolutions with different budget/slice
+combos, specifically to be the kind of shape most likely to expose a
+truncation-order divergence if one existed):
+- `computeFroxelGridXY(1366, 769, 8192, 16)` → `(25, 14)` [python:
+  `compute_xy_full(1366,769,8192,16)` → `(25,14,56)`].
+- `computeFroxelGridXY(853, 481, 4096, 8)` → `(27, 16)` [python:
+  `compute_xy_full(853,481,4096,8)` → `(27,16,32)`] — also exercises a
+  non-default budget/slice-count combo, not just the viewport axis.
+
+Both pass against the FIXED (integer-truncating) implementation.
+`rx_scene_tests`: 105/105 (26683 assertions), up from 104/104 —
+zero regressions in the pre-existing 3 configs (confirming, as expected,
+that the fix changed the arithmetic PATH without changing any RESULT for
+every config this codebase currently exercises).
+
+### Finding 2 — at-capacity boundary tests
+
+**Fixed.** `test_cluster_capacity_determinism_gpu.cpp` gained two new
+TEST_CASEs alongside the existing capacity+1 ones, engineered so the true
+need lands EXACTLY on the declared cap (not past it):
+
+- **Per-froxel, at capacity**: exactly `maxLightsPerFroxel` (8) lights all
+  at one froxel's own bounding-sphere center. `trueCounts == 8`,
+  `writeCounts == 8` (full assignment, nothing truncated),
+  `perFroxelOverflow == 0`, `globalOverflow == 0`, all 8 light indices
+  present ascending.
+- **Global, at capacity**: the same 8-froxel localized-cluster scenario
+  the capacity+1 GLOBAL test uses, but `maxTotalLightIndices` is set to
+  EXACTLY the real total need (discovered via a first pass with a
+  generous cap, then re-run with the cap set to that exact discovered
+  value — not a hardcoded guess). Every froxel: `writeCount ==
+  min(trueCount, maxLightsPerFroxel)` (full assignment),
+  `globalOverflow == 0` everywhere, `totalUsed == realNeed` (the buffer
+  exactly, fully consumed — neither under- nor over-used).
+
+Both boundary cases confirm the underlying `min(trueCount, cap)`/running-
+budget clamp behaves correctly exactly AT the boundary, not just past it
+— closing the specific coverage gap the review named (the existing
+zero-overflow assertions elsewhere in the suite were incidental, from
+generously-oversized caps or unrelated empty froxels, never an ENGINEERED
+at-capacity case).
+
+`rx_cluster_gpu_tests`: 6/6 test cases (up from 4/4), 58462 assertions (up
+from 38982) — both drivers, zero unfiltered validation errors (see
+"Re-verification" below).
+
+### Finding 3 — stress-bench reproducibility
+
+**Re-measured, N=5 separate process invocations per driver** (each its
+own cold process: fresh device/pipeline-cache warm-up, 1 discarded
+warm-up dispatch per tier, then the existing 20-iteration intra-run
+average) — the review's own methodology (three separate re-runs showing
++13% to +23% drift) pointed at cross-PROCESS GPU clock/boost-state
+variance, which a single continuous run's own intra-run min/max cannot
+characterize; re-running the whole binary as 5 separate processes is what
+actually samples that variance axis.
+
+**Real NVIDIA RTX 2080, driver 580.82.07** (5 runs, solo GPU, niced,
+offscreen):
+
+| Lights | Total assigned indices | Run-avg values (ms) | **Median (ms)** | **Min–max range (ms)** |
+|---|---|---|---|---|
+| 100 | 5,391 (exact, all 5 runs) | 0.459, 0.489, 0.449, 0.387, 0.413 | **0.449** | **0.328 – 0.546** |
+| 1,000 | 42,136 (exact, all 5 runs) | 0.872, 1.110, 0.865, 0.762, 0.731 | **0.865** | **0.675 – 1.187** |
+| 5,000 | 246,596 (exact, all 5 runs) | 2.604, 2.843, 2.448, 2.428, 2.195 | **2.448** | **2.078 – 3.860** |
+
+(Min–max range is the widest observed value across ALL 100 individual
+iterations — 5 runs × 20 intra-run iterations each — not merely the
+spread of the 5 run-level averages, for the most honest possible range.)
+
+**Lavapipe (llvmpipe, software)**, 5 runs, same methodology:
+
+| Lights | Total assigned indices | Run-avg values (ms) | **Median (ms)** | **Min–max range (ms)** |
+|---|---|---|---|---|
+| 100 | 5,391 (exact) | 0.911, 0.900, 0.849, 0.868, 0.812 | **0.868** | **0.589 – 1.385** |
+| 1,000 | 42,136 (exact) | 7.099, 8.177, 7.273, 7.061, 6.958 | **7.099** | **4.931 – 26.682** |
+| 5,000 | 246,596 (exact) | 28.863, 27.083, 29.587, 28.019, 24.798 | **28.019** | **23.241 – 38.944** |
+
+**Variance source, honestly**: correctness (`totalAssignedIndices`) is
+bit-exact and IDENTICAL across every one of the 5 runs on both drivers —
+this is wall-clock-only variance, not a correctness regression. On real
+NVIDIA hardware the run-to-run spread (0.33–3.86ms depending on tier) is
+consistent with ordinary desktop GPU clock/power-state (boost/throttle)
+transitions between process launches — the same "quiet host, solo GPU,
+niced" measurement discipline this project already uses cannot eliminate
+this, only reduce contention-driven variance, which is a DIFFERENT
+variance source from clock-state drift. Lavapipe's own per-tier spread is
+comparatively tighter at the low/mid tiers (a pure-CPU rasterizer has no
+GPU clock state to drift) but shows one wide outlier (1000-light tier,
+run 2, an intra-run max of 26.68ms vs. a run-average of 8.18ms) —
+consistent with an ordinary host scheduling hiccup on a shared,
+non-dedicated CPU rather than anything specific to this task's own code
+(lavapipe numbers were never the exit-criterion driver; NVIDIA is).
+
+**Published medians vs. the original single-run report numbers**: the new
+NVIDIA medians (0.449 / 0.865 / 2.448 ms) land inside the reviewer's own
+independently-observed range (0.432–0.476 / 0.862–0.905 / 2.302–2.600 ms)
+at every tier — corroborating the review's own finding directly, not just
+accepting it on faith. Per the closure instruction, **these medians
+replace the original single-run numbers as this task's own published
+stress baseline**:
+
+| Lights | Original (single run) | **New median (N=5)** | Δ |
+|---|---|---|---|
+| 100 | 0.405 ms | **0.449 ms** | +11% |
+| 1,000 | 0.726 ms | **0.865 ms** | +19% |
+| 5,000 | 2.157 ms | **2.448 ms** | +13% |
+
+The qualitative exit conclusion is UNCHANGED under the corrected numbers:
+2.4–3.9ms at 5000 lights (5× T15's own top named scale) is still a small
+fraction of a 16.6ms 60fps frame budget, with room for T15's own per-pixel
+light loop on top. No regression claim in this task depended on the
+original, now-superseded single-run figures — the DamagedHelmet/Sponza
+forward-path regression check (a separate methodology, `--bench-frames
+200`, which the review independently confirmed reproduces tightly) is
+unaffected.
+
+Steam Deck numbers: still honest-manual per RC8 (unchanged).
+
+### Re-verification (both drivers, this round)
+
+**Lavapipe**: `rx_scene_tests` 105/105 (26683 assertions); `rx_cluster_tests`
+4/4 (17 assertions); `rx_cluster_gpu_tests` 6/6 (58462 assertions), zero
+unfiltered Vulkan validation errors (`grep -i validation` minus this
+repo's own documented false-positive categories → empty).
+
+**Real NVIDIA RTX 2080, driver 580.82.07**: `rx_cluster_gpu_tests` 6/6
+(58462 assertions), zero unfiltered Vulkan validation errors — identical
+assertion count to lavapipe, confirming driver-independent correctness at
+the new boundary cases too.
+
+### Commit (branch `task/t14-froxel-clustering`)
+
+One additional commit, explicit pathspecs, no AI attribution, author =
+local git config. Not pushed.

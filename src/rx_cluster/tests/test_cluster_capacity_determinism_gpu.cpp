@@ -12,12 +12,16 @@
 //      this test is expected to pass BY CONSTRUCTION, not by luck; it
 //      exists to PROVE that design claim empirically, matching CLAUDE.md's
 //      "every criterion empirically proven" standing rule.
-//  (2) CAPACITY+1, both axes [plan:504-505: "max lights per froxel /
-//      total... counters exact and CI-gateable"; CLAUDE.md's own standing
-//      capacity-past-declared-limit rule]. Both TEST_CASEs below construct
-//      a scenario deliberately PAST the declared capacity and assert the
-//      overflow counter is EXACT (never a boolean, never silently
-//      dropped/corrupted) and that unrelated froxels are unaffected.
+//  (2) CAPACITY, both axes, at TWO distinct points each [plan:504-505: "max
+//      lights per froxel / total... counters exact and CI-gateable";
+//      CLAUDE.md's own standing capacity-past-declared-limit rule]:
+//      capacity+1 (deliberately PAST the declared capacity -- overflow
+//      counter EXACT, never a boolean, never silently dropped/corrupted,
+//      unrelated froxels unaffected) AND, added in Fix round 1 (review
+//      Finding 2), the AT-CAPACITY boundary itself (true need EXACTLY
+//      equals the declared cap -- FULL assignment, ZERO overflow) -- the
+//      two points the clamp `min(trueCount, cap)`/the prefix-sum's own
+//      running-budget check actually branches between.
 #include "cluster_gpu_fixture.h"
 
 #include <doctest/doctest.h>
@@ -178,6 +182,139 @@ TEST_CASE("Cluster light assignment: CAPACITY+1, PER-FROXEL axis -- (maxLightsPe
     CHECK(result->writeCounts[farIdx] == 0);
     CHECK(result->perFroxelOverflow[farIdx] == 0);
     CHECK(result->globalOverflow[farIdx] == 0);
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Cluster light assignment: AT-CAPACITY (exact boundary), PER-FROXEL axis [Fix round 1, "
+          "review Finding 2] -- exactly maxLightsPerFroxel lights all overlapping the SAME froxel: "
+          "FULL assignment (writeCount == trueCount == the cap), ZERO overflow -- the boundary case "
+          "capacity+1 alone does not exercise (this is the LAST value the clamp `min(trueCount, cap)` "
+          "leaves untouched before the +1 case starts truncating)") {
+    auto fixture = makeFixture("rx_cluster_capacity_per_froxel_boundary");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    auto pipelineCache = rx::rhi::ComputePipelineCache::create(
+        fixture->device.device(), pipelineCachePath("rx_cluster_capacity_per_froxel_boundary"));
+    REQUIRE(pipelineCache.has_value());
+    auto pipelines =
+        ClusterPipelines::create(fixture->device.device(), *pipelineCache, *compiler, RX_CLUSTER_SHADER_DIR);
+    REQUIRE(pipelines.has_value());
+
+    constexpr uint32_t kMaxPerFroxel = 8;
+    // Same corner point as the capacity+1 TEST_CASE above -- known to hit
+    // froxel (0,0,1) of the real 1080p-shaped grid.
+    const glm::vec3 targetPoint(-5.488147944009125F, -2.992096042551129F, -5.55263825016892F);
+
+    // EXACTLY kMaxPerFroxel lights this time (not +1) -- the true count
+    // lands EXACTLY on the declared cap.
+    std::vector<ClusterLightGpu> lights;
+    for (uint32_t i = 0; i < kMaxPerFroxel; ++i) {
+        lights.push_back(pointLight(targetPoint, 1e-4F));
+    }
+    auto lightsBuffer = uploadLights(fixture->allocator, lights);
+    REQUIRE(lightsBuffer.has_value());
+
+    rx::scene::Camera camera;
+    ClusterParams params;
+    params.zLightNear = 5.0F;
+    params.zLightFar = 100.0F;
+    params.maxLightsPerFroxel = kMaxPerFroxel;
+    params.maxTotalLightIndices = 8192;  // generous -- isolates the PER-FROXEL axis alone.
+
+    auto result = runCluster(*fixture, *pipelines, lightsBuffer->handle(), static_cast<uint32_t>(lights.size()),
+                              camera, 1920, 1080, params);
+    REQUIRE(result.has_value());
+
+    const uint32_t targetIdx = rx::scene::froxel::froxelIndex(0, 0, 1, result->grid);
+    // Exactly at the boundary: true count == the cap.
+    CHECK(result->trueCounts[targetIdx] == kMaxPerFroxel);
+    // FULL assignment -- nothing truncated at exactly-at-capacity.
+    CHECK(result->writeCounts[targetIdx] == kMaxPerFroxel);
+    // ZERO overflow of either kind -- the boundary itself is not an
+    // overflow condition.
+    CHECK(result->perFroxelOverflow[targetIdx] == 0);
+    CHECK(result->globalOverflow[targetIdx] == 0);
+    // Every one of the kMaxPerFroxel light indices is present, ascending.
+    const std::vector<uint32_t> targetLights = result->froxelLights(targetIdx);
+    REQUIRE(targetLights.size() == kMaxPerFroxel);
+    for (uint32_t i = 0; i < kMaxPerFroxel; ++i) {
+        CHECK(targetLights[i] == i);
+    }
+
+    CHECK_FALSE(fixture->context.hasValidationErrors());
+}
+
+TEST_CASE("Cluster light assignment: AT-CAPACITY (exact boundary), GLOBAL axis [Fix round 1, review "
+          "Finding 2] -- the light-index buffer's declared total capacity EXACTLY matches the true "
+          "total assignment need (sum of every hit froxel's own true count): FULL assignment "
+          "everywhere (writeCount == trueCount per froxel), ZERO globalOverflow everywhere, totalUsed "
+          "== the buffer's own declared capacity -- the boundary the capacity+1 TEST_CASE's own "
+          "kGlobalCap=50 (deliberately smaller than the 240-light need) does not exercise") {
+    auto fixture = makeFixture("rx_cluster_capacity_global_boundary");
+    if (!fixture.has_value()) {
+        return;
+    }
+
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    auto pipelineCache = rx::rhi::ComputePipelineCache::create(
+        fixture->device.device(), pipelineCachePath("rx_cluster_capacity_global_boundary"));
+    REQUIRE(pipelineCache.has_value());
+    auto pipelines =
+        ClusterPipelines::create(fixture->device.device(), *pipelineCache, *compiler, RX_CLUSTER_SHADER_DIR);
+    REQUIRE(pipelines.has_value());
+
+    // Same localized-cluster trick as the capacity+1 GLOBAL TEST_CASE below
+    // -- 30 lights at the corner point, known to hit an 8-froxel cluster,
+    // every froxel there seeing all 30 (240 total true assignments needed
+    // across the cluster).
+    constexpr uint32_t kLightCount = 30;
+    const glm::vec3 targetPoint(-5.488147944009125F, -2.992096042551129F, -5.55263825016892F);
+    std::vector<ClusterLightGpu> lights;
+    for (uint32_t i = 0; i < kLightCount; ++i) {
+        lights.push_back(pointLight(targetPoint, 1e-4F));
+    }
+    auto lightsBuffer = uploadLights(fixture->allocator, lights);
+    REQUIRE(lightsBuffer.has_value());
+
+    rx::scene::Camera camera;
+    ClusterParams params;
+    params.zLightNear = 5.0F;
+    params.zLightFar = 100.0F;
+    params.maxLightsPerFroxel = 1000;  // generous -- isolates the GLOBAL axis alone.
+
+    // First pass, with a generous global cap, to discover the REAL total
+    // need (sum of true counts across the hit cluster) -- this test's own
+    // boundary value is DERIVED from that, not a value picked in advance,
+    // so it is exact by construction rather than by a hardcoded guess.
+    params.maxTotalLightIndices = 8192;
+    auto discover = runCluster(*fixture, *pipelines, lightsBuffer->handle(), static_cast<uint32_t>(lights.size()),
+                                camera, 1920, 1080, params);
+    REQUIRE(discover.has_value());
+    const uint32_t realNeed = discover->totalUsed;
+    REQUIRE(realNeed > 0);
+
+    // Second pass: the global cap set to EXACTLY that real need.
+    params.maxTotalLightIndices = realNeed;
+    auto result = runCluster(*fixture, *pipelines, lightsBuffer->handle(), static_cast<uint32_t>(lights.size()),
+                              camera, 1920, 1080, params);
+    REQUIRE(result.has_value());
+
+    for (uint32_t i = 0; i < result->grid.froxelCount(); ++i) {
+        // FULL assignment everywhere -- writeCount always equals trueCount
+        // (capped by maxLightsPerFroxel=1000, which no froxel here reaches).
+        CHECK(result->writeCounts[i] == std::min(result->trueCounts[i], params.maxLightsPerFroxel));
+        // ZERO global overflow everywhere -- the boundary itself drops nothing.
+        CHECK(result->globalOverflow[i] == 0);
+        CHECK(result->perFroxelOverflow[i] == 0);
+    }
+    // The buffer is exactly, fully consumed -- neither under- nor over-used.
+    CHECK(result->totalUsed == realNeed);
 
     CHECK_FALSE(fixture->context.hasValidationErrors());
 }

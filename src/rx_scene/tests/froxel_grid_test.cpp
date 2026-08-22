@@ -41,6 +41,35 @@ TEST_CASE("computeFroxelGridXY matches Filament's own computeFroxelLayout() deri
     }
 }
 
+TEST_CASE("computeFroxelGridXY: two ADDITIONAL odd/non-multiple viewport+budget combos "
+          "[Fix round 1, review Finding 1] -- locks in the grid dimensions for shapes chosen "
+          "specifically to plausibly diverge under a double-precision sqrt path vs. Filament's own "
+          "integer-truncating one (Froxelizer.cpp:299-300: `size_t(std::sqrt(froxelPlaneCount * "
+          "width / height))`, all-integer arithmetic BEFORE sqrt() -- froxel_grid.cpp's own fix-round "
+          "comment on computeFroxelGridXY() has the full derivation, including a proof that the two "
+          "paths are mathematically equivalent under EXACT arithmetic and an exhaustive brute-force "
+          "sweep (width/height in [16,4000]) that found zero divergent cases against the PRE-fix "
+          "double-precision formula either -- these two cases exist to LOCK today's correct behavior "
+          "against a future regression, not because a divergence was ever actually observed).") {
+    // python: compute_xy_full(1366, 769, 8192, 16) -> (25, 14, 56) -- a common
+    // odd laptop resolution (neither dimension a multiple of 8 or of any
+    // power of two), default froxel budget/slice count.
+    {
+        auto [cx, cy] = computeFroxelGridXY(1366, 769, 8192, 16);
+        CHECK(cx == 25);
+        CHECK(cy == 14);
+    }
+    // python: compute_xy_full(853, 481, 4096, 8) -> (27, 16, 32) -- a SMALLER,
+    // non-default budget/slice combo (half of both) at another odd,
+    // non-multiple-of-8 resolution, to also exercise the budget/slice axis,
+    // not just the viewport axis.
+    {
+        auto [cx, cy] = computeFroxelGridXY(853, 481, 4096, 8);
+        CHECK(cx == 27);
+        CHECK(cy == 16);
+    }
+}
+
 TEST_CASE("froxelIndex<->froxelCoords round-trip for EVERY froxel in a real grid shape -- the "
           "plan's own named acceptance criterion (plan:499-500: \"index<->slice round-trips\")") {
     const FroxelGridParams grid = buildFroxelGrid(1920, 1080, glm::radians(60.0F), 16.0F / 9.0F, 5.0F, 100.0F);
