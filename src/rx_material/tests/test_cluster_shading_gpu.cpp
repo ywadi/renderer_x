@@ -46,6 +46,7 @@
 #include <rx_rhi_vk/pipeline_layout.h>
 #include <rx_scene/camera.h>
 #include <rx_scene/froxel_grid.h>
+#include <rx_scene/light_math.h>
 #include <rx_scene/scene.h>
 #include <rx_shader/compiler.h>
 #include <rx_shader/reflection.h>
@@ -160,7 +161,14 @@ struct ProbePipeline {
     ProbePipeline& operator=(ProbePipeline&&) = delete;
 };
 
-std::unique_ptr<ProbePipeline> buildProbePipeline(VkDevice device, rx::rhi::BindlessTable& bindless) {
+// `entryPoint` -- [matrix-p5t15's own equivalence row] `"csProbe"` (the
+// clustered path) or `"csProbeBruteForce"` (the row's own required
+// PERMANENT brute-force reference permutation, test_cluster_shading_
+// probe.slang's own sibling entry point) -- both compiled from the SAME
+// .slang file, selected here rather than via a runtime branch inside one
+// shader, per that row's own "reachable via a build/runtime flag" text.
+std::unique_ptr<ProbePipeline> buildProbePipeline(VkDevice device, rx::rhi::BindlessTable& bindless,
+                                                    const char* entryPoint = "csProbe") {
     // [Slang runtime-compiles this file EVERY test-binary run -- no C++
     // rebuild needed for a source edit, exactly like every other Slang-
     // backed GPU test in this codebase -- this is what makes the revert-
@@ -170,7 +178,7 @@ std::unique_ptr<ProbePipeline> buildProbePipeline(VkDevice device, rx::rhi::Bind
     REQUIRE(compiler.has_value());
     const std::filesystem::path path =
         std::filesystem::path(RX_MATERIAL_SHADER_DIR) / "test_cluster_shading_probe.slang";
-    rx::shader::CompileResult compileResult = compiler->compileFromFile(path.string(), {"csProbe"});
+    rx::shader::CompileResult compileResult = compiler->compileFromFile(path.string(), {entryPoint});
     if (!compileResult.ok) {
         RX_LOG_ERROR("rx_cluster shading test: probe shader compile failed: {}", compileResult.diagnostics);
     }
@@ -220,6 +228,10 @@ struct ProbeParamsGpu {
     uint32_t clusterWriteCountsBufferIndex;
     uint32_t clusterLightIndicesBufferIndex;
     uint32_t clusterLightsBufferIndex;
+    // [matrix-p5t15's own equivalence row] Only read by `csProbeBruteForce`
+    // -- see test_cluster_shading_probe.slang's own ProbeParams::
+    // totalLightCount comment.
+    uint32_t totalLightCount;
 };
 
 struct ProbeResult {
@@ -351,7 +363,8 @@ ProbeResult runProbe(Fixture& fixture, rx::cluster::ClusterPipelines& pipelines,
                                         offsetsHandle.index(),
                                         writeCountsHandle.index(),
                                         lightIndicesHandle.index(),
-                                        lightsHandle.index()};
+                                        lightsHandle.index(),
+                                        static_cast<uint32_t>(lights.size())};
             std::memcpy(probeParamsBuffer->mappedData(), &probeParams, sizeof(probeParams));
             probeParamsBuffer->flush();
 
@@ -610,4 +623,167 @@ TEST_CASE("Clustered shading: exact per-froxel membership from the SHADING side 
         runProbe(fixture, pipelines, *probe, lights, camera, kViewport, kViewport, params, probeWorldPos);
     CHECK(near(restoredResult.diffuse[0].r, expectedDiffuseR, 0.02F));
     CHECK(restoredResult.diffuse[0].g == 0.0F);
+}
+
+// [matrix-p5t15's own "Clustered-vs-unclustered equivalence" row, plan:
+// 519-520] Runs the SAME 6-light scene / 5 probe positions through BOTH
+// `rx_evaluateClusteredLights()` (froxel-indexed, real T14 compute chain)
+// and `rx_evaluateBruteForceClusteredLights()` (the row's own required
+// PERMANENT reference permutation, cluster_lighting.slang -- loops every
+// light directly, no froxel indirection) and asserts the two paths agree
+// within a float-accumulation-order-only tolerance -- matrix row 42's own
+// acceptance text: "Tolerance derives from float-accumulation-order
+// differences ONLY... any discrepancy exceeding that floor is a real
+// assignment bug."
+//
+// All 6 lights sit at generous, EXPLICIT cull radii (300 -- comfortably
+// larger than this grid's own zLightFar=100) so T14's froxelizer assigns
+// every light to every froxel its real illuminance reaches, deliberately
+// avoiding the OTHER test's own concern (cull-radius-driven exclusion,
+// test_cluster_membership_gpu.cpp/the TEST_CASE above already cover
+// that) -- this test isolates "given the SAME light set, does the
+// froxel-indexed subset sum to the SAME value as summing every light
+// directly", which is exactly what clustering's own correctness
+// obligation is (a pure performance optimization over brute force).
+//
+// The probe's fixed world-space normal (0,0,1) [see this file's own
+// probe-shader-mirroring kN comment] makes NdotL's SIGN depend only on
+// each light's Z relative to the probe (world -Z is "into the scene",
+// so a light with a LESS-NEGATIVE z than the probe sits nearer the
+// camera along the probe's own normal and contributes positively) --
+// probes are placed at increasing depth specifically so each one sees a
+// DIFFERENT-SIZED, genuinely varied subset of the 6 lights (0, 1, 3, 5,
+// then all 6), not a fixed count, exercising the membership-selection
+// mechanism across a real range of per-froxel occupancy.
+TEST_CASE("Clustered shading: clustered path matches the PERMANENT brute-force reference path "
+          "(rx_evaluateBruteForceClusteredLights) within float-accumulation tolerance, across probes seeing "
+          "0/1/3/5/6 of the same 6 lights") {
+    auto fixtureOpt = makeFixture("rx_cluster_shading_equivalence");
+    if (!fixtureOpt.has_value()) {
+        return;
+    }
+    Fixture fixture = std::move(*fixtureOpt);
+
+    auto computeCache = rx::rhi::ComputePipelineCache::create(fixture.device.device(), freshCachePath("equiv_chain"));
+    REQUIRE(computeCache.has_value());
+    auto compiler = rx::shader::Compiler::create();
+    REQUIRE(compiler.has_value());
+    auto pipelinesOpt = rx::cluster::ClusterPipelines::create(fixture.device.device(), *computeCache, *compiler,
+                                                                RX_CLUSTER_SHADER_DIR, /*framesInFlight=*/1);
+    REQUIRE(pipelinesOpt.has_value());
+    rx::cluster::ClusterPipelines pipelines = std::move(*pipelinesOpt);
+
+    auto clusteredProbe = buildProbePipeline(fixture.device.device(), fixture.bindless, "csProbe");
+    auto bruteForceProbe = buildProbePipeline(fixture.device.device(), fixture.bindless, "csProbeBruteForce");
+
+    rx::scene::Camera camera;  // default: position (0,0,0), looking down -Z, 60deg vfov.
+    camera.aspectRatio = 1.0F;
+    constexpr uint32_t kViewport = 256;
+    rx::cluster::ClusterParams params;  // defaults: kDefaultZLightNear=5, kDefaultZLightFar=100.
+    constexpr float kGenerousCullRadius = 300.0F;  // see this TEST_CASE's own header comment.
+
+    auto makePointLight = [&](glm::vec3 worldPos, glm::vec3 colorCandela) {
+        rx::cluster::ClusterLightGpu light{};
+        light.viewPositionRadius = glm::vec4(glm::vec3(camera.view() * glm::vec4(worldPos, 1.0F)), kGenerousCullRadius);
+        light.viewAxisSinInverse = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+        light.cosSquaredFlags = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F);
+        light.shadingTypeRangeAngle = glm::vec4(1.0F, 0.0F, 0.0F, 0.0F);  // Point, range=0 (unwindowed).
+        light.shadingPositionWorld = glm::vec4(worldPos, 0.0F);
+        light.shadingColorCandela = glm::vec4(colorCandela, 0.0F);
+        light.shadingSpotDirWorld = glm::vec4(0.0F, 0.0F, -1.0F, 0.0F);
+        return light;
+    };
+
+    // L0..L5: increasing depth, generous cull radius, one finite-range
+    // Point (L3) and one Spot (L2) so both attenuation branches (range
+    // window, cone) are exercised identically by both paths.
+    std::vector<rx::cluster::ClusterLightGpu> lights;
+    lights.push_back(makePointLight(glm::vec3(2.0F, 0.0F, -8.0F), glm::vec3(15.0F, 14.0F, 12.0F)));   // L0
+    lights.push_back(makePointLight(glm::vec3(-3.0F, 0.0F, -14.0F), glm::vec3(12.0F, 10.0F, 18.0F)));  // L1
+    {
+        // L2: Spot for SHADING purposes (`shadingTypeRangeAngle.x=2.0`
+        // below, the sole Point-vs-Spot discriminator
+        // clusterAccumulateSingleLight() reads). `cosSquaredFlags`/
+        // `viewAxisSinInverse` (the head, CULLING-only float4s
+        // froxel_common.slang's own `spotIntersectsFroxel()` consults via
+        // `cosSquaredFlags.y > 0.5`) are DELIBERATELY left at
+        // `makePointLight()`'s own all-point defaults, so T14's real
+        // compute-side culling pass treats this light as a plain
+        // sphere-vs-froxel test (same generous 300-unit radius as every
+        // other light here) rather than a narrower cone-vs-froxel test --
+        // guaranteeing CULLING-side inclusion at every probe below
+        // regardless of the cone's own real geometry, so this test isolates
+        // the SHADING-side cone-attenuation arithmetic (does
+        // clustered-vs-brute-force agree on the ATTENUATED value) from the
+        // CULLING-side cone-vs-froxel intersection test (a different,
+        // already-covered T14 concern, matrix-p5t14's own scope). A real
+        // spot light in production DOES set these fields for tighter
+        // culling (cluster_lighting.cpp:153-154) -- this test's own
+        // shading-focused scope is why it deliberately does not replicate
+        // that here.
+        rx::cluster::ClusterLightGpu spot = makePointLight(glm::vec3(4.0F, 0.0F, -20.0F), glm::vec3(25.0F, 20.0F, 15.0F));
+        const rx::scene::lightmath::SpotAngleScaleOffset angles =
+            rx::scene::lightmath::spotAngleScaleOffset(glm::radians(20.0F), glm::radians(60.0F));
+        spot.shadingTypeRangeAngle = glm::vec4(2.0F, 0.0F, angles.scale, angles.offset);  // Spot (2.0), range=0.
+        lights.push_back(spot);  // L2
+    }
+    {
+        rx::cluster::ClusterLightGpu ranged = makePointLight(glm::vec3(-6.0F, 0.0F, -28.0F), glm::vec3(10.0F, 16.0F, 10.0F));
+        ranged.shadingTypeRangeAngle = glm::vec4(1.0F, 40.0F, 0.0F, 0.0F);  // Point, finite range=40 -- exercises the window branch.
+        lights.push_back(ranged);  // L3
+    }
+    lights.push_back(makePointLight(glm::vec3(5.0F, 0.0F, -38.0F), glm::vec3(18.0F, 8.0F, 14.0F)));   // L4
+    lights.push_back(makePointLight(glm::vec3(-2.0F, 0.0F, -48.0F), glm::vec3(14.0F, 14.0F, 20.0F)));  // L5
+
+    // Probe depths chosen (see this TEST_CASE's own header comment) so
+    // each sees a different-sized subset: P0 sees none (shallower than
+    // every light); P1 sees {L0}; P2 sees {L0,L1,L2}; P3 sees
+    // {L0,L1,L2,L3,L4}; P4 sees all six.
+    const std::array<glm::vec3, 5> probes{
+        glm::vec3(0.0F, 0.0F, -6.0F),
+        glm::vec3(0.0F, 0.0F, -12.0F),
+        glm::vec3(1.0F, 0.0F, -25.0F),
+        glm::vec3(0.0F, 0.0F, -42.0F),
+        glm::vec3(-3.0F, 0.0F, -70.0F),
+    };
+    const std::array<uint32_t, 5> expectedMemberCount{0, 1, 3, 5, 6};
+
+    constexpr float kTolerance = 0.01F;  // float-accumulation-order-only floor -- see this TEST_CASE's own header comment.
+    for (size_t i = 0; i < probes.size(); ++i) {
+        ProbeResult clustered =
+            runProbe(fixture, pipelines, *clusteredProbe, lights, camera, kViewport, kViewport, params, probes[i]);
+        ProbeResult bruteForce =
+            runProbe(fixture, pipelines, *bruteForceProbe, lights, camera, kViewport, kViewport, params, probes[i]);
+
+        CAPTURE(i);
+        CAPTURE(expectedMemberCount[i]);
+        CAPTURE(clustered.diffuse[0].r);
+        CAPTURE(clustered.diffuse[0].g);
+        CAPTURE(clustered.diffuse[0].b);
+        CAPTURE(bruteForce.diffuse[0].r);
+        CAPTURE(bruteForce.diffuse[0].g);
+        CAPTURE(bruteForce.diffuse[0].b);
+        CHECK(near(clustered.diffuse[0].r, bruteForce.diffuse[0].r, kTolerance));
+        CHECK(near(clustered.diffuse[0].g, bruteForce.diffuse[0].g, kTolerance));
+        CHECK(near(clustered.diffuse[0].b, bruteForce.diffuse[0].b, kTolerance));
+        CHECK(near(clustered.specular[0].r, bruteForce.specular[0].r, kTolerance));
+        CHECK(near(clustered.specular[0].g, bruteForce.specular[0].g, kTolerance));
+        CHECK(near(clustered.specular[0].b, bruteForce.specular[0].b, kTolerance));
+
+        if (expectedMemberCount[i] == 0) {
+            // Not vacuously true -- P0 sees no light in EITHER path
+            // (every light is deeper than the probe, NdotL<=0 for all six),
+            // so both sums must be EXACTLY zero, not merely equal to each
+            // other (two paths could theoretically agree on a wrong
+            // nonzero value; this pins the zero case to its own known
+            // ground truth).
+            CHECK(clustered.diffuse[0].r == 0.0F);
+            CHECK(bruteForce.diffuse[0].r == 0.0F);
+        } else {
+            // Rules out a vacuous pass (both paths returning zero by
+            // coincidence, e.g. from a broken bindless index) for every
+            // probe that DOES have real contributors.
+            CHECK(bruteForce.diffuse[0].r + bruteForce.diffuse[0].g + bruteForce.diffuse[0].b > 0.05F);
+        }
+    }
 }

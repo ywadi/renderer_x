@@ -38,6 +38,13 @@ struct ProbeParams {
     uint clusterWriteCountsBufferIndex;
     uint clusterLightIndicesBufferIndex;
     uint clusterLightsBufferIndex;
+    // [matrix-p5t15's own "Clustered-vs-unclustered equivalence" row] Only
+    // read by `csProbeBruteForce` below -- the total scene light count
+    // `rx_evaluateBruteForceClusteredLights()` loops over directly, no
+    // froxel indirection. `csProbe` (the clustered path) ignores this
+    // field entirely (its own light set comes from the froxel-indexed
+    // offset/count lookup instead).
+    uint totalLightCount;
 };
 
 // set 1 (this probe's own dedicated set, alongside material.slang's
@@ -80,9 +87,12 @@ static const float3 kDiffuseColor = float3(1.0, 1.0, 1.0);
 static const float kRoughness = 1.0;
 static const float kAlpha = 1.0;  // roughness^2 at roughness=1.
 
-[shader("compute")]
-[numthreads(1, 1, 1)]
-void csProbe(uint3 id : SV_DispatchThreadID) {
+// Shared MaterialVertex construction -- both `csProbe` (the clustered
+// path) and `csProbeBruteForce` (the matrix's own required equivalence-
+// harness permutation, below) start from the IDENTICAL per-fragment
+// state, differing only in which rx_cluster/cluster_lighting.slang entry
+// point they call.
+MaterialVertex buildProbeVertex(uint3 id) {
     MaterialVertex v;
     v.worldPos = gTestPositions[id.x];
     v.normal = kN;
@@ -118,11 +128,37 @@ void csProbe(uint3 id : SV_DispatchThreadID) {
     v.clusterLightIndicesBufferIndex = gProbe.clusterLightIndicesBufferIndex;
     v.clusterLightsBufferIndex = gProbe.clusterLightsBufferIndex;
     v.clusterView = gClusterView[0];
+    return v;
+}
 
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void csProbe(uint3 id : SV_DispatchThreadID) {
+    MaterialVertex v = buildProbeVertex(id);
     float3 diffuse;
     float3 specular;
     rx_evaluateClusteredLights(v, kN, kViewDir, kNdotV, kF0, kF90, kDiffuseColor, kRoughness, kAlpha, diffuse,
                                 specular);
+    gOutDiffuse[id.x] = diffuse;
+    gOutSpecular[id.x] = specular;
+}
+
+// [matrix-p5t15's own "Clustered-vs-unclustered equivalence" row] Calls
+// the PERMANENT brute-force reference permutation
+// (rx_evaluateBruteForceClusteredLights(), cluster_lighting.slang) --
+// loops `gProbe.totalLightCount` scene lights directly, no froxel
+// indirection. A separate compute ENTRY POINT (not a runtime branch
+// inside `csProbe`) is this row's own "reachable via a build/runtime
+// flag" mechanism: `test_cluster_shading_gpu.cpp` selects which one to
+// dispatch by compiling/binding the entry point it wants.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void csProbeBruteForce(uint3 id : SV_DispatchThreadID) {
+    MaterialVertex v = buildProbeVertex(id);
+    float3 diffuse;
+    float3 specular;
+    rx_evaluateBruteForceClusteredLights(v, kN, kViewDir, kNdotV, kF0, kF90, kDiffuseColor, kRoughness, kAlpha,
+                                           gProbe.totalLightCount, diffuse, specular);
     gOutDiffuse[id.x] = diffuse;
     gOutSpecular[id.x] = specular;
 }

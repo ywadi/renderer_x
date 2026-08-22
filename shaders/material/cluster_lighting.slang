@@ -146,6 +146,91 @@ public uint clusterFroxelIndex(float3 worldPos, MaterialVertex v) {
 // rx_scene/light_math.h's own derivation) -- NOT re-derived here, restated
 // only where the formula itself appears, per this project's own citation
 // discipline].
+// --- Per-light BRDF/attenuation evaluation [factored out, matrix-p5t15's
+// own "clustered-vs-unclustered equivalence" row] -- the ONE place the
+// punctual attenuation/BRDF math is written for the clustered path. Both
+// `rx_evaluateClusteredLights()` (froxel-indexed subset) and
+// `rx_evaluateBruteForceClusteredLights()` (below, the row's own required
+// PERMANENT brute-force reference permutation, "loop over ALL scene
+// lights per fragment, no froxel indirection") call this SAME function
+// per light -- so the only possible difference between the two paths'
+// output is WHICH lights get visited, never how a visited light's own
+// contribution is computed. This is deliberate: it makes the equivalence
+// test in test_cluster_shading_gpu.cpp an unambiguous MEMBERSHIP check
+// (any discrepancy is necessarily a selection/culling bug, never a BRDF
+// divergence between two independently-authored copies of the same math).
+void clusterAccumulateSingleLight(ClusterLightGpu light, float3 worldPos, float3 N, float3 viewDir, float NdotV,
+                                   float3 F0, float F90, float3 diffuseColor, float alpha, inout float3 outDiffuse,
+                                   inout float3 outSpecular) {
+    float3 lightPos = light.shadingPositionWorld.xyz;
+    float3 toLight = lightPos - worldPos;
+    float distSq = max(dot(toLight, toLight), 1e-8);
+    float dist = sqrt(distSq);
+    float3 lightDir = toLight / dist;
+
+    float NdotL = max(dot(N, lightDir), 0.0);
+    // [Filament precedent, cited by matrix-p5t15's own row 3:
+    // surface_light_punctual.fs:180-225 -- "early-out on NoL<=0...
+    // shadow lookups are the expensive step, gated last"] This engine
+    // has no per-clustered-light shadow test yet (T18's own future
+    // scope, cubemap/atlas point-and-spot shadows) -- the early-out
+    // still saves the D/V/Fresnel evaluation below for a
+    // back-facing-relative-to-this-light fragment, the SAME
+    // performance shape the cited precedent establishes.
+    if (NdotL <= 0.0) {
+        return;
+    }
+
+    // KHR_lights_punctual range-property window [README.md, quoted in
+    // full by standard_pbr.slang's own comment] -- the LITERAL,
+    // un-squared form (this project's own resolved Open Question,
+    // matching the spec text/reference code/glTF-Sample-Renderer all
+    // three).
+    float lightRange = light.shadingTypeRangeAngle.y;
+    float rangeWindow = 1.0;
+    if (lightRange > 0.0) {
+        float ratio = dist / lightRange;
+        float ratio4 = ratio * ratio;
+        ratio4 = ratio4 * ratio4;
+        rangeWindow = saturate(1.0 - ratio4);
+    }
+    float lightAttenuation = rangeWindow / distSq;
+
+    // x > 1.5 selects Spot (2.0) over Point (1.0) -- see
+    // rx_cluster::buildClusterLightList()'s own `shadingTypeRangeAngle.x`
+    // comment (cluster_lighting.h); Directional lights never reach this
+    // buffer at all (buildClusterLightList() skips them, matrix-p5t15's
+    // own row 1).
+    if (light.shadingTypeRangeAngle.x > 1.5) {
+        float angleScale = light.shadingTypeRangeAngle.z;
+        float angleOffset = light.shadingTypeRangeAngle.w;
+        float3 spotDir = light.shadingSpotDirWorld.xyz;
+        float cd = dot(normalize(spotDir), -lightDir);
+        float angularAttenuation = saturate(cd * angleScale + angleOffset);
+        angularAttenuation *= angularAttenuation;
+        lightAttenuation *= angularAttenuation;
+    }
+
+    float3 halfVec = normalize(viewDir + lightDir);
+    float NdotH = max(dot(N, halfVec), 0.0);
+    float VdotH = max(dot(viewDir, halfVec), 0.0);
+
+    float D = D_GGX(alpha, NdotH);
+    float vis = V_SmithGGXCorrelated(alpha, NdotV, NdotL);
+    float3 fresnel = F_Schlick(F0, F90, VdotH);
+
+    // [standard_pbr.slang's own punctual-term comment, restated]
+    // `shadingColorCandela` is CANDELA -- multiplying by the
+    // inverse-square/window/cone attenuation term converts it into the
+    // SAME lux-equivalent-irradiance space the diffuse/specular BRDF
+    // terms already assume, matching Filament's own `light.
+    // colorIntensity.rgb * light.attenuation * NoL` composition.
+    float3 radiance = light.shadingColorCandela.rgb * lightAttenuation * NdotL;
+
+    outDiffuse += diffuseColor * Fd_Lambert() * radiance;
+    outSpecular += D * vis * fresnel * radiance;
+}
+
 public void rx_evaluateClusteredLights(MaterialVertex v, float3 N, float3 viewDir, float NdotV, float3 F0, float F90,
                                         float3 diffuseColor, float roughness, float alpha, out float3 outDiffuse,
                                         out float3 outSpecular) {
@@ -159,73 +244,36 @@ public void rx_evaluateClusteredLights(MaterialVertex v, float3 N, float3 viewDi
     for (uint i = 0; i < count; ++i) {
         uint lightIdx = gClusterBuffers[v.clusterLightIndicesBufferIndex][offset + i];
         ClusterLightGpu light = gClusterLights[v.clusterLightsBufferIndex][lightIdx];
+        clusterAccumulateSingleLight(light, v.worldPos, N, viewDir, NdotV, F0, F90, diffuseColor, alpha, outDiffuse,
+                                      outSpecular);
+    }
+}
 
-        float3 lightPos = light.shadingPositionWorld.xyz;
-        float3 toLight = lightPos - v.worldPos;
-        float distSq = max(dot(toLight, toLight), 1e-8);
-        float dist = sqrt(distSq);
-        float3 lightDir = toLight / dist;
+// [matrix-p5t15's own "Clustered-vs-unclustered equivalence" row, plan:
+// 519-520: "An N-light scene renders within tolerance of a brute-force
+// all-lights reference path (discrimination: clustering changes cost,
+// never the image)."] PERMANENT regression harness, reachable via
+// `totalLightCount` (a caller-supplied count -- NOT read from any
+// froxel-grid structure, deliberately, since this path's entire point is
+// to bypass froxel indirection: "loop over ALL scene lights per
+// fragment, no froxel indirection", matrix row 42's own acceptance
+// text). test_cluster_shading_gpu.cpp's own equivalence TEST_CASE is
+// this path's caller -- production `standard_pbr.slang` never calls
+// this function (it always uses the clustered, O(lights-in-froxel)
+// path above; this permutation exists purely as the committed,
+// re-runnable ground-truth oracle every future point/spot lighting
+// change re-checks against, per the matrix row's own "NOT deleted after
+// the comparison is made once" requirement).
+public void rx_evaluateBruteForceClusteredLights(MaterialVertex v, float3 N, float3 viewDir, float NdotV, float3 F0,
+                                                   float F90, float3 diffuseColor, float roughness, float alpha,
+                                                   uint totalLightCount, out float3 outDiffuse,
+                                                   out float3 outSpecular) {
+    outDiffuse = float3(0.0, 0.0, 0.0);
+    outSpecular = float3(0.0, 0.0, 0.0);
 
-        float NdotL = max(dot(N, lightDir), 0.0);
-        // [Filament precedent, cited by matrix-p5t15's own row 3:
-        // surface_light_punctual.fs:180-225 -- "early-out on NoL<=0...
-        // shadow lookups are the expensive step, gated last"] This engine
-        // has no per-clustered-light shadow test yet (T18's own future
-        // scope, cubemap/atlas point-and-spot shadows) -- the early-out
-        // still saves the D/V/Fresnel evaluation below for a
-        // back-facing-relative-to-this-light fragment, the SAME
-        // performance shape the cited precedent establishes.
-        if (NdotL <= 0.0) {
-            continue;
-        }
-
-        // KHR_lights_punctual range-property window [README.md, quoted in
-        // full by standard_pbr.slang's own comment] -- the LITERAL,
-        // un-squared form (this project's own resolved Open Question,
-        // matching the spec text/reference code/glTF-Sample-Renderer all
-        // three).
-        float lightRange = light.shadingTypeRangeAngle.y;
-        float rangeWindow = 1.0;
-        if (lightRange > 0.0) {
-            float ratio = dist / lightRange;
-            float ratio4 = ratio * ratio;
-            ratio4 = ratio4 * ratio4;
-            rangeWindow = saturate(1.0 - ratio4);
-        }
-        float lightAttenuation = rangeWindow / distSq;
-
-        // x > 1.5 selects Spot (2.0) over Point (1.0) -- see
-        // rx_cluster::buildClusterLightList()'s own `shadingTypeRangeAngle.x`
-        // comment (cluster_lighting.h); Directional lights never reach this
-        // buffer at all (buildClusterLightList() skips them, matrix-p5t15's
-        // own row 1).
-        if (light.shadingTypeRangeAngle.x > 1.5) {
-            float angleScale = light.shadingTypeRangeAngle.z;
-            float angleOffset = light.shadingTypeRangeAngle.w;
-            float3 spotDir = light.shadingSpotDirWorld.xyz;
-            float cd = dot(normalize(spotDir), -lightDir);
-            float angularAttenuation = saturate(cd * angleScale + angleOffset);
-            angularAttenuation *= angularAttenuation;
-            lightAttenuation *= angularAttenuation;
-        }
-
-        float3 halfVec = normalize(viewDir + lightDir);
-        float NdotH = max(dot(N, halfVec), 0.0);
-        float VdotH = max(dot(viewDir, halfVec), 0.0);
-
-        float D = D_GGX(alpha, NdotH);
-        float vis = V_SmithGGXCorrelated(alpha, NdotV, NdotL);
-        float3 fresnel = F_Schlick(F0, F90, VdotH);
-
-        // [standard_pbr.slang's own punctual-term comment, restated]
-        // `shadingColorCandela` is CANDELA -- multiplying by the
-        // inverse-square/window/cone attenuation term converts it into the
-        // SAME lux-equivalent-irradiance space the diffuse/specular BRDF
-        // terms already assume, matching Filament's own `light.
-        // colorIntensity.rgb * light.attenuation * NoL` composition.
-        float3 radiance = light.shadingColorCandela.rgb * lightAttenuation * NdotL;
-
-        outDiffuse += diffuseColor * Fd_Lambert() * radiance;
-        outSpecular += D * vis * fresnel * radiance;
+    for (uint i = 0; i < totalLightCount; ++i) {
+        ClusterLightGpu light = gClusterLights[v.clusterLightsBufferIndex][i];
+        clusterAccumulateSingleLight(light, v.worldPos, N, viewDir, NdotV, F0, F90, diffuseColor, alpha, outDiffuse,
+                                      outSpecular);
     }
 }
